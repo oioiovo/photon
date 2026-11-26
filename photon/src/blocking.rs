@@ -38,6 +38,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument as _;
 
 use crate::error::RpcError;
 use crate::session::{ConnectOptions, ServiceRegistry, Session, SessionHandle, SessionOptions};
@@ -86,6 +87,8 @@ enum Command {
     Call {
         service_id: u16,
         method: u64,
+        /// 方法名，只用于 span（`method` 是哈希，日志里认不出来）。
+        method_name: Option<&'static str>,
         payload: Bytes,
         deadline_ms: u32,
         /// 外层期限，与调用方 `recv_timeout` 用的是同一个值。
@@ -175,12 +178,28 @@ where
         payload: Bytes,
         deadline_ms: u32,
     ) -> Result<Bytes, RpcError> {
+        self.call_named(service_id, method, None, payload, deadline_ms)
+    }
+
+    /// 同 [`Self::call`]，但把方法名一并带进会话线程的 span。
+    ///
+    /// 宏生成的 stub 走这一条；手写调用方拿不到名字就传 `None`，span 里会写
+    /// `<unknown>`。名字只影响观测，不影响线格式与语义。
+    pub fn call_named(
+        &self,
+        service_id: u16,
+        method: u64,
+        method_name: Option<&'static str>,
+        payload: Bytes,
+        deadline_ms: u32,
+    ) -> Result<Bytes, RpcError> {
         let (reply, wait) = std::sync::mpsc::sync_channel(1);
         self.inner
             .jobs
             .send(Command::Call {
                 service_id,
                 method,
+                method_name,
                 payload,
                 deadline_ms,
                 timeout: self.timeout,
@@ -324,6 +343,7 @@ async fn dispatcher<S, K>(
             Command::Call {
                 service_id,
                 method,
+                method_name,
                 payload,
                 deadline_ms,
                 timeout,
@@ -332,21 +352,34 @@ async fn dispatcher<S, K>(
                 // 每条请求单独 spawn：同步调用方可能来自多个线程，串行化会把
                 // 「并发调用」变成「排队等前一个超时」。
                 let handle = handle.clone();
-                tokio::spawn(async move {
-                    let call = handle.call(service_id, method, payload, deadline_ms);
-                    let result = match timeout {
-                        Some(limit) => match tokio::time::timeout(limit, call).await {
-                            Ok(result) => result,
-                            // 期限到：future 被 drop，`CallGuard` 摘掉 pending 表项并
-                            // 给对端送 `Cancel`——外层超时不会留下一张永远挂着
-                            // 待回包的条目。
-                            Err(_) => Err(RpcError::Timeout),
-                        },
-                        None => call.await,
-                    };
-                    // 调用方可能已经超时走人，此时它那一端已经 drop：发失败无所谓。
-                    let _ = reply.send(result);
-                });
+                // 与异步 stub 的 `photon.call` 同名同字段：抓日志时两条路径的
+                // 输出能用一个 filter 捞全。`request_id` 由 `Session::call` 回填。
+                let span = tracing::info_span!(
+                    "photon.call",
+                    service_id,
+                    method,
+                    method_name = method_name.unwrap_or(crate::UNKNOWN_METHOD_NAME),
+                    deadline_ms,
+                    request_id = tracing::field::Empty,
+                );
+                tokio::spawn(
+                    async move {
+                        let call = handle.call(service_id, method, payload, deadline_ms);
+                        let result = match timeout {
+                            Some(limit) => match tokio::time::timeout(limit, call).await {
+                                Ok(result) => result,
+                                // 期限到：future 被 drop，`CallGuard` 摘掉 pending 表项并
+                                // 给对端送 `Cancel`——外层超时不会留下一张永远挂着
+                                // 待回包的条目。
+                                Err(_) => Err(RpcError::Timeout),
+                            },
+                            None => call.await,
+                        };
+                        // 调用方可能已经超时走人，此时它那一端已经 drop：发失败无所谓。
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
             }
             Command::Notify {
                 service_id,

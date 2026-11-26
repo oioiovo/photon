@@ -17,6 +17,8 @@ photon-macros = { path = "../photon-macros" }
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 trybuild = "1"
+# 只在测试里用来抓 span 字段（design 3.5 的验收手段），不进主 crate 依赖集。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [features]
 # M0 只落默认集；shm / blocking / interceptor / codec-rkyv / full

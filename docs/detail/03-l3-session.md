@@ -414,14 +414,17 @@ struct ClosingState {
 
 | 项 | 内容 | 成本 |
 |---|---|---|
-| 请求 span | `service_id` + `method_name` + `request_id`；`method_name` 来自宏生成的方法名表 | 零（全是常量） |
+| 请求 span | 服务端 `photon.request`：`service_id` + `method` + `method_name` + `request_id` + `code`（成功写 `0`，失败写错误体里的码）。在 `dispatch` 里**进 handler 之前**建好，`code` 回包时回填；只 `instrument` 里层 task（外层只是 panic 兜底）。`method_name` 来自 `Service::method_name`（宏用名字表覆盖，手写实现默认 `None` → `<unknown>`） | 零（全是常量；`instrument` 只多一层 poll 包装） |
+| 调用 span | 客户端 `photon.call`：字段与服务端**同名同值**；`method_name` 是宏的编译期常量，`request_id` 由 `Session::call` 分配后 `Span::current().record` 回填（字段不存在时是 no-op） | 零 |
 | 队列深度 | `tx.capacity()` / 已排队条数，超阈值 warn | 低 |
 | pending 大小 | 定期采样 `outbound.lock().pending.len()`，接近配额时 warn | 低 |
 | 入站配额 | `inbound.async_used` / `blocking_used` 采样；与 pending 分开报，否则看不出是哪个方向过载 | 低 |
 | handler 耗时 | debug 构建下 > 100 µs 打 warn，提示该加 `#[photon(blocking)]` | 仅 debug |
 | shm 槽位占用时长 | ZeroCopy 路径下 payload 从交出处到 drop 的时长，做指标 | M5 |
 
-只带 `request_id` 的 span 在排障时基本没用——一个数字对不上任何业务语义。
+只带 `request_id` 的 span 在排障时基本没用——一个数字对不上任何业务语义；只有 `service_id + method` 也一样（哈希认不出方法名）。所以名字必须由宏那一侧交出来（`Service::method_name`），L3 自己反推不了。
+
+**span 的边界就是请求的边界**：客户端 span 覆盖「encode 之后到 decode 之前」，服务端 span 覆盖「进 handler 到回包入队」。handler 内部打的日志靠 `instrument` 落进后者——`tests/tracing_spans.rs` 断言的就是这件事，而不是「span 建出来了」。
 
 ---
 

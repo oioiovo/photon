@@ -198,6 +198,7 @@ fn expand(
         } else {
             quote! { &(#(#arg_names),*) }
         };
+        let name_str = m.name.to_string();
         quote! {
             /// 发一次请求；期限取客户端上的 `deadline_ms`（默认 0 = 不设期限）。
             pub async fn #name(&self, #(#params),*)
@@ -205,9 +206,20 @@ fn expand(
             {
                 let payload =
                     <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
-                let reply = self
+                // 一次调用一个 span，`request_id` 在 `Session::call` 里回填——那才
+                // 是分配它的地方。`method_name` 是编译期常量，所以客户端这一侧也能
+                // 带上名字（服务端靠 `Service::method_name` 拿同一份名字表）。
+                let span = ::photon::__private::tracing::info_span!(
+                    "photon.call",
+                    service_id = #helper::SERVICE_ID,
+                    method = #helper::#hash,
+                    method_name = #name_str,
+                    deadline_ms = self.deadline_ms,
+                    request_id = ::photon::__private::tracing::field::Empty,
+                );
+                let reply = ::photon::__private::instrument(span, self
                     .handle
-                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms)
+                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms))
                     .await
                     #unwrap?;
                 <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
@@ -245,6 +257,7 @@ fn expand(
             } else {
                 quote! { &(#(#arg_names),*) }
             };
+            let name_str = m.name.to_string();
             quote! {
                 /// 发一次请求并阻塞等回包；期限取同步客户端上的 `deadline_ms`。
                 pub fn #name(&self, #(#params),*)
@@ -252,9 +265,17 @@ fn expand(
                 {
                     let payload =
                         <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
+                    // 名字只进 span（同步路径的 span 在会话线程上建，所以这里把
+                    // 编译期常量一起递过去）。语义与 `call` 完全相同。
                     let reply = self
                         .session
-                        .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms)
+                        .call_named(
+                            Self::SERVICE_ID,
+                            #helper::#hash,
+                            ::std::option::Option::Some(#name_str),
+                            payload,
+                            self.deadline_ms,
+                        )
                         #unwrap?;
                     <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
                 }
@@ -435,6 +456,16 @@ fn expand(
         }
     };
 
+    // 名字表交给 L3：method id 是哈希，只有这里反推得出名字。
+    let method_name_impl = quote! {
+        fn method_name(&self, method: u64) -> ::std::option::Option<&'static str> {
+            #helper::METHOD_NAMES
+                .iter()
+                .find(|(hash, _)| *hash == method)
+                .map(|(_, name)| *name)
+        }
+    };
+
     quote! {
         #[doc(hidden)]
         mod #helper {
@@ -561,6 +592,7 @@ fn expand(
 
             #schedule_impl
             #payload_mode_impl
+            #method_name_impl
         }
 
         /// 用本服务的 `service_id` 占号。撞号返回 `Err`，不覆盖已有服务。

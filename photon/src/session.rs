@@ -25,6 +25,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::{
     Schedule, Service,
@@ -413,6 +414,10 @@ where
         }
 
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // 回填 `request_id` 到调用方的 span（`photon.call`）。字段在宏产物里先占位
+        // 为 `Empty`，因为「分配的瞬间」只有这里知道；span 上没有这个字段时（比如
+        // 用户直接调 `handle.call`）`record` 是空操作，不会报错。
+        tracing::Span::current().record("request_id", request_id);
         let (tx, rx) = oneshot::channel();
 
         {
@@ -819,6 +824,24 @@ where
         // 登记必须在 spawn 之前：紧跟 Request 到达的 Cancel 才能命中。
         self.cancels.lock().insert(header.request_id, token.clone());
 
+        // 一个请求一个 span，字段在**进 handler 之前**就都齐了：`service_id` /
+        // `method` / `method_name` / `request_id`。`code` 先占位，回包时回填——
+        // 这样「一次调用」在日志里是可 grep 的一段，而不是散落的几行。
+        //
+        // 为什么 name 来自 `Service::method_name`：method id 是哈希，L3 自己
+        // 反推不出名字；只有宏产物的名字表知道。
+        let method_name = svc
+            .method_name(header.method)
+            .unwrap_or(crate::UNKNOWN_METHOD_NAME);
+        let span = tracing::info_span!(
+            "photon.request",
+            service_id = header.service_id,
+            method = header.method,
+            method_name,
+            request_id = header.request_id,
+            code = tracing::field::Empty,
+        );
+
         let tx = self.tx.clone();
         let cancels = Arc::clone(&self.cancels);
         let shutdown = self.shutdown.clone();
@@ -834,6 +857,9 @@ where
         // `catch_unwind`（要引入 futures，且 panic 语义得搬进 async 块里）。
         let outer_tx = tx.clone();
         let outer_cancels = Arc::clone(&cancels);
+        // span 只装在里层：外层那个 task 只做 panic 兜底，没有业务语义；
+        // 里层才是「这个请求」的全部生命周期。
+        let inner_span = span;
         tokio::spawn(async move {
             let inner = tokio::spawn(async move {
                 let deadline = async move {
@@ -879,12 +905,18 @@ where
                     }
                 } else {
                     let frame = match outcome {
-                        Ok(body) => response_frame(request_id, body, false),
+                        Ok(body) => {
+                            // 成功也写 `code = 0`：这样「有没有这个字段」不再有歧义，
+                            // 按 `code` 过滤时不会漏掉成功的请求。
+                            tracing::Span::current().record("code", 0u32);
+                            response_frame(request_id, body, false)
+                        }
                         Err(e) => {
                             // 框架级故障（Io / Protocol / RuntimeDropped）没有合适的业务码，
                             // 按 `0` 兜底；但回包路径上绝不静默丢帧。
                             let (code, retryable, message) = error_body::to_wire(&e)
                                 .unwrap_or_else(|| (0, false, format!("{e}")));
+                            tracing::Span::current().record("code", code);
                             let body = error_body::encode(code, retryable, &message);
                             response_frame(request_id, body, true)
                         }
@@ -895,7 +927,8 @@ where
                 cancels.lock().remove(&request_id);
                 // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
                 drop(guard);
-            });
+            }
+            .instrument(inner_span));
 
             if let Err(join) = inner.await
                 && join.is_panic()

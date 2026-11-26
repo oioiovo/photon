@@ -37,6 +37,10 @@ use std::sync::Arc;
 /// 待回包表。公开而非私有：它出现在 `Service` 的签名里。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// `method_name` 未知时的占位：用户自己实现 `Service` 却没覆盖 `method_name`
+/// （异步与同步两条路径共用一个值，日志里一眼看得出「没接名字表」）。
+pub(crate) const UNKNOWN_METHOD_NAME: &str = "<unknown>";
+
 /// 一次调用该占哪一类额度。
 ///
 /// 调度策略是编译期属性（宏逐方法写死），这个枚举只是把它交到 L3 手上——
@@ -123,5 +127,36 @@ pub trait Service: Send + Sync + 'static {
     /// 是否把槽位直接借用出去。
     fn payload_mode(&self, _method: u64) -> PayloadMode {
         PayloadMode::Copy
+    }
+
+    /// 这个方法的名字，供观测用（请求 span 的 `method_name` 字段）。
+    ///
+    /// 默认 `None`，宏用展开期写死的名字表覆盖。为什么放在 trait 上而不是让
+    /// L3 自己维护一张表：method id 是 `xxh3` 哈希，**单靠哈希逆向不出名字**，
+    /// 而只有 id 的 span（`service_id=7 method=0xffb35...`）在排障时基本没用。
+    /// 名字只在宏产物的那个模块里，L3 拿不到，只能由实现方交出来。
+    fn method_name(&self, _method: u64) -> Option<&'static str> {
+        None
+    }
+}
+
+/// 宏产物专用的小工具，**不是公开 API 的一部分**（将来可能随宏一起改）。
+///
+/// 之所以要有：生成的 stub 需要给调用包一个 span，而 `tracing` 是 `photon`
+/// 的依赖、不是用户的依赖——宏里写 `tracing::` 会让没用它的下游 crate 编不过。
+#[doc(hidden)]
+pub mod __private {
+    pub use tracing;
+
+    /// 把 future 装进给定 span，返回可 `await` 的包装。
+    ///
+    /// 用户代码里不需要 `use tracing::Instrument`，宏直接调这个函数就够了；
+    /// 返回值是 `Instrumented<F>`，`await` 之后拿到 `F` 的输出。
+    pub fn instrument<F>(span: tracing::Span, future: F) -> tracing::instrument::Instrumented<F>
+    where
+        F: std::future::Future,
+    {
+        use tracing::Instrument as _;
+        future.instrument(span)
     }
 }

@@ -174,6 +174,16 @@ fn schedule(&self, method: u64) -> Schedule {
 
 **`schedule` 为什么必须由生成代码给出（v0.19）**：配额检查发生在「reader 解析完头、准备 spawn」这一刻，此时手上只有 `service_id + method`；实现内部走哪个分支要等 `call` 被 poll 才知道，而那时额度已经扣过了。让 L3 猜不了，也不该让 handler 自己扣（那等于把会话层的资源契约下放到业务代码）。代价只是一次 `match` 比较链，且只有存在 blocking 方法时才生成。
 
+**`method_name` 同理，只是用途是观测（v0.28）**：`dispatch` 在进 handler 之前就要建 `photon.request` span，而那时只有 `service_id + method`；`method` 是 `xxh3` 哈希，**反推不出名字**，名字只存在于宏展开的 `mod __photon_xxx::METHOD_NAMES` 里。所以 `Service` 加了一个默认返回 `None` 的方法，宏用一次 `find` 覆盖它：
+
+```rust
+fn method_name(&self, method: u64) -> Option<&'static str> {
+    METHOD_NAMES.iter().find(|(hash, _)| *hash == method).map(|(_, name)| *name)
+}
+```
+
+不生成时（手写 `Service`）日志里写 `<unknown>`——比什么都不写诚实：看得出「没接名字表」，而不是以为这个方法没有名字。
+
 参数解码位置：**`async fn` / `fn` 分支在 `call` 开头** `let (a, b) = Default::decode::<(i64, i64)>(&payload)?;`；**`#[photon(blocking)]` 分支必须在 `spawn_blocking` 的闭包里 decode**（v0.10 修）——v0.9 把它写在闭包外，等于只在调用线程上解析、闭包里只剩执行，一次线程切换只干了一件事；更糟的是 decode 出错时闭包外的 `?` 会让 `payload` 在闭包捕获前就被借用，写出来的代码通常编译不过或被迫多一次 clone。解码失败一律 `code = 4`。`Vec<u8>` 等容器类型直接走 serde，不需要特殊处理。
 
 ---
@@ -267,6 +277,18 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 - 两个期限用**同一个值**（v0.27 改判 v0.7 的「外层 +50ms」）：会话线程上的 `timeout` 到点会 drop future，`CallGuard` 摘表并送 `Cancel`，所以调用方先返回不会漏收尾；多留 50 ms 只是让内层先说结论，而结论一样。
 - 错误映射：`recv_timeout` 的 `Disconnected` → `Closed`（会话线程没了），`Timeout` → `Timeout`。命令投递失败（通道关闭）同样 → `Closed`。
 
+### 7.2.1 名字要跟着命令一起过线程（v0.28）
+
+`photon.call` 的 span 在**会话线程**上建（调用方线程上没有 runtime、也没有 `await`），而 `method_name` 只有宏知道。所以 `Command::Call` 多带一个 `Option<&'static str>`，公开入口是：
+
+```rust
+pub fn call(&self, service_id, method, payload, deadline_ms) -> Result<Bytes, RpcError>;
+pub fn call_named(&self, service_id, method, method_name: Option<&'static str>, payload, deadline_ms)
+    -> Result<Bytes, RpcError>;
+```
+
+`call` 就是 `call_named(.., None, ..)`——手写调用方拿不到名字，日志里写 `<unknown>`，语义与线格式都不受影响。宏生成的同步 stub 走 `call_named`，因此**两条路径（异步 stub / 同步 stub）的 span 同名同字段**，一个 `RUST_LOG` 过滤条件能同时捞到。
+
 ### 7.3 生命周期
 
 - **构造必须等到握手结果**：`ready` 用 `sync_channel(1)`；握手失败或线程早死 → `Err`，绝不交出一个「看着能用、其实没握手」的客户端。
@@ -288,6 +310,7 @@ v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：f
 | `deadline_alone_bounds_the_call` | 只设 `deadline` 也有界（外层默认 `None` 不是漏洞） |
 | `notify_is_fire_and_forget` | 通知不占回包通道 |
 | `close_then_call_is_closed` | `close()` 之后的调用回 `Closed` |
+| `blocking_call_also_carries_the_name`（在 `tests/tracing_spans.rs`） | 同步路径的 `photon.call` 也带 `method_name`，且与服务端 `photon.request` 的 `request_id` 对齐 |
 | `business_error_survives_sync_stub` | 业务错误经 `from_error` 三处映射后仍是用户码 |
 | `usable_inside_current_thread_runtime` | `current_thread` runtime 里同步调用不 panic、不死锁 |
 
@@ -444,6 +467,13 @@ impl<S, K> SessionHandle<S, K> {
 - `notify` 与 `call` 共用同一条 `tx` 队列、同样的背压，只是**不插 pending 表**——因此它不占出站配额，也不会有超时或 `Cancel`。代价是失败不可观测：服务端 handler 报错时只写 `tracing::warn!`，调用方永远看到 `Ok(())`。要确认结果就改用 `call`。
 - 服务端侧的 `Notification` 与 `Request` 走同一个 `dispatch`（查服务 → 扣额度 → spawn），差别只有 `want_reply = false`：**未注册服务、额度不足都只记日志，绝不回 `Response`**。给通知回一个 `Response` 是协议噪声：对端没有对应 pending，收到只会丢掉。
 - `deadline_ms` 的客户端语义是「本端愿意等多久」，因此它同时决定头里的剩余预算。放弃（超时或 future 被 drop）时 `CallGuard` 摘表并触发 `Cancel`，见 `03` 6.3。
+
+**客户端 stub 顺手带一个 span（v0.28）**：生成的异步方法先建 `photon.call`（`service_id` / `method` / `method_name` / `deadline_ms`，`request_id` 留 `Empty`），再用 `photon::__private::instrument` 把整次调用包进去。两处细节值得写下来：
+
+1. **`method_name` 在客户端这一侧也是常量**——宏知道方法名，没必要等回包才知道；
+2. **`request_id` 由 L3 回填**：分配它的地方是 `Session::call`，那里做 `Span::current().record("request_id", id)`；span 上没有这个字段时（用户直接调 `handle.call`）`record` 是 no-op，不会报错。
+
+不在 stub 里自己生成 `request_id`：那会把「id 分配」这件事复制成两份，迟早不一致。
 
 ### 10.4 完整的装配清单（照抄这一条就不会漏）
 
