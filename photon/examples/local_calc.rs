@@ -1,6 +1,8 @@
-//! M2 最小集：单进程全链路（client stub → session → dispatch → codec → 回包）。
+//! 单进程全链路：client stub → session → dispatch → codec → 回包。
 //!
-//! 一条命令跑通：`cargo run --example local_calc`。
+//! M2 的四种形态之外，M3 的四种形态也在这里同一个会话里跑一遍：
+//! 通知（无回包）、超时（客户端准、服务端尽力）、同步 handler、优雅关闭
+//! （等在飞清空再收尾）。一条命令：`cargo run --example local_calc`。
 
 #[path = "calc_service/mod.rs"]
 mod calc;
@@ -27,8 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("[server] listening on memory (in-process pair, no endpoint)");
 
-    // 服务端会话由内部的 reader task 持有，这里只需要确保它不被提前 drop。
-    let _server = server_session;
+    // 服务端会话由内部的 reader task 持有；这里留个名字，最后用它的 `close()`
+    // 演示「宣告关闭 + 等在飞清空」。
+    let server = server_session;
 
     let (client_session, client_handle) = Session::new(
         client_halves.0,
@@ -62,6 +65,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("[client] 32 concurrent calls -> all matched, mismatched = {mismatched}");
+
+    // 通知：不插 pending、不占出站配额，`Ok` 只代表帧进了队列。
+    client
+        .handle()
+        .notify(calc::service_id(), calc::ping_method(), bytes::Bytes::new())
+        .await?;
+    println!("[client] notify ping (no reply)");
+
+    // 超时：期限挂在客户端上，`slow_op(200)` 在 50 ms 处被本端放弃，
+    // 服务端自己的 deadline 也是 50 ms，于是 handler 一并被丢掉。
+    let strict = CalcClient::new(client.handle().clone()).with_deadline(50);
+    match strict.slow_op(200).await {
+        Ok(ms) => println!("[client] slow_op -> Ok({ms})  (超时没生效？)"),
+        Err(photon::RpcError::Timeout) => println!("[client] slow_op -> Err(Timeout after 50ms)"),
+        Err(err) => println!("[client] slow_op -> {}", describe(&err)),
+    }
+
+    // 同步 handler：声明是 `fn`，stub 仍是 async（线上永远异步）。
+    let hash = client.fast_hash(b"photon".to_vec()).await?;
+    println!("[client] fast_hash(data) = {hash:#018x}   (sync handler, 未 await)");
+
+    // 优雅关闭：留一个在飞的请求，然后由服务端宣告关闭；
+    // `close()` 不返回直到 handler 清空，回包也在这之前进了 writer。
+    let inflight = tokio::spawn({
+        let client = CalcClient::new(client.handle().clone());
+        async move { client.slow_op(30).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    server.close().await?;
+    let _ = inflight.await?;
+    println!("[server] shutdown (in-flight drained)");
 
     client.handle().close().await?;
     Ok(())

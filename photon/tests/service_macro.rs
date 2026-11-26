@@ -231,3 +231,66 @@ async fn schedule_reflects_method_annotation() {
         photon::Schedule::Blocking
     );
 }
+
+// ---- stub 的期限：`with_deadline` 必须真的进头 ----
+
+#[photon::service(id = 9)]
+trait Sleepy {
+    async fn nap(&self, ms: u64) -> Result<u64, RpcError>;
+}
+
+struct SleepyImpl;
+
+impl Sleepy for SleepyImpl {
+    async fn nap(&self, ms: u64) -> Result<u64, RpcError> {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(ms)
+    }
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn client_deadline_reaches_header() {
+    use photon::{Session, SessionOptions, transport::memory::Memory};
+
+    let (client_halves, server_halves) = Memory::pair();
+    let mut registry = ServiceRegistry::empty();
+    register_sleepy(&mut registry, Arc::new(SleepyImpl)).expect("注册");
+
+    let (_server, _) = Session::new(
+        server_halves.0,
+        server_halves.1,
+        Arc::new(registry),
+        SessionOptions::default(),
+    )
+    .expect("建服务端会话");
+    let (client_session, handle) = Session::new(
+        client_halves.0,
+        client_halves.1,
+        Arc::new(ServiceRegistry::empty()),
+        SessionOptions::default(),
+    )
+    .expect("建客户端会话");
+    client_session.wait_ready().await.expect("握手");
+
+    // 默认期限 0：300 ms 的活照常跑完。
+    let lenient = SleepyClient::new(handle.clone());
+    assert_eq!(lenient.deadline_ms(), 0);
+    assert_eq!(lenient.nap(300).await.expect("无期限调用"), 300);
+
+    // 期限 30 ms：同一个方法必须在本端被放弃，而不是等服务端 300 ms 跑完。
+    // 变异验证：把生成代码里的 `self.deadline_ms` 换回 `0`，这条会红（拿到 Ok(300)）。
+    let strict = SleepyClient::new(handle.clone()).with_deadline(30);
+    assert_eq!(strict.deadline_ms(), 30);
+    let started = std::time::Instant::now();
+    let err = strict.nap(300).await.expect_err("必须超时");
+    assert!(
+        matches!(err, RpcError::Timeout),
+        "期望 Timeout，实际 {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(300),
+        "超时判定没有生效，等了 {:?}",
+        started.elapsed()
+    );
+}

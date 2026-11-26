@@ -173,14 +173,14 @@ fn expand(
             quote! { &(#(#arg_names),*) }
         };
         quote! {
-            /// 发一次请求。期限为 0 表示不设期限。
+            /// 发一次请求；期限取客户端上的 `deadline_ms`（默认 0 = 不设期限）。
             pub async fn #name(&self, #(#params),*)
                 -> ::std::result::Result<#ok_ty, ::photon::RpcError>
             {
                 let payload = <::photon::codec::Default as ::photon::Codec>::encode(#packed)?;
                 let reply = self
                     .handle
-                    .call(Self::SERVICE_ID, #helper::#hash, payload, 0)
+                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms)
                     .await?;
                 <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply)
             }
@@ -279,6 +279,8 @@ fn expand(
             K: 'static,
         {
             handle: ::photon::session::SessionHandle<S, K>,
+            /// 这个客户端上所有请求的期限（毫秒，0 = 不设期限）。
+            deadline_ms: u32,
         }
 
         impl<S, K> #client<S, K>
@@ -290,7 +292,26 @@ fn expand(
             pub const SERVICE_ID: u16 = #helper::SERVICE_ID;
 
             pub fn new(handle: ::photon::session::SessionHandle<S, K>) -> Self {
-                Self { handle }
+                Self {
+                    handle,
+                    deadline_ms: 0,
+                }
+            }
+
+            /// 给这个客户端上的请求设一个期限，返回新的客户端（原值不变）。
+            ///
+            /// 用「换一个值」而不是「改全局状态」：期限是每个调用点的选择，
+            /// 让 `&self` 上挂着可变期限会让并发调用互相影响。
+            pub fn with_deadline(self, deadline_ms: u32) -> Self {
+                Self {
+                    deadline_ms,
+                    ..self
+                }
+            }
+
+            /// 当前期限（毫秒，0 = 不设期限）。
+            pub fn deadline_ms(&self) -> u32 {
+                self.deadline_ms
             }
 
             pub fn handle(&self) -> &::photon::session::SessionHandle<S, K> {

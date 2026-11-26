@@ -327,11 +327,16 @@ loop {
 ```rust
 pub struct CalcClient<S, K>
 where S: MessageSource + 'static, K: MessageSink + 'static
-{ handle: SessionHandle<S, K> }
+{
+    handle: SessionHandle<S, K>,
+    deadline_ms: u32,          // 0 = 不设期限
+}
 
 impl<S, K> CalcClient<S, K> {
-    pub fn new(handle: SessionHandle<S, K>) -> Self;
-    // 业务方法：encode → call → decode，全部 async
+    pub fn new(handle: SessionHandle<S, K>) -> Self;      // deadline_ms = 0
+    pub fn with_deadline(self, ms: u32) -> Self;          // 换值返回新客户端
+    pub fn deadline_ms(&self) -> u32;
+    // 业务方法：encode → call(.., self.deadline_ms) → decode，全部 async
 }
 
 // 连接是独立的一步，按传输类型单态化
@@ -340,6 +345,13 @@ pub async fn connect<T: Transport>(ep: &Endpoint, opts: ConnectOptions)
 ```
 
 于是「换传输」只换 `connect::<T>` 这一处，`CalcClient` 与业务代码一行不动；`ConnectOptions` 把 `TransportOptions` 与 `SessionOptions` 打包，避免 connect 出现两套参数顺序。`connect` 还会等握手到 `Ready`：`codec_id` / 版本不符在这里就变成 `Err`，不留到第一次业务调用超时。
+
+**期限为什么挂在客户端上，而不是每个方法多一个参数（v0.24）**。`deadline_ms` 的线格式 v0.20 就落了、`CallGuard` 也在等它，但 stub 一直硬传 `0`——用户想要一次带超时的调用，只能绕到 `SessionHandle::call` 自己 encode，等于类型化 API 缺了一个最有用的旋钮。两个候选：
+
+- 每个方法多一个 `deadline: u32` 参数：签名被噪声污染，且 `add(a, b, 100)` 这种第一个参数是业务值的调用点读起来完全不自解释；
+- 客户端上挂一个字段、`with_deadline` 换值（**采用**）：期限本来就是「这条连接上这一批调用的预算」，重试与预算都在上层，一个客户端一份期限正好对应一个调用点。
+
+用 `self` 换值而不是 `&mut self`：`SessionHandle` 是 `Clone` 的、客户端可以随手复制给并发任务，可变期限会让两条并发调用互相影响——这种 bug 只在压力下出现，代价远高于多写一次 `CalcClient::new`。
 
 **这条改判的代价**：用户多写一行 `CalcClient::new(connect::<T>(ep, opts).await?)`。换来的是「进程内配对、UDS、TCP、shm 共用同一份客户端代码」，这也是 `tests/concurrency.rs` 能在两条传输上跑同一套断言的前提。
 ```
