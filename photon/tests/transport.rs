@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 #[cfg(feature = "local")]
@@ -238,7 +239,12 @@ async fn limit_knob<H: Harness>() {
     s_src.recv_limit().store(1024 * 1024, Ordering::Relaxed);
     // 收发必须并发推进：500 KiB 远超 UDS 缓冲区，先写完再读会自己把自己堵住。
     // 用 `join!` 而不是 `spawn`，是为了把 `c_sink` 留着给下一段断言。
-    let (send_res, recv_res) = tokio::join!(c_sink.send(big.clone()), s_src.recv());
+    // 外面再套一层超时：卡住要变成失败，而不是让整个测试二进制一直挂着。
+    let (send_res, recv_res) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(c_sink.send(big.clone()), s_src.recv())
+    })
+    .await
+    .expect("500 KiB 收发在 10 s 内没有推进，说明两侧没有并发");
     send_res.expect("放宽后应当发得出去");
     assert_eq!(recv_res.expect("接收 500 KiB").len(), big.len());
 

@@ -7,6 +7,7 @@ use bytes::Bytes;
 
 use crate::{error::RpcError, proto::header::validate};
 
+pub mod error_body;
 pub mod handshake;
 pub mod header;
 
@@ -111,7 +112,12 @@ pub struct Decoded {
 /// 顺序固定：长度 → 解码 → 切片 → 校验。长度检查必须在解码与切片之前，
 /// 否则一条超大异常帧会白走一遍逐字段校验。
 pub fn parse(msg: Bytes) -> Result<Decoded, RpcError> {
-    check_len(msg.len())?;
+    parse_with_limit(msg, MAX_MESSAGE_LEN)
+}
+
+/// 按会话协商出的上限解析。上限不是常量：它来自握手，两个方向可以不同。
+pub fn parse_with_limit(msg: Bytes, limit: usize) -> Result<Decoded, RpcError> {
+    check_len(msg.len(), limit)?;
 
     let header = Header::decode(&msg[..HEADER_LEN])?;
     // slice 而非 to_vec：只增引用计数，不复制字节。
@@ -122,16 +128,16 @@ pub fn parse(msg: Bytes) -> Result<Decoded, RpcError> {
 }
 
 /// 长度检查：不足 24 字节或超上限即拒绝。抽出来是为了让 `parse` 只做编排。
-fn check_len(len: usize) -> Result<(), RpcError> {
+fn check_len(len: usize, limit: usize) -> Result<(), RpcError> {
     if len < HEADER_LEN {
         return Err(RpcError::Protocol {
             detail: format!("消息长度 {len} < {HEADER_LEN}，头不完整"),
         });
     }
 
-    if len > MAX_MESSAGE_LEN {
+    if len > limit {
         return Err(RpcError::Protocol {
-            detail: format!("消息长度 {len} 超过上限 {MAX_MESSAGE_LEN}"),
+            detail: format!("消息长度 {len} 超过上限 {limit}"),
         });
     }
 

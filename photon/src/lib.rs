@@ -6,9 +6,11 @@
 
 pub mod error;
 pub mod proto;
+pub mod session;
 pub mod transport;
 
 pub use error::{RemoteError, RpcError};
+pub use session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
 
 use std::future::Future;
 use std::pin::Pin;

@@ -8,6 +8,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 bytes = "1.10.1"
 thiserror = "2"
 parking_lot = "0.12"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
 # M0 只落默认集；shm / blocking / interceptor / codec-rkyv / full

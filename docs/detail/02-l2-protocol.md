@@ -260,7 +260,7 @@ v0.7 的 `GoAway{last_request_id}` 已删：对称会话下它没有良定义—
 ## 9. 模块布局
 
 ```
-src/proto.rs      HEADER_LEN / MAX_MESSAGE_LEN、kind / flags 常量、Kind / Header / Decoded、`parse()` 入口（帧长检查 + 编排，不写校验分支）
+src/proto.rs      HEADER_LEN / MAX_MESSAGE_LEN、kind / flags 常量、Kind / Header / Decoded、`parse()` / `parse_with_limit()` 入口（帧长检查 + 编排，不写校验分支）
 src/proto/
   header.rs     24B encode / decode + 逐 kind 校验（M0 就做，否则端到端无法验证）
   error_body.rs code 表、8B 前缀编解码、RemoteError ↔ 错误体、`to_wire()` 白名单
@@ -271,6 +271,8 @@ src/proto/
     rkyv.rs     M5，ID = 1，独立 feature
 src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 ```
+
+**两个 `parse` 入口**：帧长上限不是常量——它来自握手，且两个方向可以不同。`parse()` 用 `MAX_MESSAGE_LEN` 这个常量上限，供单测与 M0 的固定上限场景；`Session` 的 reader 用 `parse_with_limit(msg, 本端声明值)`。二者只是把上限当参数，校验逻辑同一份。
 
 **模块文件是 `proto.rs` 而不是 `proto/mod.rs`（2024 风格）**：入口文件与子目录同名并列，`proto.rs` 里用 `pub mod header;` 声明子模块。`codec.rs` 与 `codec/` 同理。
 
