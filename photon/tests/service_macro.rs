@@ -147,6 +147,9 @@ trait Mixed {
     /// 在 blocking 线程里 panic：JoinError 必须变成错误体，而不是挂住请求。
     #[photon(blocking)]
     fn boom(&self) -> Result<(), RpcError>;
+    /// 显式声明零拷贝：只有同步 `fn` 能这么写（async / blocking 都会在展开期被拒）。
+    #[photon(zero_copy)]
+    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError>;
 }
 
 struct MixedImpl;
@@ -168,6 +171,10 @@ impl Mixed for MixedImpl {
 
     fn boom(&self) -> Result<(), RpcError> {
         panic!("blocking handler 炸了")
+    }
+
+    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError> {
+        Ok(u64::try_from(data.len()).unwrap_or(0))
     }
 }
 
@@ -229,6 +236,27 @@ async fn schedule_reflects_method_annotation() {
     assert_eq!(
         Service::schedule(&*service, __photon_mixed::HASH_SLOW_DOUBLE),
         photon::Schedule::Blocking
+    );
+}
+
+#[test]
+fn payload_mode_reflects_method_annotation() {
+    let service = Arc::new(MixedService::new(Arc::new(MixedImpl)));
+
+    // 默认 Copy：没标的方法一律走安全路径，框架不替用户做决定。
+    assert_eq!(
+        Service::payload_mode(&*service, __photon_mixed::HASH_DOUBLE),
+        photon::PayloadMode::Copy
+    );
+    // 只有显式 opt-in 的同步 fn 才是 ZeroCopy。
+    assert_eq!(
+        Service::payload_mode(&*service, __photon_mixed::HASH_DIGEST),
+        photon::PayloadMode::ZeroCopy
+    );
+    // 未知 method 也必须是安全默认值，而不是「猜一个」。
+    assert_eq!(
+        Service::payload_mode(&*service, 0xdead_beef),
+        photon::PayloadMode::Copy
     );
 }
 

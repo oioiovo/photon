@@ -111,6 +111,8 @@ struct Method {
     args: Vec<(syn::Ident, Type)>,
     /// `Result<T, E>` 里的 `T`。
     ok_ty: Type,
+    /// 显式标了 `#[photon(zero_copy)]`；只有同步 `fn` 才可能为真。
+    zero_copy: bool,
 }
 
 #[proc_macro_attribute]
@@ -291,6 +293,26 @@ fn expand(
             quote! { #helper::#hash }
         })
         .collect::<Vec<_>>();
+    let zero_copy_hashes = methods
+        .iter()
+        .filter(|m| m.zero_copy)
+        .map(|m| {
+            let hash = hash_ident(&m.name);
+            quote! { #helper::#hash }
+        })
+        .collect::<Vec<_>>();
+    let payload_mode_impl = if zero_copy_hashes.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
+                match method {
+                    #(#zero_copy_hashes)|* => ::photon::PayloadMode::ZeroCopy,
+                    _ => ::photon::PayloadMode::Copy,
+                }
+            }
+        }
+    };
     let schedule_impl = if blocking_hashes.is_empty() {
         quote! {}
     } else {
@@ -427,6 +449,7 @@ fn expand(
             }
 
             #schedule_impl
+            #payload_mode_impl
         }
 
         /// 用本服务的 `service_id` 占号。撞号返回 `Err`，不覆盖已有服务。
@@ -490,7 +513,7 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
         // 方法级属性只认 `blocking`；`zero_copy` 属于后续阶段，写出来要报错而不是
         // 静默忽略——静默忽略等于让用户以为它生效了。
         let mut blocking = false;
-        let mut zero_copy = None;
+        let mut zero_copy = false;
         for attr in &item_fn.attrs {
             if !attr.path().is_ident("photon") {
                 continue;
@@ -499,24 +522,16 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
             for meta in metas {
                 match &meta {
                     Meta::Path(path) if path.is_ident("blocking") => blocking = true,
-                    Meta::Path(path) if path.is_ident("zero_copy") => zero_copy = Some(meta),
+                    Meta::Path(path) if path.is_ident("zero_copy") => zero_copy = true,
                     other => {
                         return Err(syn::Error::new_spanned(
                             other,
-                            "方法级 `#[photon(...)]` 只接受 `blocking`",
+                            "方法级 `#[photon(...)]` 只接受 `blocking` 与 `zero_copy`",
                         ));
                     }
                 }
             }
         }
-        if let Some(meta) = zero_copy {
-            return Err(syn::Error::new_spanned(
-                meta,
-                "`zero_copy` 尚未实现：它要等 `PayloadMode` 与 shm 一起落地，\
-                 现在写出来不会生效",
-            ));
-        }
-
         let sig = &item_fn.sig;
         let kind = match (sig.asyncness.is_some(), blocking) {
             (true, false) => MethodKind::Async,
@@ -530,6 +545,24 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
             (false, false) => MethodKind::Sync,
             (false, true) => MethodKind::Blocking,
         };
+
+        // `zero_copy` 只对同步 `fn` 开放：跨 `await` 的 handler 会把 shm 槽位攥上
+        // 不可预期的时间，环被填满后整条通道停摆。blocking 方法同样排除——它在
+        // 池线程上一次性跑完，但时长由用户计算量决定，同样不可预期。
+        if zero_copy && !matches!(kind, MethodKind::Sync) {
+            let reason = match kind {
+                MethodKind::Async => {
+                    "`zero_copy` 只能标在同步 `fn` 上：async handler 跨 await 拿着 payload，\
+                     会把 shm 槽位攥上不可预期的时间"
+                }
+                MethodKind::Blocking => {
+                    "`zero_copy` 不能标在 `#[photon(blocking)]` 方法上：它在池线程上执行，\
+                     占用时长由用户计算量决定，不可预期"
+                }
+                MethodKind::Sync => unreachable!(),
+            };
+            return Err(syn::Error::new_spanned(sig, reason));
+        }
 
         let mut inputs = sig.inputs.iter();
         match inputs.next() {
@@ -577,6 +610,7 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
             kind,
             args,
             ok_ty,
+            zero_copy,
         });
     }
 

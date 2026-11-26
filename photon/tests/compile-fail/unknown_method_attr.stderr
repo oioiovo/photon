@@ -1,5 +1,5 @@
-error: `zero_copy` 尚未实现：它要等 `PayloadMode` 与 shm 一起落地，现在写出来不会生效
- --> tests/compile-fail/unknown_method_attr.rs:7:14
+error: 方法级 `#[photon(...)]` 只接受 `blocking` 与 `zero_copy`
+ --> tests/compile-fail/unknown_method_attr.rs:9:14
   |
-7 |     #[photon(zero_copy)]
-  |              ^^^^^^^^^
+9 |     #[photon(cache)]
+  |              ^^^^^

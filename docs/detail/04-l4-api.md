@@ -61,8 +61,8 @@ pub trait Service: Send + Sync + 'static {
 | 属性 | 适用 | 语义 |
 |---|---|---|
 | `#[photon(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking`（v0.19 生效） |
-| `#[photon(zero_copy)]` | 仅 `fn` | 该方法的入站 payload 允许直传。**尚未实现**（v0.19：宏直接报错，等 `PayloadMode` 与 shm 一起落地） |
-| `#[photon(error = MyError)]` | 服务级/方法级 | M3：把业务错误映射成 `code ≥ 0x1_0000` 的 `Remote` |
+| `#[photon(zero_copy)]` | 仅同步 `fn` | 该方法的入站 payload 允许直传；生成 `payload_mode` 覆盖返回 `ZeroCopy`（v0.26 生效，v1 上是 no-op，等 shm） |
+| `error = MyError` | **仅服务级** | v0.25：把业务错误映射成 `code ≥ 0x1_0000` 的 `Remote`；方法级不支持（同一 trait 里混两种错误类型没有意义） |
 
 **不合法的组合必须在编译期报错**，不能降级为警告：`async fn` + `blocking`、`async fn` + `zero_copy`、`fn` 不带 `blocking` 却出现在 blocking client 里（后者由生成逻辑自然规避）。
 
@@ -205,6 +205,28 @@ codec::decode(&reply).map_err(BizError::from_error)
 
 **debug 断言的必要性**：业务错误写成 `code 3` 会被客户端当成 `UnknownMethod`，`code 6` 会被当成 deadline——两种都是「看起来框架坏了」的假象，且只有在线日志里才能回溯。`assert_business_error` 在 `into_error` 之后立刻检查，release 下 `debug_assert!` 整体编译掉，不留分支。
 
+## 5.2 `PayloadMode`：两种取值在 v1 都是 no-op（v0.26）
+
+```rust
+#[photon::service(id = 8)]
+trait Mixed {
+    async fn add(&self, ..) -> Result<i64, RpcError>;
+    #[photon(zero_copy)]
+    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError>;   // 仅同步 fn
+}
+
+// 生成的 impl Service 里多一段
+fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
+    match method { HASH_DIGEST => PayloadMode::ZeroCopy, _ => PayloadMode::Copy }
+}
+```
+
+**为什么这一步不产生任何性能差异**：`tcp` / `local` / `memory` 交出来的 `Bytes` 都是 owned + `'static`，`Copy` 想拷贝也没有「借用槽位」可拷。真正为 `PayloadMode` 付钱的是 M5 的 shm 借用槽位——那时 `Copy` 才等于「先拷到堆缓冲再交给 handler」，`ZeroCopy` 才等于「把槽位直接借出去，handler 结束才归还」。
+
+所以这一步落的是三件**不涉及代码生成结果**的事：类型（`PayloadMode`）、通路（`Service::payload_mode` 与 `schedule` 并列）、护栏（`zero_copy` 只对同步 `fn` 放行）。护栏是唯一有立即收益的部分：把「async handler 攥住槽位」这种错误提前到编译期，而不是等 M5 在线上表现为「环被填满、通道停摆」。
+
+**`SessionOptions` 不加 `payload_mode`**：v1 里没有任何路径会读它——加了就是一个收下不用的参数，和 `Memory::pair` 去掉 `opts` 是同一条理由。M5 加总闸时用户代码不用改，因为 `#[photon(zero_copy)]` 已经存在，语义（全局关时方法标了也不生效）也已经定死。
+
 ## 6. 配额与线程池
 
 | 配额 | 谁消费 | 默认 | 说明 |
@@ -269,16 +291,16 @@ codec::decode(&reply).map_err(BizError::from_error)
 |---|---|---|
 | `id` 缺失 / 不是 `u16` 字面量 | 展开 | 指出「必须写 `id = N`」，并给一行正确写法 |
 | `async fn` + `#[photon(blocking)]` | 展开 | 「`blocking` 只能标在同步 `fn` 上」；v0.19 起由 `tests/compile-fail/blocking_on_async.rs` 冻结文本 |
-| `#[photon(zero_copy)]` / 未知方法级属性 | 展开 | 「尚未实现 / 只接受 `blocking`」；v0.19 由 `unknown_method_attr.rs` 冻结 |
+| 未知方法级属性（如 `cache`） | 展开 | 「只接受 `blocking` 与 `zero_copy`」；由 `unknown_method_attr.rs` 冻结 |
+| `async fn` / `#[photon(blocking)] fn` + `zero_copy` | 展开 | 分别说明「跨 await 会攥住槽位」「池线程时长不可预期」；由 `zero_copy_on_async.rs` / `zero_copy_on_blocking.rs` 冻结 |
 | 服务带 `blocking` 参数 | 展开 | 直接说「`BlockingClient` 还没做」，并指引用方法级 `#[photon(blocking)]`；**不许降级成同步 stub** |
 | 接收者不是 `&self`、返回不是 `Result`、参数是模式解构 | 展开 | 定位到具体方法，说明展开需要「简单标识符参数 + `Result` 返回」 |
 | 方法名重复或哈希相撞 | 展开 | 常量断言式检查；报出两个方法名 |
 | `async fn` + `blocking` | 展开 | 「同步方法才需要 `blocking`」 |
-| `async fn` + `zero_copy` | 展开 | 「`zero_copy` 只对 `fn` 开放」 |
 | 注册撞号 | 运行期（注册时） | `Err`，**不覆盖**已有服务 |
 | 改方法签名 | 编译期 | 在用户侧编译失败，错误信息必须定位到具体方法 |
 
-测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。v0.19 共四条：`blocking_on_async`、`unknown_method_attr`（`zero_copy`）、`missing_id`、`blocking_service`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。v0.17 的 `sync_method` 已删除：同步 `fn` 在 v0.19 起是合法声明。
+测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。截至 v0.26 共七条：`blocking_on_async`、`blocking_service`、`missing_id`、`unknown_method_attr`（`cache`）、`zero_copy_on_async`、`zero_copy_on_blocking`、`error_type_mismatch`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。v0.17 的 `sync_method` 已删除：同步 `fn` 在 v0.19 起是合法声明；`unknown_method_attr` 原先用 `zero_copy` 当「未知属性」，`zero_copy` 在 v0.26 转正后改用真正不存在的 `cache`。
 
 ---
 

@@ -71,6 +71,24 @@ pub trait ServiceError: Sized {
     fn from_error(err: RpcError) -> Self;
 }
 
+/// payload 交给 handler 的方式。
+///
+/// **v1 的两种取值都是 no-op**：tcp / local / memory 交出来的 `Bytes` 本身就是
+/// owned + `'static`，拷一次没有收益，`Copy` 只是「默认安全」的语义。真正为它付钱
+/// 的是 M5 的 shm 借用槽位——那时 `Copy` 才等于「先拷到堆缓冲再交给 handler」。
+///
+/// 之所以现在就定下来：语法一旦晚于用户代码出现，就得逼所有人回来改 trait。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadMode {
+    /// 默认。借用型 payload 先拷出再进 handler；owned payload 上是 no-op。
+    #[default]
+    Copy,
+    /// 高风险：payload 的生命周期会与 handler 执行时长绑定（shm 槽位迟迟不归还）。
+    ///
+    /// 只对同步 `fn` 开放，且必须逐方法显式写 `#[photon(zero_copy)]`。
+    ZeroCopy,
+}
+
 /// 被暴露为 RPC 服务的对象。
 ///
 /// `self: Arc<Self>` 而不是 `&self`：处理一次调用期间对象必须保持存活，且同一
@@ -93,5 +111,15 @@ pub trait Service: Send + Sync + 'static {
     /// 那时只有 `service_id + method`，还没机会看到实现的分支。
     fn schedule(&self, _method: u64) -> Schedule {
         Schedule::Async
+    }
+
+    /// 这个方法的 payload 怎么交给 handler。
+    ///
+    /// 默认 `Copy`；宏只给显式标了 `#[photon(zero_copy)]` 的同步 `fn` 生成
+    /// `ZeroCopy`。和 `schedule` 放在一起，是因为两者都是「进入 handler 之前
+    /// 就得知道、且只有宏知道」的编译期属性，M5 的 shm 路径要读这个值决定
+    /// 是否把槽位直接借用出去。
+    fn payload_mode(&self, _method: u64) -> PayloadMode {
+        PayloadMode::Copy
     }
 }

@@ -1,0 +1,5 @@
+error: `zero_copy` 只能标在同步 `fn` 上：async handler 跨 await 拿着 payload，会把 shm 槽位攥上不可预期的时间
+  --> tests/compile-fail/zero_copy_on_async.rs:10:5
+   |
+10 |     async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
