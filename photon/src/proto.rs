@@ -7,6 +7,7 @@ use bytes::Bytes;
 
 use crate::{error::RpcError, proto::header::validate};
 
+pub mod handshake;
 pub mod header;
 
 /// 语义头长度。任何消息的 payload 都从偏移 24 开始。

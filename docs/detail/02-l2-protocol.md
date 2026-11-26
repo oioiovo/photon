@@ -246,6 +246,8 @@ pub fn to_wire(e: &RpcError) -> Option<ErrorBody>
 | 8 | 2 | `codec_id` | `Codec::ID`；不等即断 |
 | 10 | 2 | `reserved` | 必须 0（v0.8 的 `payload_mode` 从这里移除） |
 
+落地位置 `proto/handshake.rs`：`encode()` 只产 12 字节 payload、`encode_frame()` 拼 36 字节整帧、`decode()` 校验长度与保留位、`from_decoded()` 确认首帧 kind、`check_against()` 做版本与 codec 的 fail-fast 比对。**`max_message_len` 不参与比对**：两个方向各用各的值，不取小。
+
 ### 8.2 `GoAway` / `Cancel`
 
 - `GoAway`：payload 为空，全部字段按 3.2 为 0；`flags` bit2 = 1 表示急停（不等 in-flight）。
@@ -262,7 +264,7 @@ src/proto.rs      HEADER_LEN / MAX_MESSAGE_LEN、kind / flags 常量、Kind / He
 src/proto/
   header.rs     24B encode / decode + 逐 kind 校验（M0 就做，否则端到端无法验证）
   error_body.rs code 表、8B 前缀编解码、RemoteError ↔ 错误体、`to_wire()` 白名单
-  control.rs    Handshake / GoAway / Cancel 的手写编解码（12B / 0B / 0B）
+  handshake.rs  Handshake 的 12B 编解码与语义比对（已落地）；GoAway / Cancel 的 payload 恒空，由 header::validate 覆盖，不再单开文件
   codec.rs      Codec trait + `codec::Default` 别名（由 feature 决定）
   codec/
     postcard.rs postcard 实现（默认，ID = 0）

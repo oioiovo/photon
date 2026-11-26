@@ -158,7 +158,7 @@ photon/                          # workspace 根
 │   │   ├── proto/
 │   │   │   ├── header.rs        # 24 字节语义头 + 手工编解码
 │   │   │   ├── error_body.rs    # 错误体 8B 前缀 + code 表（见 3.8）
-│   │   │   ├── control.rs       # Handshake / GoAway / Cancel 手写定长编解码
+│   │   │   ├── handshake.rs     # Handshake 12B 编解码；GoAway / Cancel 的 payload 恒空
 │   │   │   ├── codec.rs         # Codec trait（含 const ID）+ codec::Default 别名
 │   │   │   └── codec/
 │   │   │       ├── postcard.rs  # 默认实现，ID = 0
