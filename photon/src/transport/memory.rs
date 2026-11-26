@@ -165,6 +165,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_between_task_is_zero_copy() {
+        let ((_a_src, mut a_sink), (mut b_src, _b_sink)) = Memory::pair();
+
+        // `Bytes::from_owner` 把一块外部内存交给 `Bytes` 管，正是「顺手 copy 一份」
+        // 最容易被写坏的路径；用指针相等来证明它只是换了主人，字节没动过。
+        let owned = vec![0x5Au8; 512];
+        let ptr = owned.as_ptr();
+        let msg = Bytes::from_owner(owned);
+        assert_eq!(msg.as_ptr(), ptr, "from_owner 不应复制");
+
+        a_sink.send(msg).await.expect("发送");
+        let received = b_src.recv().await.expect("接收");
+        assert_eq!(
+            received.as_ptr(),
+            ptr,
+            "memory 传输在收发之间复制了字节；进程内都做不到零拷贝，shm 就没有意义"
+        );
+        assert_eq!(received.len(), 512);
+    }
+
+    #[tokio::test]
     async fn recv_over_limit_is_invalid_data() {
         let ((_a_src, mut a_sink), (mut b_src, _b_sink)) = Memory::pair();
         b_src.recv_limit().store(1024, Ordering::Relaxed);

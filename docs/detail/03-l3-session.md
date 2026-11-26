@@ -251,12 +251,12 @@ loop {
 
 1. `let svc = registry.get(service_id)` → 无 → `RemoteError::new(2)`（回包侧构造，见 `02` 7.3）；
 2. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RemoteError::new(3)`；
-3. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**；
-4. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<ErrorBody>`**（`02-l2-protocol.md` 7.3 的白名单）：
+3. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
+4. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<(u32, bool, String)>`**（`02-l2-protocol.md` 7.3 的白名单）：
    - `Ok(Ok(bytes))` → `Response`，flags bit0 = 0；
-   - `Ok(Err(e))` → `to_wire(&e)`：`Some(body)` → `Response` + bit0 = 1；`None`（`Closed`/`Io`/`Protocol`/`RuntimeDropped`）→ 记 `error` 日志并按 `code = 0` 兜底，**不许静默丢帧**；
-   - `Err(JoinError)`（panic / 被取消）→ `Remote { code: 0 }` 的错误体 + 本端 `tracing::error!`。
-5. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。
+   - `Ok(Err(e))` → `to_wire(&e)`：`Some` → `Response` + bit0 = 1；`None`（`Io`/`Protocol`/`RuntimeDropped`）→ 按 `code = 0` 兜底，**不许静默丢帧**；
+   - `Err(JoinError)`（panic）→ `Remote { code: 0 }` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
+5. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性目前由默认 panic hook 打到 stderr，收敛成结构化日志（`tracing`）留到 M3。
 
 > **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `to_wire` 一张表：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
 
@@ -400,9 +400,12 @@ struct ClosingState {
 | 项 | 判据 | 阶段 |
 |---|---|---|
 | 并发乱序 | 100 个并发请求、响应乱序返回，互不串包 | M1 |
-| 首帧强制 | 首帧非 `Handshake` → 100 ms 内断连，错误 `Protocol` | M1 |
-| 换 transport | `tcp` → `local`，`session/` 一行不改（只改示例的 `Endpoint`） | M1 |
-| 零拷贝形状 | `memory` 上返回 `Bytes::from_owner`，全程无额外拷贝 | M1 |
+| 首帧强制 | 首帧非 `Handshake` → 200 ms 内断连，错误 `Protocol` | M1 |
+| 换 transport | 同一套会话用例在 `memory` 与 `local` 上各跑一遍（8 条 × 2），`session.rs` 一行不改 | M1 |
+| 零拷贝形状 | `memory` 上返回 `Bytes::from_owner`，收发后指针不变（`tests` 里断言 `as_ptr` 相等） | M1 |
+| handler panic | 服务实现 panic → 调用方拿到 `Remote{0}` + panic 文本，会话不断连 | M1 |
+| 对端关闭 | 对端 `close()` 后新调用 200 ms 内变 `Closed`，不挂在 pending 表上 | M1 |
+| 上限方向性 | 对端声明 1 MiB、本端 64 KiB 时 200 KiB 请求发得出去（写上限取对端声明值） | M1 |
 | 杀进程 | 服务端被 kill，客户端 100 ms 内收到明确错误而非挂死 | M3 |
 | 握手失败 | `codec_id` 不等 / `reserved != 0` → 断连 | M3 |
 | 配额 | 并发压测后 `outbound.pending` 从未越界；客户端 `max_blocking_in_flight = 0` 仍正常；入站与出站配额互不影响 | M3 |

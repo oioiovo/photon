@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -576,39 +576,60 @@ where
         let method = header.method;
         let deadline_ms = header.deadline_ms;
 
+        // 外层 task 只负责一件事：里层 panic 时也要回一个错。
+        // 服务是被第三方代码调用的，panic 属于真实输入；没有这一层，那个请求
+        // 就只能等调用方的期限自己超时，而服务端看起来「什么都没发生」。
+        // 代价是每个请求多一次 spawn；将来若压测显示这层成本显著，再换成
+        // `catch_unwind`（要引入 futures，且 panic 语义得搬进 async 块里）。
+        let outer_tx = tx.clone();
+        let outer_cancels = Arc::clone(&cancels);
         tokio::spawn(async move {
-            let deadline = async move {
-                match deadline_ms {
-                    0 => std::future::pending::<()>().await,
-                    ms => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
-                }
-            };
+            let inner = tokio::spawn(async move {
+                let deadline = async move {
+                    match deadline_ms {
+                        0 => std::future::pending::<()>().await,
+                        ms => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
+                    }
+                };
 
-            let outcome = tokio::select! {
-                biased;
-                _ = token.cancelled() => Err(RpcError::Remote(RemoteError {
-                    code: 5,
-                    retryable: false,
-                    message: "cancelled by peer".into(),
-                })),
-                _ = shutdown.cancelled() => Err(RpcError::Closed),
-                _ = deadline => Err(RpcError::Timeout),
-                res = svc.call(method, payload) => res,
-            };
+                let outcome = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(RpcError::Remote(RemoteError {
+                        code: 5,
+                        retryable: false,
+                        message: "cancelled by peer".into(),
+                    })),
+                    _ = shutdown.cancelled() => Err(RpcError::Closed),
+                    _ = deadline => Err(RpcError::Timeout),
+                    res = svc.call(method, payload) => res,
+                };
 
-            let frame = match outcome {
-                Ok(body) => response_frame(request_id, body, false),
-                Err(e) => {
-                    let (code, retryable, message) = error_body::code_for(&e);
-                    let body = error_body::encode(code, retryable, &message);
-                    response_frame(request_id, body, true)
-                }
-            };
-            let _ = tx.send(frame).await;
+                let frame = match outcome {
+                    Ok(body) => response_frame(request_id, body, false),
+                    Err(e) => {
+                        // 框架级故障（Io / Protocol / RuntimeDropped）没有合适的业务码，
+                        // 按 `0` 兜底；但回包路径上绝不静默丢帧。
+                        let (code, retryable, message) =
+                            error_body::to_wire(&e).unwrap_or_else(|| (0, false, format!("{e}")));
+                        let body = error_body::encode(code, retryable, &message);
+                        response_frame(request_id, body, true)
+                    }
+                };
+                let _ = tx.send(frame).await;
 
-            cancels.lock().remove(&request_id);
-            // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
-            drop(guard);
+                cancels.lock().remove(&request_id);
+                // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
+                drop(guard);
+            });
+
+            if let Err(join) = inner.await
+                && join.is_panic()
+            {
+                // guard 已在 unwind 里 drop，这里只剩「回包 + 摘 token」。
+                let body = error_body::encode(0, false, &panic_text(join));
+                let _ = outer_tx.send(response_frame(request_id, body, true)).await;
+                outer_cancels.lock().remove(&request_id);
+            }
         });
 
         Ok(())
@@ -717,6 +738,19 @@ where
             }
             None => return,
         }
+    }
+}
+
+/// 从 `JoinError` 里掏出 panic 的文本：`panic!("boom")` 与 `panic!("{}", x)` 的
+/// payload 类型不同，两种都要认。
+fn panic_text(err: JoinError) -> String {
+    let payload = err.into_panic();
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        format!("handler panicked: {text}")
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        format!("handler panicked: {text}")
+    } else {
+        "handler panicked".into()
     }
 }
 

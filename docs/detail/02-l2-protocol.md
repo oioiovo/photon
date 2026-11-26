@@ -213,8 +213,10 @@ pub trait Codec {
 唯一出口函数（`proto/error_body.rs`，全项目只允许这一处拼错误体）：
 
 ```rust
-pub fn to_wire(e: &RpcError) -> Option<ErrorBody>
+pub fn to_wire(e: &RpcError) -> Option<(u32, bool, String)>
 ```
+
+返回的是「错误体的三个字段」，不是封装类型：`error_body::encode` 才是拼字节的那一步，这里只决定线上该写什么码。
 
 | `RpcError` 变体 | 上线 code |
 |---|---|
@@ -224,7 +226,8 @@ pub fn to_wire(e: &RpcError) -> Option<ErrorBody>
 | `Cancelled`（ handler 被 `Cancel` 中止） | `5` |
 | `Timeout`（handler 自己的 deadline 到期） | `6` |
 | `Remote { code, .. }` | 原码（用户业务错误即 `code ≥ 0x1_0000`） |
-| `Closed` / `Io` / `Protocol` / `RuntimeDropped` | `None`（回包路径上出现属框架异常，记 error 日志后按 `0` 兜底，不静默丢帧） |
+| `Closed` | `7`（回包侧声明「本端正在关闭」是准确陈述，`7` 就是为这句话留的） |
+| `Io` / `Protocol` / `RuntimeDropped` | `None`（框架自身出问题，编成任何业务码都是误导；按 `0` 兜底，**不静默丢帧**） |
 
 **`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**：由**回包侧**用 `RemoteError::new(code)` 造 `Remote`，再经 `to_wire` 透传（`Remote` 走原码直通）。只允许三处调用：查不到 `service_id`、查不到 `method`、`ingress == Draining`。这条同时堵住两个已经写歪的地方：`04-l4-api.md` 的未知方法分支曾自己 `RemoteError::new(3)` 却没说明「这是回包侧允许的行为」，`03-l3-session.md` 曾把 `Timeout → 6`、`Overloaded → 1` 写成散装映射、绕过白名单。
 

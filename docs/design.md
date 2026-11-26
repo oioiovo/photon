@@ -2,9 +2,9 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M0 — 搭架构骨架，先实现 Rust ↔ Rust 的进程间通讯**。
+> 当前阶段：**M1 — 多路复用已落地**（`Session` 能在 `memory` 与 `local` 上跑通同一套用例），下一步 M2。
 >
-> 版本：**v0.15**（`local` 传输落地：Unix 上手搓 `tokio::net::UnixStream`，保留半关闭；同时把 drop 契约从「必须半关闭」改判为「本端不再写 + 能力声明」。线格式、字节布局与 17 条校验零改动）
+> 版本：**v0.16**（L3 `Session` 骨架、错误体、握手首帧强制与 panic 兜底落地；同时把错误出口函数的签名与实现对齐（`to_wire -> Option<(code, retryable, message)>`）。线格式、字节布局与 17 条校验零改动）
 
 ## 变更记录
 
@@ -25,6 +25,7 @@
 | **v0.12** | **样例承载方式改为源码内联，线格式零改动**。① 七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 里的内联字节数组（`assert_golden` 的 `expected` 参数），删除 `tests/fixtures/` 目录与 `include_bytes!` 这层路径管理。理由：`.bin` 在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果完全等价。② 布局约束第 4 条随之重写（原「`tests/fixtures/` 从 M0 就存在」→「样例内联在 `tests/protocol.rs`」），1.3 目录树删掉 fixtures 子目录。③ **`PROTOCOL.md` §9 第 12 条（帧长上限）在 M0 落地**：新增 `proto::MAX_MESSAGE_LEN = 64 KiB`，`parse` 在解码与切片之前先查长度（`check_len`），恰好等于上限放行、多 1 字节拒绝，两个用例都只差长度、字段全合法。④ 同步 `PROTOCOL.md` §8.8 表头与 §11 生成/冻结流程、`detail/02` §10 与测试矩阵。 |
 | **v0.13** | **`Transport::bind` 改为异步，线格式零改动**。① 原同步签名与实现的真实前置条件不符：tokio 的 `TcpListener::from_std` 必须把 fd 注册进当前 runtime 的 driver，取不到 `Handle` 时 `Handle::current()` 直接 panic（`there is no reactor running`），而签名返回 `io::Result` 又让调用方以为失败一定可处理——错误类型错位。② 改为返回 `impl Future<Output = io::Result<Self>> + Send`：实现可直接用 `tokio::net::TcpListener::bind().await`，不再需要 `std::net::TcpListener::bind` + `set_nonblocking` + `from_std` 三步，也不需要运行时的 `try_current` 补丁——「必须被某个 executor poll」成为类型上的前置条件，漏掉是编译错误而不是构造期 panic。③ 三个发起动作（`bind` / `connect` / `accept`）由此统一在 async 世界，`detail/01` 的 `L1-C4` 改为「三者皆异步」。④ 门面代价口径修正：`AnyTransport::bind` 现在同样要一次 `Box::pin`，但一个进程只调一次，不在热路径。**同步改动**：`design.md` 2 节 trait 片段与 2.5 门面代价段、`detail/01` `L1-C4` / 模块表 / §6.1 / §7.2、`detail/04` `Server::bind` 签名与装配清单、`detail/00` 版本指向、`PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 | **v0.14** | **`memory` 落地，`Memory::pair` 去掉 `opts`，线格式零改动**。① 产出 `transport/memory.rs`：`pair()` 造两条单向 `mpsc`（容量 `DEFAULT_QUEUE_CAPACITY = 1024`，实现常量不是协议约定）；读半把通道 `None` 映射 `UnexpectedEof`（返回空消息会让 L2 误诊成「头不完整」），读侧超上限报 `InvalidData`，写侧超上限报 `InvalidInput` 且连接保持可用。② **不实现 `Transport`**：`bind` / `connect` / `accept` 对「已经接好的一对 channel」没有对应动作，造一个按名字查找的注册表等于给它加一套不该有的寻址。③ `pair(opts)` → `pair()`：`TransportOptions` 的 `connect_timeout` 与 `spin_hint` 对进程内配对都无意义，收下不用就是坏参数。④ 新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体只写一份，`tcp` 与 `memory` 各跑一遍（12 条全绿）——这是 M0 对 L1 抽象的唯一客观证据。**同步改动**：`design.md` 2.7 与 10.5、`detail/01` §3 目录树与 §6.3、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
+| **v0.16** | **M1 落地：`Session` 骨架 + 错误体，线格式零改动**。① 产出 `session.rs`：`pending` 表（`PendingEntry` 带 `Drop` guard，超时/取消/panic 三条路径都回收配额）+ reader/writer 两个 task（`Source`/`Sink` 都是 `&mut self` 且非 `Sync`，拆开之后「谁来保证不并发写」在结构上不存在）+ 首帧强制 `Handshake` + `SessionOptions{max_message_len, close_timeout, handshake_timeout, max_async_in_flight}`。② 产出 `proto/error_body.rs`：8B 前缀编解码与 `to_wire`；**签名对齐实现**：`to_wire(&RpcError) -> Option<(u32, bool, String)>`，`Io`/`Protocol`/`RuntimeDropped` 返回 `None` 由调用方按 `0` 兜底（不静默丢帧），`Closed` 映射 `7`（回包侧说「正在关闭」是准确陈述）。③ `proto::parse` 拆出 `parse_with_limit`：帧长上限来自握手且两方向可以不同，写死 64 KiB 会让「对端声明 1 MiB」永远收不到大帧（真 bug，测试抓到）。④ handler panic 兜底：外层 task `await` 里层 `JoinHandle`，`JoinError` → `Remote{0}` + panic 文本；代价是每请求多一次 `spawn`（换 `catch_unwind` 要引入 `futures`，留待压测后再议）。⑤ `memory` 零拷贝形状验证：`Bytes::from_owner` 收发后 `as_ptr` 不变。⑥ `tests/session.rs` 改成「用例体一份 + `Harness` 两种实现」，8 条用例在 `memory` 与 `local` 各跑一遍（16 条）——M1 的「换 transport 不改上层」由此变成可执行断言。⑦ `limit_knob` 套 10 s 超时：卡住要变失败，而不是让整个测试二进制挂着。**同步改动**：`detail/02`（`parse` 双入口、`to_wire` 签名与 code 表、模块表）、`detail/03`（§6.2 的 spawn/JoinError 口径、§10 验收表补 3 行并纠正首帧窗口）、`detail/00` 与 `PROTOCOL.md` 版本指向、`design.md` M1 清单与 M2 错误体项勾选。 |
 | **v0.15** | **`local` 落地 + drop 契约改判**。① 产出 `transport/local.rs`：Unix 上手搓 `tokio::net::UnixStream`（零新依赖，约 240 行含测试），`OwnedWriteHalf::drop` 免费拿到 `SHUT_WR`；`Endpoint::Local(LocalAddr)` + `local` feature（不进默认集）；Windows 开启该 feature 直接 `compile_error!`（named pipe 无半关闭、server 需 per-connection 新建，没有测试环境不写）。② **把 2.1 的 drop 契约从「必须尽力半关闭写方向（验收项）」改判为「drop 后本端不再写」**，对端能否观测 EOF 降级为**实现能力**，正确性改由 `GoAway` + `close_timeout` 兜底——原写法需要给 named pipe 开例外条款，而需要例外才成立的契约不是契约。③ `tests/transport.rs` 的 `Harness` 增加 `const PEER_SEES_EOF: bool` 能力位，EOF 用例改为「按声明断言」，同一份用例体覆盖 3 个实现（21 条）。④ 顺带修一处测试自身的缺陷：`limit_knob` 先写 500 KiB 再读，在 UDS 缓冲区上会自堵（tcp 的缓冲够大所以没暴露），改为 `join!` 并发推进。 |
 
 ---
@@ -1340,15 +1341,16 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 
 ### M1 — 多路复用（1–2 天）
 
-- [ ] `Session`：pending map（**带 `Drop` guard 的 `PendingEntry`**）+ reader task + writer task
-- [ ] `Request` / `Response` 语义
-- [ ] `Handshake` **最小版**：固定 12 字节、版本 1、首帧强制、握手超时与握手前 64 KiB 上限（完整协商留到 M3）
+- [x] `Session`：pending map（**带 `Drop` guard 的 `PendingEntry`**）+ reader task + writer task
+- [x] `Request` / `Response` 语义
+- [x] `Handshake` **最小版**：固定 12 字节、版本 1、首帧强制、握手超时与握手前 64 KiB 上限（完整协商留到 M3）
 - [x] `Transport` 换成 `local`（Unix 手搓 UDS，M0 已落地；Windows 分支推迟，见 2.6）
-- [ ] 用 `cargo test --features local` 跑通本地 IPC 的 21 条用例
-
-- [ ] `shutdown` token 覆盖 reader **与 writer** 两个 task，让两边都能被唤醒并非阻塞退出（v0.8 删掉了 `MessageSource::close`，见 2.1）
-- [ ] 并发测试：100 个并发请求乱序返回，互不串包
-- [ ] **零拷贝形状验证**：在 `memory` 上返回 `Bytes::from_owner`，确认全程没有额外拷贝
+- [x] 用 `cargo test --features local` 跑通本地 IPC：`tests/transport.rs` 21 条 + `tests/session.rs` 8 条（同一套会话用例在 `memory` 与 `local` 上各跑一遍）
+- [x] `shutdown` token 覆盖 reader **与 writer** 两个 task，让两边都能被唤醒并非阻塞退出（v0.8 删掉了 `MessageSource::close`，见 2.1）
+- [x] 并发测试：100 个并发请求乱序返回，互不串包
+- [x] **零拷贝形状验证**：在 `memory` 上返回 `Bytes::from_owner`，确认全程没有额外拷贝
+- [x] `GoAway` / `close()` 六步：对端关闭后新调用在毫秒级内变 `Closed`，不挂在 pending 表上
+- [x] handler 的 panic 兜底：服务实现 panic 时回 `code 0`，连接不被一条坏请求打死
 
 **验收**：把 transport 从 TCP 换成本地 IPC，`Session` 代码一行不改；`memory` 的 zero-copy 路径跑通；首帧非 `Handshake` 会被断连。
 
@@ -1359,7 +1361,7 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 - [ ] method 哈希（**只哈希方法名**）碰撞与重复检测 + **方法名表** + golden 哨兵测试
 - [ ] **`Service::call` 用 `self: Arc<Self>` 接收者**（为 `spawn_blocking` 预留，见 5.1；用 `&self` 后面要返工）
 - [ ] `ServiceRegistry` 按 `service_id` 路由（表先静态构建，结构留动态；撞号注册报错）
-- [ ] **错误体提前落地**（3.8 的 `code` 表 + `RpcError::Remote`）：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
+- [x] **错误体提前落地**（3.8 的 `code` 表 + `RpcError::Remote`）——M1 已随 `proto/error_body.rs` 完成：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
 - [ ] 示例组 `local_calc` / `calc_server` / `calc_client`，覆盖 10.3 的**第 1、2、5 三种形态**
 - [ ] `tests/concurrency.rs`：同一套测试在 `tcp` 与 `memory` 上全绿
 - [ ] 本阶段**只支持 `async fn` 声明**；`fn` 与 `#[photon(blocking)]` 放到 M3（见 5.2）
