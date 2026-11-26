@@ -90,7 +90,7 @@ src/transport/
   framing.rs    FramedSource<S> / FramedSink<S>：长度前缀、读满、双向上限旋钮
   tcp.rs        TcpTransport（tokio bind + nodelay + into_split）
   local.rs      LocalTransport（interprocess，tokio feature）
-  memory.rs     MemoryTransport + Memory::pair(opts) -> ((Source, Sink), (Source, Sink))
+  memory.rs     Memory::pair() -> ((Source, Sink), (Source, Sink))；不实现 Transport
   any.rs        AnySource / AnySink / AnyTransport（枚举门面，按 feature 裁剪变体）
   shm.rs        （M5）段管理、SPSC 环、块池、心跳；内部真拆子模块时须回填 1.3 的树
 ```
@@ -223,7 +223,8 @@ src/transport/
 
 ### 6.3 `memory`（一致性测试替身）
 
-- 形状：`Memory::pair(opts) -> ((Source, Sink), (Source, Sink))`——第一组给 A 侧，第二组给 B 侧，每组都是完整一对（`design.md` 2.7）。
+- 形状：`Memory::pair() -> ((Source, Sink), (Source, Sink))`——第一组给 A 侧，第二组给 B 侧，每组都是完整一对（`design.md` 2.7）。队列容量是实现常量（默认 1024），**不吃 `TransportOptions`**：里面那两项（连接超时、忙轮询）对「已经接好的两条 channel」都没有意义，收下不用只会变成一个坏参数。
+- **不实现 `Transport`**：`bind` / `connect` / `accept` 在进程内配对里没有对应动作。硬造一个按名字查找的注册表，等于给 `memory` 加一套它不该有的寻址，而 2.x 明确说了地址不参与查找。
 - 内部：两条单向 `mpsc`（A→B、B→A），容量默认 1024（实现默认值，不是协议约定）。
 - `recv`：`rx.recv().await` → `Option`，`None` 即对端写半已 drop，返回 `UnexpectedEof`（不是 `Ok` 空帧）。
 - `send`：`tx.send(msg).await`，队列满即等待（这是背压，不是错误）。

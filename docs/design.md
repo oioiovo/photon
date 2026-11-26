@@ -4,7 +4,7 @@
 >
 > 当前阶段：**M0 — 搭架构骨架，先实现 Rust ↔ Rust 的进程间通讯**。
 >
-> 版本：**v0.13**（只把 `Transport::bind` 从同步改为异步，让「必须在 runtime 内」成为类型上的前置条件；线格式、字节布局与 17 条校验零改动）
+> 版本：**v0.14**（`memory` 传输落地，`Memory::pair` 去掉 `opts` 参数并明确不实现 `Transport`；新增 `tests/transport.rs` 用同一套用例同时验收 `tcp` 与 `memory`。线格式、字节布局与 17 条校验零改动）
 
 ## 变更记录
 
@@ -24,6 +24,7 @@
 | **v0.11** | **工程约定定稿，线格式零改动**。① **模块文件统一 2024 风格**：`foo.rs` + `foo/`，禁 `foo/mod.rs`。两种写法 rustc 都合法（`foo.rs` 与 `foo/mod.rs` 不能并存），官方自 1.30 起鼓励新写法，本项目为「入口文件与子目录并列、一眼可见」而统一采用；1.3 目录树按此重画（`transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`）。② **`edition = "2024"` + `resolver = "3"`**，根 `Cargo.toml` 定为纯 virtual workspace（只有 `[workspace]`，不再同时挂 `[package]`，否则没有 target 会直接报 `no targets specified in the manifest`）。③ **成员名定死 `photon-macros`（复数）**，且它是 `proc-macro = true` 的 **lib** crate——proc-macro 不能是 bin，`src/main.rs` 的写法编译不过。④ **布局约束从四条变五条**，新增第 5 条即模块文件风格。**同步改动**：`docs/detail/01` §3 文件表、`docs/detail/02` §9 模块布局改为 `transport.rs` / `proto.rs` / `codec.rs`，并各加一段「为什么不是 `mod.rs`」。`PROTOCOL.md` 只更新版本指向，字节布局与 17 条校验一字未动。 |
 | **v0.12** | **样例承载方式改为源码内联，线格式零改动**。① 七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 里的内联字节数组（`assert_golden` 的 `expected` 参数），删除 `tests/fixtures/` 目录与 `include_bytes!` 这层路径管理。理由：`.bin` 在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果完全等价。② 布局约束第 4 条随之重写（原「`tests/fixtures/` 从 M0 就存在」→「样例内联在 `tests/protocol.rs`」），1.3 目录树删掉 fixtures 子目录。③ **`PROTOCOL.md` §9 第 12 条（帧长上限）在 M0 落地**：新增 `proto::MAX_MESSAGE_LEN = 64 KiB`，`parse` 在解码与切片之前先查长度（`check_len`），恰好等于上限放行、多 1 字节拒绝，两个用例都只差长度、字段全合法。④ 同步 `PROTOCOL.md` §8.8 表头与 §11 生成/冻结流程、`detail/02` §10 与测试矩阵。 |
 | **v0.13** | **`Transport::bind` 改为异步，线格式零改动**。① 原同步签名与实现的真实前置条件不符：tokio 的 `TcpListener::from_std` 必须把 fd 注册进当前 runtime 的 driver，取不到 `Handle` 时 `Handle::current()` 直接 panic（`there is no reactor running`），而签名返回 `io::Result` 又让调用方以为失败一定可处理——错误类型错位。② 改为返回 `impl Future<Output = io::Result<Self>> + Send`：实现可直接用 `tokio::net::TcpListener::bind().await`，不再需要 `std::net::TcpListener::bind` + `set_nonblocking` + `from_std` 三步，也不需要运行时的 `try_current` 补丁——「必须被某个 executor poll」成为类型上的前置条件，漏掉是编译错误而不是构造期 panic。③ 三个发起动作（`bind` / `connect` / `accept`）由此统一在 async 世界，`detail/01` 的 `L1-C4` 改为「三者皆异步」。④ 门面代价口径修正：`AnyTransport::bind` 现在同样要一次 `Box::pin`，但一个进程只调一次，不在热路径。**同步改动**：`design.md` 2 节 trait 片段与 2.5 门面代价段、`detail/01` `L1-C4` / 模块表 / §6.1 / §7.2、`detail/04` `Server::bind` 签名与装配清单、`detail/00` 版本指向、`PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
+| **v0.14** | **`memory` 落地，`Memory::pair` 去掉 `opts`，线格式零改动**。① 产出 `transport/memory.rs`：`pair()` 造两条单向 `mpsc`（容量 `DEFAULT_QUEUE_CAPACITY = 1024`，实现常量不是协议约定）；读半把通道 `None` 映射 `UnexpectedEof`（返回空消息会让 L2 误诊成「头不完整」），读侧超上限报 `InvalidData`，写侧超上限报 `InvalidInput` 且连接保持可用。② **不实现 `Transport`**：`bind` / `connect` / `accept` 对「已经接好的一对 channel」没有对应动作，造一个按名字查找的注册表等于给它加一套不该有的寻址。③ `pair(opts)` → `pair()`：`TransportOptions` 的 `connect_timeout` 与 `spin_hint` 对进程内配对都无意义，收下不用就是坏参数。④ 新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体只写一份，`tcp` 与 `memory` 各跑一遍（12 条全绿）——这是 M0 对 L1 抽象的唯一客观证据。**同步改动**：`design.md` 2.7 与 10.5、`detail/01` §3 目录树与 §6.3、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 
 ---
 
@@ -436,7 +437,7 @@ pub enum Endpoint {
 
 endpoint 必须携带足够的寻址信息，让 L3 完全无感——L3 拿到 endpoint 就直接调 `T::connect(ep, opts)`。
 
-> **`Endpoint::Memory` 是唯一一个「不参与查找」的变体（v0.8 补）。** `memory` 走的是「进程内直接配对」，而且返回的是**两份半身**而不是一份：`Memory::pair(opts) -> ((Source, Sink), (Source, Sink))`——第一组给 A 侧、第二组给 B 侧。v0.8 只写「返回两半」，但一条双向会话需要 `(Source, Sink)` **各一份**，`Session` 没法只靠一个 `Source` 和一个 `Sink` 跑起来（reader 要读、writer 要写，缺一半就是单向）。示例把两组分别交给 server 与 client，全程没有地址解析，也没有全局注册表。
+> **`Endpoint::Memory` 是唯一一个「不参与查找」的变体（v0.8 补）。** `memory` 走的是「进程内直接配对」，而且返回的是**两份半身**而不是一份：`Memory::pair() -> ((Source, Sink), (Source, Sink))`——第一组给 A 侧、第二组给 B 侧。v0.8 只写「返回两半」，但一条双向会话需要 `(Source, Sink)` **各一份**，`Session` 没法只靠一个 `Source` 和一个 `Sink` 跑起来（reader 要读、writer 要写，缺一半就是单向）。示例把两组分别交给 server 与 client，全程没有地址解析，也没有全局注册表。
 >
 > 顺带定死 `Session` 的构造入口（v0.10 补 `registry`）：`Session::new(source: S, sink: K, registry: Arc<ServiceRegistry>, opts: SessionOptions) -> (Arc<Session>, SessionHandle)`——`local_calc` 与测试矩阵需要「从一对现成的 source/sink 直接建会话」，服务端还需要在同一入口上装配注册表；客户端传一个空注册表即可。这一条不定，示例就得绕到 transport 里去拿通道，`memory` 的整个 pair 设计白做，而服务端根本没有入口挂服务。
 
@@ -1484,7 +1485,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 `calc_server` / `calc_client` 同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`。
 
-> **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair(opts)` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
+> **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair()` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
 
 若同时用 `--features blocking` 且服务端声明 `#[photon::service(id = 7, blocking)]`，额外打印一行 `[client] blocking client: add(2,3) = 5`——**这一行不是默认验收门槛**，因为默认 feature 集不含 `blocking`（见 1.3.1）。
 

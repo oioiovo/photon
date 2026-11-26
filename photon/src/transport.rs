@@ -16,6 +16,9 @@ use bytes::Bytes;
 
 pub mod framing;
 
+#[cfg(feature = "memory")]
+pub mod memory;
+
 #[cfg(feature = "tcp")]
 pub mod tcp;
 
