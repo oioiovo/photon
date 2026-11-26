@@ -311,7 +311,7 @@ loop {
 - **`ServiceRegistry` 是 `Arc` 共享给所有连接的**：每连接复制一份注册表会让「同一进程内路由不一致」变成可能，而且白白多 N 份 map。`serve` 里包一次 `Arc`，每连接 `clone` 给 `Session`。
 - **每连接一个 `Session`，两个 task（reader/writer）**；`serve` 本身只做 accept，不参与收发。这样 N 条连接 = N×2 个 task，与「每连接两个半身」的结构一致。
 - `SessionHandle`（发起端）在纯服务端场景用不上，但**不能随手丢掉**：定死 `SessionHandle::drop` **不关连接**（它只是个请求入口），真正关闭由 `Arc<Session>::close()` 或 drop 最后一个 `Arc<Session>` 决定。这一条不写，示例里 `let (session, _handle) = ...` 会被人当成「丢了就会关」。
-- 服务端驱动的收尾入口**只有一个**：`Session::close(&self)`（`03` 7.3 六步）。「等对端 `GoAway` / EOF 再收尾」的等待逻辑属于 `Session` 内部，不要在示例代码里再拼一套状态机。**「连接结束了没有」也只有一个观测点**：`Session::wait_closed()`（监听 `closed: Arc<Notify>`）；别用 `is_closed()` 轮询，那会在每条连接上留一个 1 ms 定时器。
+- 服务端驱动的收尾入口有两个，区别只在「等不等」：`Session::close(&self)`（`03` 7.3 六步，等在飞回完）与 `Session::abort(&self)`（发 bit2 急停，立刻弃掉在飞；见 `03` 6.4）。`abort` **不挂到 `SessionHandle`** 上：句柄的语义是「发起请求」，单方面给整条连接判死不该是它的能力。「等对端 `GoAway` / EOF 再收尾」的等待逻辑属于 `Session` 内部，不要在示例代码里再拼一套状态机。**「连接结束了没有」也只有一个观测点**：`Session::wait_closed()`（监听 `closed: Arc<Notify>`）；别用 `is_closed()` 轮询，那会在每条连接上留一个 1 ms 定时器。
 - accept 循环的错误分两类：**单连接 `accept` 失败**（对端提前断开）记 `debug` 后继续；**listener 级别失败**（`EMFILE`、listener 被关）直接返回 `Err`。不要用 `while let Ok(..)` 把 listener 错误静默吞成「永远 accept 不到新连接」。
 
 ### 10.3 客户端：泛型还是 `AnyTransport`

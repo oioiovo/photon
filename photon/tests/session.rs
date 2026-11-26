@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use photon::session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
-use photon::transport::{Endpoint, LocalAddr, MessageSink, MessageSource, TransportOptions};
+use photon::transport::{
+    DEFAULT_MAX_MESSAGE_LEN, Endpoint, LocalAddr, MessageSink, MessageSource, TransportOptions,
+};
 use photon::{BoxFuture, RpcError, Schedule, Service};
 
 #[cfg(feature = "local")]
@@ -198,6 +200,71 @@ impl Service for Counter {
             self.0.fetch_add(1, Ordering::AcqRel);
             Ok(Bytes::new())
         })
+    }
+}
+
+/// 先记「进来了」，再睡一段：用来制造「handler 正在跑」这个时刻。
+struct Gate {
+    started: Arc<AtomicUsize>,
+    busy: Duration,
+}
+
+impl Service for Gate {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        _payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        let started = Arc::clone(&self.started);
+        let busy = self.busy;
+        Box::pin(async move {
+            started.fetch_add(1, Ordering::AcqRel);
+            tokio::time::sleep(busy).await;
+            Ok(Bytes::from_static(b"done"))
+        })
+    }
+}
+
+/// 挂起直到被 drop：`dropped` 计数是「这个 handler 真的被取消了」的唯一时点，
+/// 因为 `pending()` 正常永远不返回，只有取消才会走到 `Drop`。
+struct Cancellable {
+    started: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Service for Cancellable {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        _payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        let started = Arc::clone(&self.started);
+        let dropped = Arc::clone(&self.dropped);
+        Box::pin(async move {
+            struct Mark(Arc<AtomicUsize>);
+            impl Drop for Mark {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            let _mark = Mark(dropped);
+            started.fetch_add(1, Ordering::AcqRel);
+            std::future::pending::<()>().await;
+            Ok(Bytes::new())
+        })
+    }
+}
+
+/// 轮询等到计数到 `want`。全程带期限：等不到应当变红，而不是挂住。
+async fn wait_until(counter: &AtomicUsize, want: usize, budget: Duration) {
+    let until = tokio::time::Instant::now() + budget;
+    while counter.load(Ordering::Acquire) < want {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "等了 {budget:?} 仍是 {}，期望 {want}",
+            counter.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -648,6 +715,219 @@ async fn notification_reaches_handler<H: Harness>() {
     server.close().await.expect("关闭");
 }
 
+/// 优雅关闭必须等在飞把手上的活回完：`close()` 返回时那条请求已经拿到结果。
+async fn graceful_close_waits_inflight<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(
+            7,
+            Arc::new(Gate {
+                started: Arc::clone(&started),
+                busy: Duration::from_millis(30),
+            }),
+        ),
+        SessionOptions::default(),
+        SessionOptions::default(),
+    )
+    .await;
+
+    let ch2 = ch.clone();
+    let call = tokio::spawn(async move { ch2.call(7, 1, Bytes::new(), CALL_DEADLINE).await });
+    wait_until(&started, 1, Duration::from_secs(2)).await;
+
+    // 此刻 handler 正在跑，宣告关闭。close() 必须等它回包，而不是直接断。
+    let close_budget = Duration::from_secs(2);
+    tokio::time::timeout(close_budget, server.close())
+        .await
+        .expect("close 不该挂住")
+        .expect("关闭");
+
+    let reply = call
+        .await
+        .expect("call task")
+        .expect("优雅关闭期间在飞请求应当正常完成");
+    assert_eq!(&reply[..], b"done");
+}
+
+/// 急停不等在飞：对端的在飞请求要立刻失败，而不是等到自己的期限。
+async fn abort_fails_inflight_without_waiting<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(
+            7,
+            Arc::new(Gate {
+                started: Arc::clone(&started),
+                busy: Duration::from_secs(3),
+            }),
+        ),
+        SessionOptions::default(),
+        SessionOptions::default(),
+    )
+    .await;
+
+    let ch2 = ch.clone();
+    let call = tokio::spawn(async move { ch2.call(7, 1, Bytes::new(), CALL_DEADLINE).await });
+    wait_until(&started, 1, Duration::from_secs(2)).await;
+
+    let at = tokio::time::Instant::now();
+    server.abort();
+
+    // 3 s 的 handler 还没走完；错误必须在 1 s 内到，否则「急停」只是说说。
+    let reply = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("急停后 1 s 内应当有结果，实际仍挂在 pending 上")
+        .expect("call task");
+    assert!(reply.is_err(), "对端急停后这条调用不该成功");
+    assert!(
+        tokio::time::Instant::now() - at < Duration::from_secs(1),
+        "急停传导耗时过长"
+    );
+    assert!(server.is_closed(), "急停后本端应当已经 Closed");
+}
+
+/// 双方都宣告关闭之后，迟到的 `Request` 必须收到 `Remote{7}`，不能静默丢。
+///
+/// 这条只能用手写的假对端：真 `Session` 在宣告后就不再发起新请求，
+/// 那段窗口在自己的 API 里根本走不到。
+async fn ingress_draining_rejects_late_requests<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let ((s_src, s_sink), (mut c_src, mut c_sink)) = H::connected().await;
+    let (server, _sh) = Session::new(
+        s_src,
+        s_sink,
+        registry_with(
+            7,
+            Arc::new(Gate {
+                started: Arc::clone(&started),
+                busy: Duration::from_millis(50),
+            }),
+        ),
+        SessionOptions::default(),
+    )
+    .expect("服务端会话");
+
+    // 假对端：先握手，再读掉服务端的握手帧。
+    c_sink
+        .send(photon::proto::handshake::Handshake::new(DEFAULT_MAX_MESSAGE_LEN, 0).encode_frame())
+        .await
+        .expect("握手帧应当发得出");
+    let their_handshake = c_src.recv().await.expect("应当收到服务端握手帧");
+    assert_eq!(
+        photon::proto::Header::decode(&their_handshake[..])
+            .expect("头可解")
+            .kind,
+        photon::proto::Kind::Handshake
+    );
+
+    // 第一条请求：让 handler 进入并占住窗口。
+    c_sink
+        .send(control_frame(photon::proto::Kind::Request, 0, 7, 1, 1, 0))
+        .await
+        .expect("请求应当发得出");
+    wait_until(&started, 1, Duration::from_secs(2)).await;
+
+    // 假对端宣告关闭；服务端同时 close()，于是「双方都宣告过」成立。
+    c_sink
+        .send(control_frame(photon::proto::Kind::GoAway, 0, 0, 0, 0, 0))
+        .await
+        .expect("GoAway 应当发得出");
+    let closing = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.close().await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 这个窗口里再塞一条请求：必须回 `Remote{7}`。
+    c_sink
+        .send(control_frame(photon::proto::Kind::Request, 0, 7, 2, 1, 0))
+        .await
+        .expect("迟到请求应当发得出");
+
+    let mut verdict = None;
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while verdict.is_none() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "2 s 内没等到迟到请求的回包"
+        );
+        let frame = tokio::time::timeout(Duration::from_millis(200), c_src.recv())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        let Some(frame) = frame else { continue };
+        let header = photon::proto::Header::decode(&frame[..]).expect("头可解");
+        if header.kind == photon::proto::Kind::Response && header.request_id == 2 {
+            let body = photon::proto::error_body::decode(&frame[24..]).expect("错误体可解");
+            verdict = Some(body.code);
+        }
+    }
+    assert_eq!(verdict, Some(7), "迟到请求应当是 Remote{{7}}，不是别的");
+
+    let _ = closing.await;
+}
+
+/// 收到**急停** `GoAway`（flags bit2）时，正在跑的 handler 必须被丢掉；
+/// 优雅 `GoAway` 则相反——它要等这条 handler 自己结束。
+async fn force_goaway_cancels_running_handlers<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let ((s_src, s_sink), (mut c_src, mut c_sink)) = H::connected().await;
+    let (server, _sh) = Session::new(
+        s_src,
+        s_sink,
+        registry_with(
+            7,
+            Arc::new(Cancellable {
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&dropped),
+            }),
+        ),
+        SessionOptions::default(),
+    )
+    .expect("服务端会话");
+
+    c_sink
+        .send(photon::proto::handshake::Handshake::new(DEFAULT_MAX_MESSAGE_LEN, 0).encode_frame())
+        .await
+        .expect("握手帧应当发得出");
+    let _ = c_src.recv().await.expect("服务端握手帧");
+
+    c_sink
+        .send(control_frame(photon::proto::Kind::Request, 0, 7, 1, 1, 0))
+        .await
+        .expect("请求应当发得出");
+    wait_until(&started, 1, Duration::from_secs(2)).await;
+
+    // flags bit2：急停。handler 是 `pending()`，只有被取消才会 drop。
+    c_sink
+        .send(control_frame(photon::proto::Kind::GoAway, 4, 0, 0, 0, 0))
+        .await
+        .expect("急停帧应当发得出");
+
+    wait_until(&dropped, 1, Duration::from_secs(2)).await;
+    assert!(server.is_closed(), "急停之后服务端应当已经 Closed");
+}
+
+/// 手写一条控制帧（request / goaway 都用得上）：头 24 B + 空 payload。
+fn control_frame(
+    kind: photon::proto::Kind,
+    flags: u8,
+    service_id: u16,
+    request_id: u64,
+    method: u64,
+    deadline_ms: u32,
+) -> Bytes {
+    let header = photon::proto::Header {
+        kind,
+        flags,
+        service_id,
+        request_id,
+        method,
+        deadline_ms,
+    };
+    header.encode().into()
+}
+
 /// 把同一组用例挂到每个实现上。这里只有签名，用例体一行不改。
 macro_rules! suite {
     ($name:ident, $H:ty) => {
@@ -707,6 +987,26 @@ macro_rules! suite {
             #[tokio::test]
             async fn client_abandon_cancels_handler() {
                 super::client_abandon_cancels_handler::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn force_goaway_cancels_running_handlers() {
+                super::force_goaway_cancels_running_handlers::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn graceful_close_waits_inflight() {
+                super::graceful_close_waits_inflight::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn abort_fails_inflight_without_waiting() {
+                super::abort_fails_inflight_without_waiting::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn ingress_draining_rejects_late_requests() {
+                super::ingress_draining_rejects_late_requests::<$H>().await
             }
 
             #[tokio::test]

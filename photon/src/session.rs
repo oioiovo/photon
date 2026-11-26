@@ -247,7 +247,17 @@ where
     /// 出站是否允许发起新请求。`close()` 与收到 `GoAway` 都会关掉它。
     egress_open: AtomicBool,
     peer_goaway: AtomicBool,
+    /// 本端是否发过 `GoAway`（`close()` 或 `abort()`）。
+    goaway_sent: AtomicBool,
+    /// 入站是否已经进入 Draining：**双方都宣告过关闭**之后才置位。此后到达的
+    /// `Request` 回 `Remote{7}` 而不是被静默丢弃——调用方至少能立刻看到拒绝。
+    ingress_draining: AtomicBool,
     closing: AtomicBool,
+    /// 对端宣告关闭后那条「排空即收尾」的后台任务是否已经起过。
+    finishing: AtomicBool,
+    /// 是否走了急停。writer 据此决定「取消后排不排空」——优雅关闭必须写完，
+    /// 急停则是「对端已经不看了」，丢掉的帧要出现在日志里而不是凭空消失。
+    abrupt: Arc<AtomicBool>,
     /// 进 `Closed` 的唯一通知点：`serve` 循环靠它知道这条连接该收尾了。
     closed: Arc<Notify>,
     limits: (Arc<AtomicU32>, Arc<AtomicU32>),
@@ -305,7 +315,11 @@ where
             phase: AtomicU8::new(PHASE_NEGOTIATING),
             egress_open: AtomicBool::new(true),
             peer_goaway: AtomicBool::new(false),
+            goaway_sent: AtomicBool::new(false),
+            ingress_draining: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            finishing: AtomicBool::new(false),
+            abrupt: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(Notify::new()),
             limits,
             reader: Mutex::new(None),
@@ -316,7 +330,8 @@ where
 
         let writer = {
             let shutdown = shutdown.clone();
-            tokio::spawn(async move { writer_loop(sink, rx, shutdown).await })
+            let abrupt = Arc::clone(&session.abrupt);
+            tokio::spawn(async move { writer_loop(sink, rx, shutdown, abrupt).await })
         };
 
         let reader = {
@@ -467,27 +482,26 @@ where
 
     /// 优雅关闭：宣告 → 等在飞归零 → 停两个 task → 兜底。
     ///
-    /// 重复调用安全。
+    /// 重复调用安全。**入站不动**：宣告之后仍然继续 dispatch、继续回包，否则
+    /// 对端在收到我们 `GoAway` 之前发出的请求会被无辜打成 `Remote{7}`。
     pub async fn close(&self) -> Result<(), RpcError> {
         if self.closing.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
 
+        // 顺序不能反：先关 egress 再发帧。反过来的话，宣告与「本地拒新请求」
+        // 之间会留一个窗口，此刻进来的请求发得出去但没人会等它。
         self.egress_open.store(false, Ordering::Release);
-        let _ = self.tx.send(goaway_frame(false)).await;
+        if !self.goaway_sent.swap(true, Ordering::AcqRel) {
+            self.maybe_drain_ingress();
+            let _ = self.tx.send(goaway_frame(false)).await;
+        }
 
         // 等在飞归零：pending 是「我发出去的」，handlers 是「别人发给我、我还没回」。
-        let drained = async {
-            loop {
-                let pending = self.outbound.lock().pending.len();
-                if pending == 0 && self.handlers.load(Ordering::Acquire) == 0 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
-
-        if timeout(self.opts.close_timeout, drained).await.is_err() {
+        if timeout(self.opts.close_timeout, self.wait_drained())
+            .await
+            .is_err()
+        {
             // 兜底：不等了，下面照样停 task、唤醒等待者。
         }
 
@@ -502,6 +516,69 @@ where
 
         self.set_closed();
         Ok(())
+    }
+
+    /// 急停：发一条带 `flags.bit2` 的 `GoAway`，**不等在飞**，立刻断连。
+    ///
+    /// 与 `close()` 的区别只在「等不等」：这里连自己的在飞请求也一起判死。
+    /// 用它「省时间」之前先想清楚：对端会同时收到「我关了」和「连接没了」，
+    /// 它在飞的回包已经写不出来，只能靠本地 `Closed` 收场。
+    pub fn abort(&self) {
+        if !self.goaway_sent.swap(true, Ordering::AcqRel) {
+            // `try_send`：急停本身就不该为排队等待，塞不进队列说明 writer 已经
+            // 很忙，此时再等只会把「立刻断」变成「等队列」。
+            if self.tx.try_send(goaway_frame(true)).is_err() {
+                tracing::debug!("急停帧未能入队，直接断连");
+            }
+        }
+        self.egress_open.store(false, Ordering::Release);
+        self.ingress_draining.store(true, Ordering::Release);
+        // 先置位再取消：writer 醒来时必须已经看得到「这次不用排空」。
+        self.abrupt.store(true, Ordering::Release);
+
+        // 让已进入 handler 的活停下：它们的结果已经没有接收方了。
+        for token in self.cancels.lock().values() {
+            token.cancel();
+        }
+        self.fail();
+    }
+
+    /// 两个方向都归零 = 没有「我发出的待回包」、也没有「我收下待回包」。
+    fn is_drained(&self) -> bool {
+        self.outbound.lock().pending.is_empty() && self.handlers.load(Ordering::Acquire) == 0
+    }
+
+    async fn wait_drained(&self) {
+        while !self.is_drained() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// 双方都宣告过关闭之后，入站才进 Draining：此前的请求都是合法在飞。
+    fn maybe_drain_ingress(&self) {
+        if self.goaway_sent.load(Ordering::Acquire) && self.peer_goaway.load(Ordering::Acquire) {
+            self.ingress_draining.store(true, Ordering::Release);
+        }
+    }
+
+    /// 收到对端 `GoAway` 后的收尾：排空即退出，不依赖对端真的把连接断掉。
+    ///
+    /// socket 上有 EOF 可等，named pipe / shm 上没有——所以这条路径必须显式存在，
+    /// 否则收到 `GoAway` 之后就只能一直挂着，等用户自己调 `close()`。
+    fn spawn_finish_when_drained(self: &Arc<Self>) {
+        if self.finishing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            if timeout(me.opts.close_timeout, me.wait_drained())
+                .await
+                .is_err()
+            {
+                tracing::debug!("对端宣告关闭后仍未排空，按 close_timeout 收尾");
+            }
+            me.shutdown.cancel();
+        });
     }
 
     async fn join_tasks(&self) {
@@ -646,11 +723,17 @@ where
             Kind::GoAway => {
                 self.peer_goaway.store(true, Ordering::Release);
                 self.egress_open.store(false, Ordering::Release);
+                self.maybe_drain_ingress();
+
                 if header.flags & FLAG_GOAWAY_FORCE != 0 {
-                    // 急停：不等在飞，立刻让它们停下（回包仍尽力发出）。
+                    // 急停：跳过排空，直接断连。对端已经不打算等了，这里的回包
+                    // 没有接收方，继续跑只是白烧 CPU。
                     for token in self.cancels.lock().values() {
                         token.cancel();
                     }
+                    self.fail();
+                } else {
+                    self.spawn_finish_when_drained();
                 }
                 Ok(())
             }
@@ -668,6 +751,14 @@ where
         payload: Bytes,
         want_reply: bool,
     ) -> Result<(), RpcError> {
+        // 双方都宣告过关闭之后，新到的 `Request` 明确拒绝。静默丢弃会让调用方
+        // 干等到自己的期限，而这段窗口里的流量本来就只可能是违规或迟滞的。
+        if want_reply && self.ingress_draining.load(Ordering::Acquire) {
+            self.send_error(header.request_id, 7, true, "shutting down")
+                .await?;
+            return Ok(());
+        }
+
         let Some(svc) = self.registry.get(header.service_id) else {
             // 通知没有回包通道：给它回一个 `Response` 反而是协议噪声（对端没有对应的
             // pending，只会被丢掉），所以这里只记日志。
@@ -907,19 +998,35 @@ where
     }
 }
 
-async fn writer_loop<K>(mut sink: K, mut rx: mpsc::Receiver<Bytes>, shutdown: CancellationToken)
-where
+async fn writer_loop<K>(
+    mut sink: K,
+    mut rx: mpsc::Receiver<Bytes>,
+    shutdown: CancellationToken,
+    abrupt: Arc<AtomicBool>,
+) where
     K: MessageSink,
 {
     loop {
         let frame = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                // 排空再退：队列里的帧都是上层已提交的，丢掉等于静默丢数据。
+                let mut dropped = 0usize;
                 while let Ok(frame) = rx.try_recv() {
+                    if abrupt.load(Ordering::Acquire) {
+                        // 急停：对端已经不等这些回包了，写出去只是白占带宽。
+                        // 但不能静默丢：条数进日志，否则「以为回了、对端没收到」
+                        // 这种问题在事后查不清。
+                        dropped += 1;
+                        continue;
+                    }
+                    // 优雅关闭：排空再退。队列里的帧都是上层已提交的，
+                    // 丢掉等于静默丢数据。
                     if sink.send(frame).await.is_err() {
                         return;
                     }
+                }
+                if dropped > 0 {
+                    tracing::debug!(dropped, "急停：丢弃未写出的帧");
                 }
                 return;
             }

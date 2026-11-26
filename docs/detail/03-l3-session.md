@@ -294,7 +294,14 @@ loop {
 
 跳过「等两类归零」：立即 `shutdown.cancel()` → 两个 task 被取消（**writer 不做排空**）→ drop 两端 → 所有 pending 置 `Closed`。即使 `tx` 里还有没写出去的 `Response` 也一并丢弃，并在日志里记下丢弃条数（否则「急停后客户端收到 `Closed` 但服务端以为回了包」永远查不清）。
 
-> 急停与优雅关闭的差别只有一处：**writer 是否排空**。实现上就是取消信号带一个 payload（`CancelKind::Graceful` / `Abrupt`），或干脆两个不同的 token。
+发起入口是 `Session::abort()`（不挂到 `SessionHandle` 上：句柄的意义是「发起请求」，单方面给整条连接判死不在它的职责内）。顺序写死：
+
+1. `goaway_sent` 去重后 `try_send(goaway_frame(true))`——急停不能被自己的写队列背压拖住，塞不进去就记一条 `debug` 直接断；
+2. `abrupt.store(true)`。**必须在取消之前**：writer 是被取消唤醒的，先置位才能保证它醒来时看得到「这次不排空」；
+3. 取消所有 handler token（它们的结果已经没有接收方）；
+4. `fail()`：`phase = Closed`、drain pending、`shutdown.cancel()`。
+
+> 急停与优雅关闭的差别只有一处：**writer 是否排空**。实现用的是 `Arc<AtomicBool> abrupt`，而不是给取消信号带 payload——token 是 `CancellationToken`，没有 payload 可带，加一个原子位比造两套 token 便宜。writer 在取消分支里读它：`false` → 逐帧 `send` 完再退；`true` → 全丢，并 `tracing::debug!(dropped, "急停：丢弃未写出的帧")`。丢弃是允许的，**静默**丢弃不是。
 
 ---
 
@@ -313,6 +320,7 @@ struct ClosingState {
     egress:      AtomicU8,
     self_goaway: AtomicBool, // 本端已发过 GoAway
     peer_goaway: AtomicBool, // 已收到对端 GoAway
+    ingress_draining: AtomicBool, // 双方都宣告过之后才置位（代码里就是这个名字）
 }
 ```
 
@@ -324,7 +332,7 @@ struct ClosingState {
 |---|---|---|---|
 | 本端调 `close()` | `Draining` + `self_goaway = true` | **保持 `Open`** | 只停发起，不停收活：对端在收到我们 `GoAway` 之前发出的请求仍是合法请求 |
 | 收到对端 `GoAway` | `Draining` + `peer_goaway = true` | **保持 `Open`** | 此后到达的都是对端在 `GoAway` 之前发出的，属于必须回完的那类 |
-| **双方都已宣告**（`self_goaway && peer_goaway`） | — | `Draining` | 到这里「还会有合法在飞请求」的前提不成立；此后到达的 `Request` 回 `Remote{7}` |
+| **双方都已宣告**（`goaway_sent && peer_goaway`，实现里叫 `ingress_draining`） | — | `Draining` | 到这里「还会有合法在飞请求」的前提不成立；此后到达的 `Request` 回 `Remote{7}` |
 | 收尾超时（默认 5 s）或急停 | `Closed` | `Closed` | 强制收尾 |
 | reader 出错 / EOF | — | `Closed` | 同 `03` 4.3 |
 | writer 出错 | `Closed` | — | — |
@@ -336,7 +344,7 @@ struct ClosingState {
 ### 7.3 优雅关闭六步（`flags` bit2 = 0）
 
 1. 把 `GoAway` **写进 `tx`**（先进队列，保证它前面的 `Response` 都能出去）；`egress = Draining`、`self_goaway = true`。**入站不动**，继续 dispatch 并回包（`INV-10a`）。
-2. 等两类在飞工作归零：`outbound.pending` 与本端 `handlers`。期间 `tx` 照常可用。
+2. 等两类在飞工作归零：`outbound.pending` 与本端 `handlers`。期间 `tx` 照常可用。实现是 1 ms 轮询 `is_drained()`（语义等价；将来换 `Notify` 是优化，不是契约）。**发帧与关 egress 的顺序写死为「先关 egress、再发帧」**：反过来的话，两者之间进来的请求发得出去但没人会等它；发帧本身由 `goaway_sent` 去重，且**已经收到过对端宣告也照发**。
 3. 归零后**只做一件事：`shutdown.cancel()`**（同时通知 reader 与 writer）。**不要试图 drop `Session` 的 `tx`**——它在 `Arc` 里，`&self` 拿不到 `&mut`；通道收口交给 writer 的排空退出（见第 5 节）。
 4. 两个 task 各自退出：writer **先排空 `rx` 再退**、退出即 drop `sink`；reader 退出即 drop `source`。**不需要 `flush`**——最后一次 `send().await` 返回 `Ok` 即数据已交给内核缓冲。注意 drop `sink` 只是**加速路径**：能让对端尽早读到 EOF，但不是关闭契约的一部分（L1 2.2）。无半关闭的实现上这一步等价于空操作，收尾照样靠第 1 步的 `GoAway` 和第 6 步的超时。
 5. `close()` 里从 `Mutex<Option<JoinHandle>>` 里 `take()` 出两个句柄并 await；`JoinError` 必须当场处理并归为断连，不能 `let _ =`。
@@ -349,7 +357,8 @@ struct ClosingState {
 
 - 本端 `egress → Draining`（新请求 `Closed`），`peer_goaway = true`；
 - **入站保持 `Open`，继续 dispatch 并继续回包**（`INV-10a`）；只有「本端也发过 `GoAway`」之后，`ingress` 才进 `Draining`；
-- 若本端也要收尾，自己再发一条 `GoAway`（双方各发一条即可完成双向关闭）。
+- 若本端也要收尾，自己再发一条 `GoAway`（双方各发一条即可完成双向关闭）。**即便本端已经收到过对端的宣告，`close()` 照样发自己这条**——`ingress` 的触发条件是「双方都宣告过」，少发一条，这个条件永远不成立；
+- **不要靠「对端把连接断掉」来判断自己该退出了**：收到宣告就起一个 `spawn_finish_when_drained` 后台任务，等 `pending` 与 `handlers` 双零（`close_timeout` 兜底）后 `shutdown.cancel()`。socket 上的 EOF 只是加速路径，named pipe / shm 上根本没有 EOF；少了这条，收到 `GoAway` 之后会话会一直挂着，直到用户自己再调 `close()`。
 
 `GoAway` 的语义是**连接级开始收尾**（双向停发起、双向继续回包），不是「我只关入站」（v0.8 的写法，与它自己的第 1 步冲突，已废弃）。但**不要**把它类比成 gRPC `GOAWAY`：后者靠 `last_stream_id` 水位划边界，本协议 v0.7 已删掉该字段（对称会话下没有良定义），所以没有「按 id 判断哪些还算 in-flight」的能力，能承诺的只有「已进入 handler 的请求一定回包」。
 
