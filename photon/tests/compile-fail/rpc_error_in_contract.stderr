@@ -1,0 +1,5 @@
+error: 契约方法不能返回 `RpcError`：它是框架对本端的判定（超时/断连/编解码失败），handler 既无从产生也无权声明。业务失败请定义自己的类型，例如 `Result<i64, CalcError>`；不可失败的方法直接写 `-> T`
+ --> tests/compile-fail/rpc_error_in_contract.rs:5:56
+  |
+5 |     async fn add(&self, a: i64, b: i64) -> Result<i64, photon::RpcError>;
+  |                                                        ^^^^^^^^^^^^^^^^

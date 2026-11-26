@@ -26,30 +26,30 @@ use tracing_subscriber::registry;
 
 #[photon::service(id = 41)]
 trait Probe {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, photon::RpcError>;
+    async fn add(&self, a: i64, b: i64) -> i64;
 }
 
 #[photon::service(id = 42, blocking)]
 trait ProbeSync {
-    fn add(&self, a: i64, b: i64) -> Result<i64, photon::RpcError>;
+    fn add(&self, a: i64, b: i64) -> i64;
 }
 
 struct ProbeSyncImpl;
 
 impl ProbeSync for ProbeSyncImpl {
-    fn add(&self, a: i64, b: i64) -> Result<i64, photon::RpcError> {
+    fn add(&self, a: i64, b: i64) -> i64 {
         tracing::info!("inside-blocking-handler");
-        Ok(a + b)
+        a + b
     }
 }
 
 struct ProbeImpl;
 
 impl Probe for ProbeImpl {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, photon::RpcError> {
+    async fn add(&self, a: i64, b: i64) -> i64 {
         // 这条日志必须出现在 `photon.request` 的 span 里，否则 instrument 没生效。
         tracing::info!("inside-handler");
-        Ok(a + b)
+        a + b
     }
 }
 

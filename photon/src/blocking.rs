@@ -40,7 +40,7 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument as _;
 
-use crate::error::RpcError;
+use crate::error::{CallFailure, RpcError};
 use crate::session::{ConnectOptions, ServiceRegistry, Session, SessionHandle, SessionOptions};
 use crate::transport::{Endpoint, MessageSink, MessageSource, Transport};
 
@@ -93,7 +93,7 @@ enum Command {
         deadline_ms: u32,
         /// 外层期限，与调用方 `recv_timeout` 用的是同一个值。
         timeout: Option<Duration>,
-        reply: SyncSender<Result<Bytes, RpcError>>,
+        reply: SyncSender<Result<Bytes, CallFailure>>,
     },
     Notify {
         service_id: u16,
@@ -177,7 +177,7 @@ where
         method: u64,
         payload: Bytes,
         deadline_ms: u32,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<Bytes, CallFailure> {
         self.call_named(service_id, method, None, payload, deadline_ms)
     }
 
@@ -192,7 +192,7 @@ where
         method_name: Option<&'static str>,
         payload: Bytes,
         deadline_ms: u32,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<Bytes, CallFailure> {
         let (reply, wait) = std::sync::mpsc::sync_channel(1);
         self.inner
             .jobs
@@ -371,7 +371,7 @@ async fn dispatcher<S, K>(
                                 // 期限到：future 被 drop，`CallGuard` 摘掉 pending 表项并
                                 // 给对端送 `Cancel`——外层超时不会留下一张永远挂着
                                 // 待回包的条目。
-                                Err(_) => Err(RpcError::Timeout),
+                                Err(_) => Err(CallFailure::Failed(RpcError::Timeout)),
                             },
                             None => call.await,
                         };

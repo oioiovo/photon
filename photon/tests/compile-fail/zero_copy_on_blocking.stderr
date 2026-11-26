@@ -1,5 +1,5 @@
 error: `zero_copy` 不能标在 `#[photon(blocking)]` 方法上：它在池线程上执行，占用时长由用户计算量决定，不可预期
- --> tests/compile-fail/zero_copy_on_blocking.rs:9:5
+ --> tests/compile-fail/zero_copy_on_blocking.rs:7:5
   |
-9 |     fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+7 |     fn add(&self, a: i64, b: i64) -> i64;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

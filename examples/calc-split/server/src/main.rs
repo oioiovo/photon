@@ -5,27 +5,23 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use calc_api::{CODE_DIVIDE_BY_ZERO, Calc};
+use calc_api::{Calc, CalcError};
 use photon::transport::tcp::TcpTransport;
-use photon::{Endpoint, RemoteError, RpcError, Server, SessionOptions, TransportOptions};
+use photon::{Endpoint, Server, SessionOptions, TransportOptions};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7001";
 
 struct Calculator;
 
 impl Calc for Calculator {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
-        Ok(a + b)
+    async fn add(&self, a: i64, b: i64) -> i64 {
+        a + b
     }
 
-    async fn div(&self, a: i64, b: i64) -> Result<i64, RpcError> {
+    async fn div(&self, a: i64, b: i64) -> Result<i64, CalcError> {
         if b == 0 {
-            // 用户码段：框架原样透传，不解释、不改写。
-            return Err(RpcError::Remote(RemoteError {
-                code: CODE_DIVIDE_BY_ZERO,
-                retryable: false,
-                message: "divide by zero".into(),
-            }));
+            // 业务错误原样走线路：框架只加「这是业务拒绝」的标志位，不解释内容。
+            return Err(CalcError::DivideByZero);
         }
         Ok(a / b)
     }

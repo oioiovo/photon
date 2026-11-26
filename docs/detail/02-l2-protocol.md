@@ -8,7 +8,7 @@
 
 ## 1. 职责边界
 
-**做**：24 字节头的编解码与逐 kind 校验、payload 的序列化（`Codec`）、method id 的稳定性、错误体的编解码、控制帧的手写编解码。
+**做**：24 字节头的编解码与逐 kind 校验、payload 的序列化（`Codec`）、method id 的稳定性、错误帧的编解码、控制帧的手写编解码。
 
 **不做**：不认识连接与 task（那是 L3）；不认识 `Service` 与 handler（那是 L4）；不判断 `service_id` 是否存在（那是 `ServiceRegistry`）；不做压缩、不做加密、不做分片。
 
@@ -66,7 +66,7 @@
 | kind | 值 | 方向 | payload | 是否走 `Codec` |
 |---|---|---|---|---|
 | `Request` | 0 | 双向 | 请求参数 | 是 |
-| `Response` | 1 | 双向 | 结果 或 错误体（`flags` bit0 = 1） | 是 / 错误体手写 |
+| `Response` | 1 | 双向 | 结果，或错误帧（`flags` bit0 = 1；bit3 决定框架/业务） | 是 / 错误帧手写 |
 | `Notification` | 2 | 双向 | 通知内容 | 是 |
 | `Cancel` | 3 | 双向 | **空** | 否 |
 | `StreamChunk` | 4 | 双向 | — | **预留，不实现**，收到即协议错误 |
@@ -86,7 +86,7 @@
 | `GoAway` | **0** | **0** | **0** | **0** |
 | `Handshake` | **0** | **0** | **0** | **0** |
 
-违反任一格的后果：**`RpcError::Protocol` + 立即断连**，不回错误体。
+违反任一格的后果：**`RpcError::Protocol` + 立即断连**，不回错误帧。
 
 理由是「必须为 0」不是风格约定，而是消除解析歧义：如果 `Response` 允许带 `service_id`，那么「用哪个服务的错误码空间」就变成第二个真相来源；如果 `Cancel` 允许带 `method`，那么「取消的是 id 还是方法」在任何一侧都能自圆其说。**歧义在协议层不能用「实现方自行忽略」来收场**——对端可以据此构造出你两种解释都成立的消息。
 
@@ -113,7 +113,7 @@ L2 只负责「头 + 裸 payload 的边界」。`codec.decode` 发生在 L3 spaw
 
 | bit | 允许出现在 | 含义 | 违规 |
 |---|---|---|---|
-| 0 | `Response` | payload 是错误体 | 其它 kind 上置位 → `Protocol` |
+| 0 | `Response` | payload 是错误帧 | 其它 kind 上置位 → `Protocol` |
 | 1 | `StreamChunk`（未实现） | 最后一帧 | 任何 kind 上置位 → `Protocol` |
 | 2 | `GoAway` | 急停，不等 in-flight | 其它 kind 上置位 → `Protocol` |
 | 3–7 | — | 保留 | 任何置位 → `Protocol` |
@@ -178,63 +178,73 @@ pub trait Codec {
 
 ---
 
-## 7. 错误体
+## 7. 错误帧
 
-### 7.1 布局（`flags` bit0 = 1 的 `Response`）
+### 7.1 两条通道（`flags` bit0 = 1 的 `Response`）
 
-```
-[ code: u32 | retryable: u8 | reserved: u24 | message: 剩余字节 UTF-8 ]
-   0..4        4              5..8           8..
-```
+| flags | 含义 | payload 布局 |
+|---|---|---|
+| `0x01` | 框架判定 | `[ code: u8 | reserved: u8 | message: 剩余字节 UTF-8 ]`，前缀 2 字节 |
+| `0x09` | 业务拒绝 | 契约里 `E` 的 codec 输出，**框架不解释、0 字节合法** |
 
-共 8 字节前缀，`message` 直接读到 payload 末尾（长度由 L1 保证，不做第二套长度字段），小端。
+`message` 直接读到 payload 末尾（长度由 L1 保证，不做第二套长度字段），UTF-8，可以为空。
 
-### 7.2 code 空间
+**为什么框架前缀是 2 字节而不是 8（v0.31）**：v0.30 是 `code u32 | retryable u8 | reserved u24`，8 字节。删掉 `retryable`（重试性改成规范静态表，见 `PROTOCOL.md` §6.1.1）并把 `code` 收窄到 `u8`（只留 `0..=7`）之后，剩下的只有 `code + reserved`——留一个保留字节是为了将来真要塞「严重级」之类的微标记时不必再动版本号。
+
+### 7.2 框架 code 空间
 
 | code | 名称 | 谁产生 | 客户端拿到后 |
 |---|---|---|---|
-| 0 | `Internal` | 框架（handler panic、JoinError、不可恢复） | `Remote { code: 0 }` |
-| 1 | `Overloaded` | 对端配额满 / 队列满 / 线程池排不上 | `Remote { code: 1 }`（`retryable` 通常 1） |
-| 2 | `UnknownService` | 对端：`service_id` 未注册 | `Remote { code: 2 }`，重试无意义 |
-| 3 | `UnknownMethod` | 对端：服务在但方法未注册 | `Remote { code: 3 }`，重试无意义 |
-| 4 | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | `Remote { code: 4 }`，重试无意义 |
-| 5 | `Cancelled` | 对端：收到 `Cancel` 并按此中止 | `Remote { code: 5 }` |
-| 6 | `DeadlineExceeded` | 对端：它自己判定的 deadline 到期 | `Remote { code: 6 }` |
-| 7 | `ShuttingDown` | 对端：优雅关闭中，不接新请求 | `Remote { code: 7 }` |
-| 8..=0xFFFF | — | 现在无定义 | **原样装进 `Remote`，不许拍成 `Internal`** |
-| ≥ 0x1_0000 | 用户 | 业务自定义 | `Remote { code }`，语义由用户定义 |
+| 0 | `Internal` | 框架（handler panic、JoinError、不可恢复） | `PeerRejected { code: 0 }` |
+| 1 | `Overloaded` | 对端配额满 / 队列满 / 线程池排不上 | `PeerRejected { code: 1 }`，可退避重试 |
+| 2 | `UnknownService` | 对端：`service_id` 未注册 | `PeerRejected { code: 2 }`，重试无意义 |
+| 3 | `UnknownMethod` | 对端：服务在但方法未注册 | `PeerRejected { code: 3 }`，重试无意义 |
+| 4 | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | `PeerRejected { code: 4 }`，重试无意义 |
+| 5 | `Cancelled` | 对端：收到 `Cancel` 并按此中止 | `PeerRejected { code: 5 }` |
+| 6 | `DeadlineExceeded` | 对端：它自己判定的 deadline 到期 | `PeerRejected { code: 6 }` |
+| 7 | `ShuttingDown` | 对端：优雅关闭中，不接新请求 | `PeerRejected { code: 7 }`，重连后可重试 |
 
-`message` 非法 UTF-8 用 `from_utf8_lossy` 并保留原 `code`——错误体是排障通道，不能因为文本坏了就把整个错误降级成 `Internal`。`retryable` 只认 0/1，其它值按「非 0 即可重试」宽松处理，**不报协议错误**：错误体位于收尾路径，在这里断连只会让排障更难。
+`8..=255` **未定义**：收到即协议错误（`PROTOCOL.md` §9 第 17 条之后的扩展条）。业务错误不占这里的任何一个码——它走 `0x09` 那条路。
 
-### 7.3 本地 / 远端分界（`INV-12`）
+`message` 非法 UTF-8 用 `from_utf8_lossy` 并保留原 `code`——错误帧是排障通道，不能因为文本坏了就把整个错误降级成 `Internal`。
 
-**规则是方向相关的，不是「本地变体一律不上线」这种一刀切（v0.10 修）：** 一刀切没法自洽——服务端要回 `code = 1/4/6`，手里只有本地变体，而 `Remote` 按定义「只能由错误体构造」。
+### 7.3 三侧分工：`HandlerError` / `CallFailure` / `RpcError`（`INV-12`）
 
-1. **只有处理请求的一侧**（正在为某个 `request_id` 生成 `Response`）可以主动构造 `Remote` 表达自己的状态，也**可以**把自己的本地变体经 `to_wire` 编成错误体。
-2. **发起请求的一侧**只能从收到的错误体得到 `Remote`；它的 `Closed` / `Io` / `Protocol` / `RuntimeDropped` 永远不出现在线上，也不与 `Remote` 互相转换。
+错误在框架里只有三个内部类型，各管一段，不互相冒充：
 
-唯一出口函数（`proto/error_body.rs`，全项目只允许这一处拼错误体）：
+| 类型 | 谁产生 | 形状 | 去向 |
+|---|---|---|---|
+| `HandlerError` | `Service::call`（宏产物 + L3 兜底） | `Framework { code: u8, message: String }` / `Business(Bytes)` | L3 编码成 `0x01` 或 `0x09` 帧 |
+| `CallFailure` | `Session::call`（本端 pending 表的结算结果） | `Failed(RpcError)` / `Rejected(Bytes)` | stub 把 `Rejected` 解成 `E` 后交给用户 |
+| `RpcError` | 本端各处 | 框架对本端的判定（`Timeout` / `Closed` / `Io` / `Protocol` / `InvalidInput` / `Overloaded` / `Internal` / `RuntimeDropped` / `PeerRejected`） | 只在本端流通；`PeerRejected` 是对端框架帧的忠实翻译 |
+
+方向规则（v0.31 收敛成一个词：**谁陈述谁**）：
+
+1. **回包侧**只交 `HandlerError`。它的 `Framework` 就是「我这边失败了，原因是这个码」；它的 `Business(tail)` 就是「业务逻辑给了个 `E`，字节在这儿」。L3 不再需要让回包侧「伪造一个远端错误」。
+2. **发起侧**只能由错误帧得到 `PeerRejected`（框架帧）或 `CallError::Rejected(E)`（业务帧）。它的 `Timeout` / `Closed` / `Io` / `Protocol` / `RuntimeDropped` / `Overloaded`（本端出站配额满）**永不上线路**。
+3. `PeerRejected` 与本地同名变体**不互相转换**：对端回 `code = 1` 得到的是 `PeerRejected { code: 1 }`，不是本端 `Overloaded`——否则「谁该为放弃负责」就糊了（`PROTOCOL.md` §6.3 的反例）。
+
+唯一出口函数（`proto/error_body.rs`，全项目只允许这一处拼框架错误帧）：
 
 ```rust
-pub fn to_wire(e: &RpcError) -> Option<(u32, bool, String)>
+// RpcError → 线上框架码（None 表示「这个变体不该上线」）
+pub(crate) fn wire(e: &RpcError) -> Option<(u8, String)>
 ```
-
-返回的是「错误体的三个字段」，不是封装类型：`error_body::encode` 才是拼字节的那一步，这里只决定线上该写什么码。
 
 | `RpcError` 变体 | 上线 code |
 |---|---|
 | `Internal` | `0` |
 | `Overloaded`（**入站配额满**） | `1` |
 | `InvalidInput`（handler 解码失败 / 参数不合法） | `4` |
-| `Cancelled`（ handler 被 `Cancel` 中止） | `5` |
+| `Cancelled`（handler 被 `Cancel` 中止） | `5` |
 | `Timeout`（handler 自己的 deadline 到期） | `6` |
-| `Remote { code, .. }` | 原码（用户业务错误即 `code ≥ 0x1_0000`） |
-| `Closed` | `7`（回包侧声明「本端正在关闭」是准确陈述，`7` 就是为这句话留的） |
-| `Io` / `Protocol` / `RuntimeDropped` | `None`（框架自身出问题，编成任何业务码都是误导；按 `0` 兜底，**不静默丢帧**） |
+| `PeerRejected { code, .. }` | 原码（只在「把对端错误再转述一次」这种罕见路径上出现） |
+| `Closed` | `7`（回包侧声明「本端正在关闭」是准确陈述） |
+| `Io` / `Protocol` / `RuntimeDropped` | `None`（框架自身出问题，编成任何业务码都是误导；调用方按 `0` 兜底，**不静默丢帧**） |
 
-**`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**：由**回包侧**构造，且只有两个入口——`Session::send_error(code, retryable, message)`（L3 内部直接写错误体，不需要绕成 `RpcError`）与 `RemoteError::new(code)`（手上必须交出一个 `RpcError` 时，目前只有宏的 unknown-method 分支）。只允许编码这三个码：查不到 `service_id`、查不到 `method`、`ingress == Draining`。这条同时堵住两个已经写歪的地方：`04-l4-api.md` 的未知方法分支曾自己 `RemoteError::new(3)` 却没说明「这是回包侧允许的行为」，`03-l3-session.md` 曾把 `Timeout → 6`、`Overloaded → 1` 写成散装映射、绕过白名单。
+**`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**：它们只由 `HandlerError::Framework` 或 `Session::send_error(code, message)` 产生，不绕 `RpcError`。白名单只有三个码，对应三条事实：查不到 `service_id`、查不到 `method`、`ingress == Draining`。
 
-`RpcError` 必须 `#[non_exhaustive]`：公开枚举不加这个标记，每加一个变体都是 semver 破坏。
+`RpcError`、`HandlerError`、`CallFailure` 都必须 `#[non_exhaustive]`（`CallFailure` 另加 `#[doc(hidden)]`，它只给宏产物用）：公开枚举不加这个标记，每加一个变体都是 semver 破坏。
 
 ---
 
@@ -246,7 +256,7 @@ pub fn to_wire(e: &RpcError) -> Option<(u32, bool, String)>
 
 | 偏移 | 宽度 | 字段 | 规则 |
 |---|---|---|---|
-| 0 | 2 | `protocol_version` | 当前为 1；不等即断 |
+| 0 | 2 | `protocol_version` | 当前为 2；不等即断 |
 | 2 | 2 | `flags` | 保留，必须 0 |
 | 4 | 4 | `max_message_len` | 本端**愿意接收**的单帧上限（含 24B 头）；`≥ 24`，`shm` 上还须 `≤ slot_size`；取值来自 `SessionOptions`，握手前本端上限恒 64 KiB |
 | 8 | 2 | `codec_id` | `Codec::ID`；不等即断 |
@@ -269,13 +279,13 @@ v0.7 的 `GoAway{last_request_id}` 已删：对称会话下它没有良定义—
 src/proto.rs      HEADER_LEN / MAX_MESSAGE_LEN、kind / flags 常量、Kind / Header / Decoded、`parse()` / `parse_with_limit()` 入口（帧长检查 + 编排，不写校验分支）
 src/proto/
   header.rs     24B encode / decode + 逐 kind 校验（M0 就做，否则端到端无法验证）
-  error_body.rs code 表、8B 前缀编解码、RemoteError ↔ 错误体、`to_wire()` 白名单
+  error_body.rs 框架 code 表、2B 前缀编解码、`FLAG_ERR_BUSINESS` 业务帧、`wire()` 白名单
   handshake.rs  Handshake 的 12B 编解码与语义比对（已落地）；GoAway / Cancel 的 payload 恒空，由 header::validate 覆盖，不再单开文件
 src/codec.rs    Codec trait + `codec::Default` 别名（由 feature 决定）
 src/codec/
   postcard.rs   postcard 实现（默认，ID = 0）
   rkyv.rs       M5，ID = 1，独立 feature
-src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
+src/error.rs    RpcError / HandlerError / CallFailure / CallError<E>（全部 `#[non_exhaustive]`）
 ```
 
 **两个 `parse` 入口**：帧长上限不是常量——它来自握手，且两个方向可以不同。`parse()` 用 `MAX_MESSAGE_LEN` 这个常量上限，供单测与 M0 的固定上限场景；`Session` 的 reader 用 `parse_with_limit(msg, 本端声明值)`。二者只是把上限当参数，校验逻辑同一份。
@@ -293,7 +303,7 @@ src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 ## 10. `PROTOCOL.md` 与逐字节样例
 
 - `PROTOCOL.md` 是本项目**线格式唯一权威**；`design.md` 3.3.1 只是设计视角速查表，与它同源。任何字段改动先改 `PROTOCOL.md`，再同步速查表与逐字节样例。真正要照着写解析器时，看它第 2 节（头）、第 4 节（逐 kind 语义）、第 6 节（错误体）、第 7 节（控制帧）、第 9 节（校验清单）。
-- `PROTOCOL.md` 最小结构：头字段表（含偏移与宽度）、逐 kind 语义、flags、错误体、控制帧、每条 kind 一段 hex 样例与字段解读。
+- `PROTOCOL.md` 最小结构：头字段表（含偏移与宽度）、逐 kind 语义、flags、错误帧（框架/业务两条）、控制帧、每条 kind 一段 hex 样例与字段解读。
 - 七个样例（`Request`、`Response Ok`、`Response Err`、`Notification`、`Cancel`、`GoAway`、`Handshake`）全部**内联在 `photon/tests/protocol.rs`**，由 `assert_golden(name, header, payload, expected)` 逐个断言。**没有 `.bin` 文件、没有 `tests/fixtures/` 目录、不用 `include_bytes!`**（v0.12）：二进制在 diff 里不可见，而内联字面量逐行可审、可逐段注释字段与宽度，冻结效果等价。
 - 生成顺序（写死）：**先用实现生成 → 人工对照 `PROTOCOL.md` 逐字节审 → 把审过的字节内联冻结 → 测试只做 decode/encode 比对，运行时绝不重新生成**。运行时重生成等于把当前实现的 bug 固化进样例。
 - 反例用例（同等重要，没有它们硬约束就没有测试）：`Cancel.service_id != 0`、`Notification.request_id == 0`、`Handshake.reserved != 0`、`flags` bit3 置位、`kind = 7`，每条都断言「必须报 `Protocol`」。
@@ -307,7 +317,7 @@ src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 | 头往返 | 任意字段组合 encode → decode 字段一致；七个样例双向比对 | M0 |
 | 逐 kind 校验 | 反例用例全部被拒，且**不误伤合法帧** | M0 |
 | 帧长上限 | 恰好 `MAX_MESSAGE_LEN` 放行、多 1 字节拒绝（`§9` 第 12 条） | M0 |
-| 错误体 | `code 0..7` 编解码；`message` 非 UTF-8 时 lossy 且 code 不变 | M2 |
+| 错误帧 | 框架帧 `code 0..7` 编解码、`message` 非 UTF-8 时 lossy 且 code 不变；业务帧 0 字节合法 | M2 |
 | 未知 kind / 保留位 | 断连且不产生 `Response` | M2 |
 | method id | golden 向量稳定；同名不同服务不冲突 | M2 |
 | codec fail-fast | 两侧 `codec_id` 不等 → 100 ms 内断开，错误为 `Protocol` | M3 |

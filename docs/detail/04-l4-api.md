@@ -62,7 +62,8 @@ pub trait Service: Send + Sync + 'static {
 |---|---|---|
 | `#[photon(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking`（v0.19 生效） |
 | `#[photon(zero_copy)]` | 仅同步 `fn` | 该方法的入站 payload 允许直传；生成 `payload_mode` 覆盖返回 `ZeroCopy`（v0.26 生效，v1 上是 no-op，等 shm） |
-| `error = MyError` | **仅服务级** | v0.25：把业务错误映射成 `code ≥ 0x1_0000` 的 `Remote`；方法级不支持（同一 trait 里混两种错误类型没有意义） |
+
+**服务级属性只剩 `id = N` 与 `blocking`（v0.31）**：v0.25 的 `error = MyError` 已删除，错误类型改由方法签名表达（`-> T` / `-> Result<T, E>`），宏只在展开期做两件校验——`E` 不许是 `RpcError`（否则报「契约方法不能返回 `RpcError`」），`T` / `E` 不做其它限制。
 
 **不合法的组合必须在编译期报错**，不能降级为警告：`async fn` + `blocking`、`async fn` + `zero_copy`、`fn` 不带 `blocking` 却出现在 blocking client 里（后者由生成逻辑自然规避）。
 
@@ -127,19 +128,24 @@ mod __photon_calc {          // 模块名 = __photon_ + 服务名的小写 snake
 
 ```rust
 // `CalcService<S>` 的 call：整个 dispatch 只包一层 Box，分支里不再各自 Box::pin
-fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
     Box::pin(async move {
         let me = Arc::clone(&self.inner);            // 内层 Arc<S>：本层不再分层
         match method {
-            HASH_ADD => {                                            // async fn：本处 await
-                let (a, b): (i64, i64) = Default::decode(&payload)?;  // async / fn 分支在 call 开头解
-                let out = <S as Calc>::add(&*me, a, b).await?;
-                Default::encode(&out)
+            HASH_ADD => {                                            // async fn，不可失败：-> i64
+                let (a, b): (i64, i64) = Default::decode(&payload)?;  // 解码失败 → ? 自动转 HandlerError::Framework{4}
+                let out = <S as Calc>::add(&*me, a, b).await;
+                Default::encode(&out).map_err(HandlerError::from)
             }
-            HASH_FAST => {                                            // fn：就地跑完，不换线程
-                let data: Vec<u8> = Default::decode(&payload)?;
-                let out = <S as Calc>::fast_hash(&*me, data)?;         // 同步 `fn` 直接出 Result
-                Default::encode(&out)
+            HASH_DIV => {                                            // async fn，可失败：-> Result<i64, CalcError>
+                let (a, b): (i64, i64) = Default::decode(&payload)?;
+                match <S as Calc>::div(&*me, a, b).await {
+                    Ok(out) => Default::encode(&out).map_err(HandlerError::from),
+                    Err(e) => match Default::encode(&e) {
+                        Ok(tail) => Err(HandlerError::Business(tail)),  // 业务拒绝：tail 是 E 的编码
+                        Err(err) => Err(HandlerError::from(err)),
+                    },
+                }
             }
             HASH_LOAD => {                                            // fn + #[photon(blocking)]
                 let me = Arc::clone(&me);
@@ -149,9 +155,12 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
                     Default::encode(&out)
                 })
                 .await
-                .map_err(|join| RpcError::Internal(format!("blocking handler 未正常结束: {join}")))?  // JoinError → 错误体
+                .map_err(|join| HandlerError::Framework {             // JoinError → 框架码 0
+                    code: 0,
+                    message: format!("blocking handler 未正常结束: {join}"),
+                })?
             }
-            _ => Err(RpcError::Remote(RemoteError::new(3))),           // UnknownMethod：回包侧构造，合法
+            _ => Err(HandlerError::Framework { code: 3, message: "unknown method".into() }),
         }
     })
 }
@@ -170,7 +179,7 @@ fn schedule(&self, method: u64) -> Schedule {
 1. **`tokio::spawn` 只在 L3 发生一次**（`tokio::spawn(svc.call(method, payload))`）。这里的三个分支只回答「这次执行落在哪个线程池」，不是「各自再 spawn 一次」。
 2. **`fn` 分支不换线程**，就在 poll 它的 worker 上就地跑完。微秒级无所谓，毫秒级就是 worker 被占住——所以需要第 7 节的 debug 告警。
 3. **`spawn_blocking` 的 `JoinHandle` 必须 await**，`JoinError` 映射成 `code = 0`；`tokio::spawn` 的句柄同理（在 L3 await）。丢掉句柄 = handler panic 无声，客户端只等到超时。
-4. **未知 method 返回 `Remote{code:3}`，不是 `Protocol`**——帧格式没错，是方法没注册。这个 `Remote` 由**回包侧**（正在回 `Response` 的一方）构造，因而是**合法**的；`RemoteError::new(code)` 是这条路径上允许的构造入口（`2` / `3` / `7` 三个码，见 `02-l2-protocol.md` 7.3）；L3 内部回 `2` / `7` 走的是 `send_error`，不必绕成 `RpcError`。**注意这条在 v0.9 被误标成「服务端伪造远端错误」——那是把「发起侧不许造 `Remote`」错当成了「谁都不许造」**；正确的规则是方向相关：发起侧只能从错误体得到 `Remote`，回包侧可以主动构造。
+4. **未知 method 回框架码 `3`（`HandlerError::Framework`），不是 `Protocol`**——帧格式没错，是方法没注册。v0.31 起回包侧不再需要「构造一个假的远端错误」：它直接交出 `HandlerError::Framework { code, message }`，由 L3 编码成框架错误帧。同理，L3 内部回 `2` / `7` 走 `send_error(code, message)`，不绕 `RpcError`。**v0.9 曾把这条标成「服务端伪造远端错误」，那是把「发起侧只能读 `PeerRejected`」错当成了「谁都不许说自己失败」**；正确的规则是方向相关：发起侧只能从错误帧得知 `PeerRejected`，回包侧直接陈述自己的 `HandlerError`。
 
 **`schedule` 为什么必须由生成代码给出（v0.19）**：配额检查发生在「reader 解析完头、准备 spawn」这一刻，此时手上只有 `service_id + method`；实现内部走哪个分支要等 `call` 被 poll 才知道，而那时额度已经扣过了。让 L3 猜不了，也不该让 handler 自己扣（那等于把会话层的资源契约下放到业务代码）。代价只是一次 `match` 比较链，且只有存在 blocking 方法时才生成。
 
@@ -188,32 +197,51 @@ fn method_name(&self, method: u64) -> Option<&'static str> {
 
 ---
 
-## 5.1 业务错误映射（v0.25）
+## 5.1 错误面：契约零框架类型（v0.31）
 
-服务级写 `error = E` 之后，方法签名与两侧转换都由展开产物负责：
+方法签名只有两种形状，`E` 由契约自定义、只要求 `Codec`：
 
 ```rust
-#[photon::service(id = 11, error = BizError)]
-trait Ledger { async fn withdraw(&self, amount: i64) -> Result<i64, BizError>; }
-
-// dispatch：handler 的 `E` 先换成 `RpcError` 再进 `Response`
-let out = <S as Ledger>::withdraw(&*me, amount).await.map_err(|e| {
-    let err = <BizError as ::photon::ServiceError>::into_error(e);
-    ::photon::error::assert_business_error(&err);   // debug：必须是 code >= 0x1_0000
-    err
-})?;
-
-// stub：`call` / `encode` / `decode` 三处都可能给出 `RpcError`，全部转回 `E`
-let payload = codec::encode(&(amount,)).map_err(BizError::from_error)?;
-let reply = handle.call(..).await.map_err(BizError::from_error)?;
-codec::decode(&reply).map_err(BizError::from_error)
+#[photon::service(id = 11)]
+trait Ledger {
+    async fn balance(&self) -> i64;                            // 不可失败
+    async fn withdraw(&self, amount: i64) -> Result<i64, CalcError>;   // 可失败
+}
 ```
 
-三处 `from_error` 缺一不可：`encode` 失败（参数编码错）与 `decode` 失败（回包结构错）都是 `InvalidInput`，它们和 `Timeout` / `Closed` 一样必须落到业务错误类型里，否则调用方拿到的是一个 `E` 里夹着 `RpcError` 的缝合产物。
+生成的 stub 交出两种失败类型：
 
-**为什么是一个 trait 而不是两个 `From`**：`impl From<E> for RpcError` 与 `impl From<RpcError> for E` 分处两个方向，用户只写一半时，报错点是展开产物里的某个 `?`（「the trait `From<…>` is not implemented」），根本指不到「你少写了一个方向」。`ServiceError` 一个 impl 同时交代两侧，且 `from_error` 是普通函数——它逼着实现方显式决定「本端 `Timeout` 怎么收敛」，这个决定不该被 `From` 的默认语义糊过去。
+```rust
+// balance（不可失败）：框架失败仍可能发生
+pub async fn balance(&self) -> Result<i64, RpcError>;
 
-**debug 断言的必要性**：业务错误写成 `code 3` 会被客户端当成 `UnknownMethod`，`code 6` 会被当成 deadline——两种都是「看起来框架坏了」的假象，且只有在线日志里才能回溯。`assert_business_error` 在 `into_error` 之后立刻检查，release 下 `debug_assert!` 整体编译掉，不留分支。
+// withdraw（可失败）：业务拒绝 / 框架失败分两臂
+pub async fn withdraw(&self, amount: i64) -> Result<i64, CallError<CalcError>>;
+```
+
+`CallError<E>` 的两臂由**来源**决定，不由类型猜：
+
+| 臂 | 来源 | 客户端该做什么 |
+|---|---|---|
+| `Rejected(E)` | 对端 `flags = 0x09` 的业务帧，payload 就是 `E` | 按业务语义处理（余额不足不是错误，是结果） |
+| `Failed(RpcError)` | 本端（超时/断开/编解码）或对端框架帧（`PeerRejected`） | 重试/退避/放弃，看 `RpcError::retryable()` |
+
+dispatch 侧与之对称，三处产物各有明确类型：
+
+```rust
+// handler 的返回值 → HandlerError（回包前就决定回哪种帧）
+match <S as Ledger>::withdraw(&*me, amount).await {
+    Ok(out) => Default::encode(&out).map_err(HandlerError::from),
+    Err(e) => match Default::encode(&e) {
+        Ok(tail) => Err(HandlerError::Business(tail)),
+        Err(err) => Err(HandlerError::from(err)),
+    },
+}
+```
+
+**为什么不做「业务码段」**：v0.25 曾要求 `into_error` 产出 `Remote { code ≥ 0x1_0000 }`，并在 debug 里断言。那套东西的实际作用是把 `E` 压成一个整数 + 文本，代价是：① 契约必须依赖框架类型；② `E` 的结构不能自己定（网关要整数码就只能这样）；③ 判定「这是业务还是框架」靠比较整数，边界一改全体失效。v0.31 用一个 flags bit 替代整段码空间——**身份由协议位表达，内容由契约表达**，两边各管一件事。
+
+**编码失败怎么办**：`E` 编码不出来（codec 是用户可替换的，理论上可能）时退化成框架码 `0` + 错误文本，**绝不再去编码错误本身**——那是递归。同理，客户端解不出 `E` 时按 `InvalidInput` 处理：那说明两端契约不一致，属于该报警的事故，不该假装成业务错误。
 
 ## 5.2 `PayloadMode`：两种取值在 v1 都是 no-op（v0.26）
 
@@ -270,7 +298,7 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 
 | 期限 | 入口 | 计时起点 | 到点后 |
 |---|---|---|---|
-| 协议期限 | `with_deadline(ms)` → header `deadline_ms` | 发起侧发帧 | 服务端回 `DeadlineExceeded`（`Remote{6}`），或发起侧计时器先响 → `Timeout` |
+| 协议期限 | `with_deadline(ms)` → header `deadline_ms` | 发起侧发帧 | 服务端回 `DeadlineExceeded`（`PeerRejected{6}`），或发起侧计时器先响 → `Timeout` |
 | 本地期限 | `with_timeout(dur)` → `recv_timeout` + 会话线程上的 `tokio::time::timeout` | 调用方投递 | 两侧同刻到点 → `Timeout` |
 
 - 本地期限默认 `None`：没设就等于「等到有结果为止」，与异步客户端一致；默认塞一个数字等于框架替用户决定最多等多久。
@@ -344,7 +372,7 @@ v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：f
 | 注册撞号 | 运行期（注册时） | `Err`，**不覆盖**已有服务 |
 | 改方法签名 | 编译期 | 在用户侧编译失败，错误信息必须定位到具体方法 |
 
-测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。截至 v0.27 共六条：`blocking_on_async`、`missing_id`、`unknown_method_attr`（`cache`）、`zero_copy_on_async`、`zero_copy_on_blocking`、`error_type_mismatch`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。已删除两条：v0.17 的 `sync_method`（同步 `fn` 从 v0.19 起合法）、v0.26 的 `blocking_service`（服务级 `blocking` 从 v0.27 起合法，改为 `tests/blocking_client.rs` 的正向验收）。`unknown_method_attr` 原先用 `zero_copy` 当「未知属性」，`zero_copy` 在 v0.26 转正后改用真正不存在的 `cache`。
+测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。截至 v0.31 共六条：`blocking_on_async`、`missing_id`、`unknown_method_attr`、`zero_copy_on_async`、`zero_copy_on_blocking`、`rpc_error_in_contract`（契约里写 `-> Result<T, RpcError>` 必须展开期报错；v0.25 的 `error_type_mismatch` 随 `error = E` 一并删除）。任何一条的 `.stderr` 都是冻结文本，改文案就要同步改它。
 
 ---
 
@@ -503,7 +531,7 @@ impl<S, K> SessionHandle<S, K> {
 `local_calc` 的两条预期输出是验收硬指标（不能随手改文案）：
 
 - `[server] listening on memory (in-process pair, no endpoint)`
-- `Err(Remote(code=0x10001, "divide by zero"))`
+- `Err(Rejected(DivideByZero))`
 
 M2 的范围必须写清：**只支持 `async fn` 声明**，不含 `Notification` / 超时 / `GoAway` / 同步 handler。把七种形态全压给 M2 是 v0.6 的错误，按现文不可能通过。
 

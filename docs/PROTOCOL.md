@@ -2,7 +2,7 @@
 
 > **本文件是 photon 线格式的唯一权威。** `docs/design.md` 3.3.1 的逐 kind 表是设计视角速查表，与本文同源；两者不一致时以本文为准，且必须立刻修正速查表。
 >
-> 当前对应 `design.md` **v0.30**，`protocol_version = 1`。v0.30 只删了两个被 `examples/calc-split` 覆盖的示例（`calc_server` / `calc_client`），**框架代码与线格式一字未动**；v0.29.1 只修了示例命令里的地址写法（位置参数而非 `--addr`），**线格式与框架代码一字未动**；v0.29 只在 `examples/` 加了一个三 crate 的嵌套 workspace（`examples/calc-split`，契约 / 服务端 / 客户端），**线格式与框架代码一字未动**；v0.28.1 只重排了 `examples/calc_service/`（接口 `api.rs` / 实现 `imp.rs` 分文件，客户端不再编译 handler），**线格式、代码与本文一字未动**；v0.28 只在 L3/L4 落 `tracing` span（`photon.call` / `photon.request`，`method_name` 由 `Service::method_name` 反查，`request_id` 由 `Session::call` 回填），**字节布局、字段语义与 17 条校验一字未动**（span 只在进程内，不上线路）；v0.27 只在 L4 落同步客户端（`photon::blocking::BlockingSession` + `<Svc>BlockingClient`，自带线程与 runtime；同时取消 `blocking` feature），**字节布局、字段语义与 17 条校验一字未动**；v0.26 只在 L4 落 `PayloadMode` 的类型与方法级 opt-in（`#[photon(zero_copy)]` 仅同步 `fn`），**握手与帧格式零改动**（`payload_mode` 不进握手，理由见 design 4.5）；v0.25 只在 L4 加业务错误映射（`ServiceError` 两个方向），错误体仍走 3.8 的 `Remote` 原码透传，**字节布局与 17 条校验一字未动**；v0.24 只在类型化 stub 上补 `with_deadline`（期限进头，本端用 `deadline_ms` 表达剩余预算），**字节布局与 17 条校验一字未动**；v0.23 只加 `calc_local` 示例（UDS 两进程），**字节布局与 17 条校验一字未动**；v0.22 只补握手协商的验收（两个方向的上限各一条用例 + 三种建连期拒绝），**字节布局、字段语义与 17 条校验一字未动**；v0.21 只落地 M3 第三步（`GoAway` 双向收尾 / 急停 bit2 的发送与接收、入站 Draining 回 `Remote{7}`），**字节布局、字段语义与 17 条校验一字未动**；v0.20 只落地 M3 第二步（超时/放弃即发 `Cancel`、`Notification` 走完整 dispatch 不回包、`SessionHandle::notify`），**字节布局、字段语义与 17 条校验一字未动**；v0.19 只落地 M3 第一步（三档声明形态、调度分流、入站双配额、`tracing` 诊断），同样零字节改动；v0.18 只落地 M2 的服务端装配、客户端连接、示例与并发验收，同样零字节改动；v0.17 只落地 codec 与 `#[photon::service]` 宏、method id 哈希，同样零字节改动；v0.16 只落地 L3 `Session` 骨架、错误体与 `to_wire` 签名对齐，**字节布局、字段语义与 17 条校验一字未动**；v0.15 只落地 `local` 传输（Unix 手搓 UDS）与 drop 契约改判，同样零字节改动；v0.14 只落地 `memory` 传输与 L1 验收测试，**字节布局、字段语义与 17 条校验一字未动**；v0.13 只把 `Transport::bind` 改为异步，**字节布局、字段语义与 17 条校验一字未动**；v0.12 只改样例的承载方式（黄金样例从 `.bin` 文件改为源码内联字节数组，`tests/fixtures/` 目录不再存在），同样零字节改动；v0.11 只改工程约定（模块文件改 2024 风格、edition/resolver、workspace 成员名），同样零字节改动；v0.10 改的是口径与校验清单（对齐断言收窄到 `memory` / `shm`、`deadline_ms` 两侧起点、§9 补 5 条校验），同样零字节改动。
+> 当前对应 `design.md` **v0.31**，`protocol_version = 2`。v0.31 改了错误帧的语义（**结构没变，仍是「错误 `Response` 的 payload」，长度仍由 L1 前缀界定**）：① flags bit3 启用，区分「框架判定」与「业务拒绝」，`Response` 的合法组合变成 `0x00 / 0x01 / 0x09`；② 框架错误体前缀从 8 字节缩到 2 字节（`code u8 | reserved u8`），**删掉 `retryable` 字段**，`code` 只保留 `0..=7`、取消业务码段；③ 业务帧 payload 就是契约里 `E` 的 codec 字节，框架不解释、可以为 0 字节。旧实现（`protocol_version = 1`）会把 `0x09` 当协议错误、并按 8 字节前缀解框架帧，因此**版本号必须升到 2**，握手不匹配即拒绝建连（7.1）。其余字节布局、17 条校验、黄金样例的头与 payload 偏移一字未动。
 
 ---
 
@@ -39,7 +39,7 @@
 | 偏移 | 宽度 | 字段 | 类型 | 说明 |
 |---|---|---|---|---|
 | 0 | 1 | `kind` | u8 | 0–6 有效，见第 3 节 |
-| 1 | 1 | `flags` | u8 | bit0–2 有定义，见第 5 节 |
+| 1 | 1 | `flags` | u8 | bit0–3 有定义，见第 5 节 |
 | 2 | 2 | `service_id` | u16 | 路由键第一段；具体语义随 kind 变化 |
 | 4 | 8 | `request_id` | u64 | **由发起方分配，只在本端 pending 表内唯一**，0 保留 |
 | 12 | 8 | `method` | u64 | 编译期哈希；只在服务内部唯一 |
@@ -77,7 +77,7 @@
 | kind | 值 | 方向 | 名称 | payload | 是否经 Codec |
 |---|---|---|---|---|---|
 | 0 | `0x00` | 双向 | `Request` | 请求参数 | 是 |
-| 1 | `0x01` | 双向 | `Response` | 结果，或错误体（`flags` bit0=1） | 是 / 错误体手写 |
+| 1 | `0x01` | 双向 | `Response` | 结果；或错误帧（`flags` bit0=1，bit3 决定框架/业务） | 是 / 错误帧手写 |
 | 2 | `0x02` | 双向 | `Notification` | 通知内容 | 是 |
 | 3 | `0x03` | 双向 | `Cancel` | **空** | 否 |
 | 4 | `0x04` | 双向 | `StreamChunk`（**预留，不实现**） | — | — |
@@ -118,48 +118,65 @@
 | 0 | `0x01` | `Response` | payload 是错误体 | 协议错误 |
 | 1 | `0x02` | `StreamChunk`（未实现） | 最后一帧 | 协议错误（当前任何 kind 上置位都错） |
 | 2 | `0x04` | `GoAway` | 急停：不等在飞工作，立即断连 | 协议错误 |
-| 3–7 | `0x08`–`0x80` | — | 保留 | **任何置位都是协议错误**，不得静默忽略 |
+| 3 | `0x08` | `Response` | **业务拒绝**：payload 是契约里 `E` 的字节，见第 6 节 | 协议错误（必须与 bit0 同时置位） |
+| 4–7 | `0x10`–`0x80` | — | 保留 | **任何置位都是协议错误**，不得静默忽略 |
 
-- `Response` 的 flags 只允许 `0x00` 与 `0x01`。
+- `Response` 的 flags 只允许 `0x00`、`0x01`、`0x09`；`0x08`（只有 bit3、没有 bit0）非法——「业务拒绝」本身一定是 Err。
 - `GoAway` 的 flags 只允许 `0x00` 与 `0x04`。
 - 其余 kind 的 flags 必须为 `0x00`。
 - **协议不留压缩位**：将来若要压缩，新增 kind + 独立协商；旧实现对未知位报错，才不会误读。
 
 ---
 
-## 6. 错误体
+## 6. 错误帧
 
-`flags` bit0 = 1 的 `Response`，payload 不是业务结果，而是：
+`flags` bit0 = 1 的 `Response` 是错误帧，**装什么由 bit3 决定**：
+
+| flags | 含义 | payload |
+|---|---|---|
+| `0x01` | 框架判定 | 2 字节前缀 + 文本（6.1） |
+| `0x09` | 业务拒绝 | 契约里 `E` 的 codec 字节，**0 字节合法**（6.2） |
+
+### 6.1 框架错误体
 
 | 偏移 | 宽度 | 字段 | 说明 |
 |---|---|---|---|
-| 0 | 4 | `code` | u32，见 6.1 |
-| 4 | 1 | `retryable` | 0 / 1；其它值按「非 0 即可重试」宽松处理，**不报协议错误** |
-| 5 | 3 | `reserved` | u24，必须 0（发送方填 0，接收方可忽略） |
-| 8 | — | `message` | UTF-8 到 payload 末尾，**没有第二个长度字段** |
+| 0 | 1 | `code` | u8，见 6.1.1；`8..=255` 未定义，收到即协议错误 |
+| 1 | 1 | `reserved` | 必须 0（发送方填 0，接收方忽略） |
+| 2 | — | `message` | UTF-8 到 payload 末尾，**没有第二个长度字段**；可以为空 |
 
-前缀固定 8 字节，`message` 长度 = payload 长度 − 8，由 L1 的边界保证。
+前缀固定 2 字节，`message` 长度 = payload 长度 − 2，由 L1 的边界保证；整帧仍受 `max_message_len` 约束。
 
-### 6.1 code 空间
+#### 6.1.1 code 与重试性
 
-| code | 名称 | 谁产生 | 客户端拿到后 |
+| code | 名称 | 谁产生 | 可重试（规范静态表） |
 |---|---|---|---|
-| `0` | `Internal` | 框架：handler panic / `JoinError` / 不可恢复 | `Remote { code: 0 }` |
-| `1` | `Overloaded` | 对端：配额满 / 队列满 / 线程池排不上 | `Remote { code: 1 }`，`retryable` 通常 1 |
-| `2` | `UnknownService` | 对端：`service_id` 未注册 | `Remote { code: 2 }`，重试无意义 |
-| `3` | `UnknownMethod` | 对端：服务在，方法未注册 | `Remote { code: 3 }`，重试无意义 |
-| `4` | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | `Remote { code: 4 }`，重试无意义 |
-| `5` | `Cancelled` | 对端：收到 `Cancel` 并按此中止 | `Remote { code: 5 }` |
-| `6` | `DeadlineExceeded` | 对端：它自己判定的 deadline 到期 | `Remote { code: 6 }` |
-| `7` | `ShuttingDown` | 对端：优雅关闭中，不接新请求 | `Remote { code: 7 }` |
-| `8`–`0xFFFF` | — | 现在无定义 | **原样装进 `Remote`，不得拍成 `Internal`**（拍平会丢信息） |
-| `≥ 0x1_0000` | 用户 | 业务自定义 | `Remote { code }`，语义由用户定义，框架不解释 |
+| `0` | `Internal` | 框架：handler panic / `JoinError` / 不可恢复 | 否 |
+| `1` | `Overloaded` | 对端：配额满 / 队列满 / 线程池排不上 | **是**（退避后重试） |
+| `2` | `UnknownService` | 对端：`service_id` 未注册 | 否 |
+| `3` | `UnknownMethod` | 对端：服务在，方法未注册 | 否 |
+| `4` | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | 否 |
+| `5` | `Cancelled` | 对端：收到 `Cancel` 并按此中止 | 否 |
+| `6` | `DeadlineExceeded` | 对端：它自己判定的 deadline 到期 | 否（换更长期限是调用方策略） |
+| `7` | `ShuttingDown` | 对端：优雅关闭中，不接新请求 | **是**（重连后） |
 
-### 6.2 编解码口径
+**重试性不上线路**（v0.31 删掉 `retryable` 字段）：同一个码的重试语义属于协议，不会按调用漂移，写成本表比写成本字节更可靠；业务错误的重试性由 `E` 自己表达。
 
-- `message` 非法 UTF-8：用 lossy 转换并**保留原 `code`**，不得因此把错误降级成 `Internal`——错误体是排障通道。
-- 本端自己产生的错误（超时、本端配额、连接关闭、IO、协议）**永不上线路**，只能由本端构造；错误体只表达「对端陈述它自己的状态」。两者不互相转换。
-  - 反例：对端回 `code = 1`，客户端拿到的是 `Remote { code: 1 }`，**不能**翻译成本地的 `Overloaded`——否则「谁该为放弃负责」就糊了。
+**`code` 没有业务段**：`≥ 0x1_0000` 之类的约定在 v0.31 全部取消。业务错误走 `0x09` 那条路，框架既不编号也不解释。
+
+### 6.2 业务错误帧
+
+`flags = 0x09` 时，payload **就是**契约里错误类型 `E` 的 codec 输出：
+
+- 框架不解析、不重排、不补前缀，长度可以是 0 字节（例如 `enum E { Unit }` 编出来就是 0 字节）。
+- 接收侧用与成功值相同的 `codec_id` 解回 `E`；解不出来按 `InvalidArgs`（本地）处理——那说明两端契约不一致。
+- `E` 的结构是契 ABI 的一部分：改字段顺序等于改线格式（postcard 按位置编码），要与 `service_id` 一起纳入版本治理。
+
+### 6.3 编解码口径
+
+- `message` 非法 UTF-8：用 lossy 转换并**保留原 `code`**，不得因此把错误降级成 `Internal`——错误帧是排障通道。
+- 本端自己产生的错误（超时、本端配额、连接关闭、IO、协议）**永不上线路**，只能由本端构造；错误帧只表达「对端陈述它自己的状态」。
+  - 反例：对端回 `code = 1`，客户端拿到的是 `PeerRejected { code: 1 }`，**不能**翻译成本地的 `Overloaded`——否则「谁该为放弃负责」就糊了。
 
 ---
 
@@ -171,7 +188,7 @@
 
 | 偏移 | 宽度 | 字段 | 规则 |
 |---|---|---|---|
-| 0 | 2 | `protocol_version` | 当前为 **1**；不等即断连 |
+| 0 | 2 | `protocol_version` | 当前为 **2**；不等即断连 |
 | 2 | 2 | `flags` | 保留，必须 0 |
 | 4 | 4 | `max_message_len` | **本端愿意接收**的单帧上限，含 24 字节头；必须 `≥ 24`，`shm` 上还必须 `≤ slot_size` |
 | 8 | 2 | `codec_id` | `0 = postcard`，`1 = rkyv`（M5）；不等即断连 |
@@ -199,7 +216,7 @@
 | `kind` | `0x05` |
 | 其余 | 全部 0 |
 
-语义：**「本端开始关闭这条连接」**——① 我不再**发起**新 `Request`；② 但我仍会把你**已进入 handler** 的请求回完；③ 两侧都宣告过 `GoAway` 之后到达的 `Request` 回 `Remote{7}`（明确拒绝，不静默丢弃）。收到 `GoAway` 的一方出站立即停止发起（新请求返回本地的 `Closed`），入站**继续保持 `Open`**，继续 dispatch 并收在飞 `Response`。
+语义：**「本端开始关闭这条连接」**——① 我不再**发起**新 `Request`；② 但我仍会把你**已进入 handler** 的请求回完；③ 两侧都宣告过 `GoAway` 之后到达的 `Request` 回框架码 `7`（`ShuttingDown`）；④ payload 为空。
 
 > **「在飞」= 已进入 handler，不是「已写到线上」**。后者不可观测，前者可计数，也只有前者能给出可验证的保证。
 >
@@ -255,22 +272,22 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 | 20–23 | `00 00 00 00` | `deadline_ms` | 必须 0 |
 | 24 | `CC` | `payload` | 占位结果 |
 
-### 8.3 样例 3：`Response`（Err，40 字节）
+### 8.3 样例 3：`Response`（Err，34 字节）
 
 ```
 01 01 00 00  01 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
-04 00 00 00  00 00 00 00  62 61 64 20  61 72 67 73
+04 00 62 61  64 20 61 72  67 73
 ```
 
 | 偏移 | 字节 | 字段 | 值 |
 |---|---|---|---|
-| 0–1 | `01 01` | kind / flags | Response，Err（bit0=1） |
+| 0–1 | `01 01` | kind / flags | Response，Err（bit0=1，框架判定） |
 | 2–3 | `00 00` | `service_id` | 必须 0 |
 | 4–11 | `01 00 00 00 00 00 00 00` | `request_id` | 回填 1 |
 | 12–19 | `00 … 00` | `method` | 必须 0 |
 | 20–23 | `00 00 00 00` | `deadline_ms` | 必须 0 |
-| 24–31 | `04 00 00 00 00 00 00 00` | 错误体前缀 | `code = 4`（InvalidArgs），`retryable = 0`，`reserved = 0` |
-| 32–39 | `62 61 64 20 61 72 67 73` | `message` | ASCII `"bad args"`（8 字节） |
+| 24–25 | `04 00` | 错误体前缀 | `code = 4`（InvalidArgs），`reserved = 0` |
+| 26–33 | `62 61 64 20 61 72 67 73` | `message` | ASCII `"bad args"`（8 字节） |
 
 > 这里故意用 ASCII 便于逐字节核对；真实用法里 `message` 可以是 UTF-8 中文，一个汉字占 3 字节，长度不再等于字符数。
 
@@ -327,14 +344,14 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 
 ```
 06 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
-01 00 00 00  00 00 01 00  00 00 00 00
+02 00 00 00  00 00 01 00  00 00 00 00
 ```
 
 | 偏移 | 字节 | 字段 | 值 |
 |---|---|---|---|
 | 0–1 | `06 00` | kind / flags | Handshake（6），flags=0 |
 | 2–23 | `00 … 00` | 其余头字段 | 必须 0 |
-| 24–25 | `01 00` | `protocol_version` | 1 |
+| 24–25 | `02 00` | `protocol_version` | 2 |
 | 26–27 | `00 00` | `flags` | 必须 0 |
 | 28–31 | `00 00 01 00` | `max_message_len` | `0x0001_0000` = 64 KiB |
 | 32–33 | `00 00` | `codec_id` | 0 = postcard |
@@ -346,7 +363,7 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 |---|---|---|---|
 | 8.1 | `"Request"` | 26 | 四字段均非 0；payload 起点 24 |
 | 8.2 | `"Response Ok"` | 25 | `service_id`/`method`/`deadline_ms` 全 0；bit0=0 |
-| 8.3 | `"Response Err"` | 40 | 错误体 8B 前缀 + 变长 message；bit0=1 |
+| 8.3 | `"Response Err"` | 34 | 错误体 2B 前缀 + 变长 message；bit0=1 |
 | 8.4 | `"Notification"` | 25 | 无 `Response` 承诺；id 非 0 |
 | 8.5 | `"Cancel"` | 24 | payload 空；`service_id` = 0 |
 | 8.6 | `"GoAway"` / `"GoAway 急停"` | 24 | 全零头；急停变体只差 flags |
@@ -379,7 +396,7 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 | 13 | `Response` 的 `request_id` = 0 | 它必须引用一个非 0 的请求 id；0 是保留值，说明对端实现有 bug |
 | 14 | `Request` / `Notification` 的 `method` = 0 | 方法 id 由宏对方法名哈希产出，0 保留为空 |
 | 15 | `Handshake` 的 payload 长度 ≠ 12 | 定长控制帧，长度不符说明编码错位，继续解析只会读错位 |
-| 16 | `Response` 且 flags bit0 = 1（Err），payload < 8 | 错误体至少要有 8 字节前缀，否则连 `code` 都读不出来 |
+| 16 | 框架错误帧（`0x01`）payload < 2 | 前缀都读不出来，无法定位 |
 | 17 | `Handshake` 的 `max_message_len < 24`，或 `shm` 上 `> slot_size` | 见第 7.1 节：前者装不下空 payload 帧，后者声明了自己映射不到的容量 |
 
 **下列情况不得断连**（否则会把合法行为打成故障）：
@@ -388,10 +405,10 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 |---|---|
 | `Response` 的 `request_id` 未知或已超时 | 静默忽略，记 debug 日志 |
 | `Cancel` 指向未知 / 已完成 id | 静默忽略 |
-| payload 解码失败 | 回 `Remote { code: 4 }`，连接保持 |
+| payload 解码失败 | 回框架码 `4`，连接保持 |
 | `message` 非法 UTF-8 | lossy 转换，保留 `code` |
-| `retryable` 非 0/1 | 按「非 0 即可重试」处理 |
-| `code` 落在 8–0xFFFF | 原样装进 `Remote` |
+| 业务帧（`0x09`）里 `E` 解不出来 | 本端按 `InvalidInput` 处理（两端契约不一致），连接保持 |
+| 框架帧的 `code` 落在 8–255 | 未定义码：按 §6.1.1 只有 `0..=7` 有定义，收到未知码即协议错误 |
 
 ---
 
@@ -403,8 +420,8 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 | 修改既有 kind 的字段语义 | **升** | 不允许原地改 |
 | 使用 flags 保留位 | **升** | 现在一律是协议错误 |
 | 修正文档措辞、补样例 | 不升 | 字节不变 |
-| 新增错误 code 8–0xFFFF | 不升 | 接收方本来就「原样透传」，未知码不算错误 |
-| 用户自定义 code ≥ 0x1_0000 | 不升 | 框架不解释 |
+| 新增框架 code | **升** | 现在 `code` 只认 `0..=7`，未知码即协议错误 |
+| 契约里 `E` 的结构变化 | 不升协议版本，但等于改业务 ABI | 由契约自己治理（与 `service_id` 一起审） |
 
 握手阶段带版本号，比后期写一堆兼容补丁便宜一百倍；本项目**不做**向后兼容层——版本不等就断连，是刻意选择的简单性。
 

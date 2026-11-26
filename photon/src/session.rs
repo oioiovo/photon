@@ -29,10 +29,10 @@ use tracing::Instrument as _;
 
 use crate::{
     Schedule, Service,
-    error::{RemoteError, RpcError},
+    error::{BUSINESS_CODE_MARK, CallFailure, HandlerError, RpcError},
     proto::{
-        Decoded, FLAG_ERR, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind, MAX_MESSAGE_LEN,
-        error_body,
+        Decoded, FLAG_BUSINESS, FLAG_ERR, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind,
+        MAX_MESSAGE_LEN, error_body,
         handshake::{CODEC_POSTCARD, Handshake},
         parse_with_limit,
     },
@@ -119,7 +119,7 @@ struct OutboundTable {
 /// `tx` 用 `Option` 是为了能在 `Drop` 里拿走：还没回包就被丢弃，说明这次调用
 /// 已经失败（超时、断连、被回收），必须当场唤醒等待者，而不是让它等到自己的超时。
 struct PendingEntry {
-    tx: Option<oneshot::Sender<Result<Bytes, RpcError>>>,
+    tx: Option<oneshot::Sender<Result<Bytes, CallFailure>>>,
     table: Arc<Mutex<OutboundTable>>,
     /// 还没拿到结果就被丢弃：调用方不等了，顺手告诉对端别再算。
     cancel: Option<(mpsc::Sender<Bytes>, u64)>,
@@ -127,7 +127,7 @@ struct PendingEntry {
 
 impl PendingEntry {
     /// 正常完成：把结果交给等待者。之后 `Drop` 只做配额归还。
-    fn finish(mut self, result: Result<Bytes, RpcError>) {
+    fn finish(mut self, result: Result<Bytes, CallFailure>) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(result);
         }
@@ -137,7 +137,7 @@ impl PendingEntry {
 impl Drop for PendingEntry {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Err(RpcError::Closed));
+            let _ = tx.send(Err(CallFailure::Failed(RpcError::Closed)));
             // 走到这里说明结果从未送达（超时、放弃、断连）：对端那条 handler 还在算，
             // 告诉它别算了。`try_send` 而不是 `send`——为了发一条「别算了」而卡在
             // 背压上比不发更糟；队列满时对端仍会按 deadline 自行收尾。
@@ -407,10 +407,10 @@ where
         method: u64,
         payload: Bytes,
         deadline_ms: u32,
-    ) -> Result<Bytes, RpcError> {
-        self.wait_ready().await?;
+    ) -> Result<Bytes, CallFailure> {
+        self.wait_ready().await.map_err(CallFailure::Failed)?;
         if !self.egress_open.load(Ordering::Acquire) {
-            return Err(RpcError::Closed);
+            return Err(CallFailure::Failed(RpcError::Closed));
         }
 
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -424,7 +424,7 @@ where
             // 检查、计数、插入必须在同一次持锁内完成。
             let mut table = self.outbound.lock();
             if table.async_used >= self.opts.max_async_in_flight {
-                return Err(RpcError::Overloaded);
+                return Err(CallFailure::Failed(RpcError::Overloaded));
             }
             table.async_used += 1;
             table.pending.insert(
@@ -447,19 +447,19 @@ where
         if self.tx.send(frame).await.is_err() {
             // writer 已经不在了：把刚插进去的那条收回来，不让调用方白等。
             drop(self.take_pending(request_id));
-            return Err(RpcError::Closed);
+            return Err(CallFailure::Failed(RpcError::Closed));
         }
 
         if deadline_ms == 0 {
             match rx.await {
                 Ok(result) => result,
-                Err(_) => Err(RpcError::Closed),
+                Err(_) => Err(CallFailure::Failed(RpcError::Closed)),
             }
         } else {
             match timeout(Duration::from_millis(u64::from(deadline_ms)), rx).await {
                 Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(RpcError::Closed),
-                Err(_) => Err(RpcError::Timeout),
+                Ok(Err(_)) => Err(CallFailure::Failed(RpcError::Closed)),
+                Err(_) => Err(CallFailure::Failed(RpcError::Timeout)),
             }
         }
     }
@@ -698,10 +698,18 @@ where
             }
 
             Kind::Response => {
-                let result = if header.flags & FLAG_ERR != 0 {
-                    Err(RpcError::Remote(error_body::decode(&payload)?))
-                } else {
+                // 两种错误帧的分流点：bit3 置位 = 业务错误，payload 是契约里 `E`
+                // 的字节，这里一个字节都不解释；否则是框架错误帧，解出 `code`。
+                let result = if header.flags & FLAG_ERR == 0 {
                     Ok(payload)
+                } else if header.flags & FLAG_BUSINESS != 0 {
+                    Err(CallFailure::Rejected(payload))
+                } else {
+                    let (code, message) = error_body::decode(&payload)?;
+                    Err(CallFailure::Failed(RpcError::PeerRejected {
+                        code,
+                        message,
+                    }))
                 };
 
                 // 摘出来再交给等待者：留在表里会让下一次同 id 的响应重复投递。
@@ -759,7 +767,7 @@ where
         // 双方都宣告过关闭之后，新到的 `Request` 明确拒绝。静默丢弃会让调用方
         // 干等到自己的期限，而这段窗口里的流量本来就只可能是违规或迟滞的。
         if want_reply && self.ingress_draining.load(Ordering::Acquire) {
-            self.send_error(header.request_id, 7, true, "shutting down")
+            self.send_error(header.request_id, 7, "shutting down")
                 .await?;
             return Ok(());
         }
@@ -768,7 +776,7 @@ where
             // 通知没有回包通道：给它回一个 `Response` 反而是协议噪声（对端没有对应的
             // pending，只会被丢掉），所以这里只记日志。
             if want_reply {
-                self.send_error(header.request_id, 2, false, "unknown service")
+                self.send_error(header.request_id, 2, "unknown service")
                     .await?;
             } else {
                 tracing::debug!(
@@ -808,7 +816,7 @@ where
                 Slot::Blocking => "blocking pool overloaded",
             };
             if want_reply {
-                self.send_error(header.request_id, 1, true, message).await?;
+                self.send_error(header.request_id, 1, message).await?;
             } else {
                 tracing::warn!(
                     service_id = header.service_id,
@@ -874,13 +882,12 @@ where
 
                 let outcome = tokio::select! {
                     biased;
-                    _ = token.cancelled() => Err(RpcError::Remote(RemoteError {
+                    _ = token.cancelled() => Err(HandlerError::Framework {
                         code: 5,
-                        retryable: false,
                         message: "cancelled by peer".into(),
-                    })),
-                    _ = shutdown.cancelled() => Err(RpcError::Closed),
-                    _ = deadline => Err(RpcError::Timeout),
+                    }),
+                    _ = shutdown.cancelled() => Err(RpcError::Closed.into()),
+                    _ = deadline => Err(RpcError::Timeout.into()),
                     res = svc.call(method, payload) => res,
                 };
 
@@ -901,24 +908,26 @@ where
                     // 通知没有回包通道，失败只能记日志：静默吞掉等于让调用方
                     // 以为「发到了」，而服务端什么都没发生。
                     if let Err(e) = &outcome {
-                        tracing::warn!(service_id, method, request_id, %e, "notification handler 失败");
+                        tracing::warn!(service_id, method, request_id, error = ?e, "notification handler 失败");
                     }
                 } else {
                     let frame = match outcome {
                         Ok(body) => {
                             // 成功也写 `code = 0`：这样「有没有这个字段」不再有歧义，
-                            // 按 `code` 过滤时不会漏掉成功的请求。
+                             // 按 `code` 过滤时不会漏掉成功的请求。
                             tracing::Span::current().record("code", 0u32);
-                            response_frame(request_id, body, false)
+                            response_frame(request_id, body, 0)
                         }
-                        Err(e) => {
-                            // 框架级故障（Io / Protocol / RuntimeDropped）没有合适的业务码，
-                            // 按 `0` 兜底；但回包路径上绝不静默丢帧。
-                            let (code, retryable, message) = error_body::to_wire(&e)
-                                .unwrap_or_else(|| (0, false, format!("{e}")));
-                            tracing::Span::current().record("code", code);
-                            let body = error_body::encode(code, retryable, &message);
-                            response_frame(request_id, body, true)
+                        Err(HandlerError::Business(tail)) => {
+                            // 业务拒绝没有码可记：`code` 只描述框架判定。日志里用
+                            // `BUSINESS_CODE_MARK` 标出来，方便按「有没有业务拒绝」筛。
+                            tracing::Span::current().record("code", BUSINESS_CODE_MARK);
+                            response_frame(request_id, tail, FLAG_ERR | FLAG_BUSINESS)
+                        }
+                        Err(HandlerError::Framework { code, message }) => {
+                            tracing::Span::current().record("code", u32::from(code));
+                            let body = error_body::encode(code, &message);
+                            response_frame(request_id, body, FLAG_ERR)
                         }
                     };
                     let _ = tx.send(frame).await;
@@ -938,8 +947,10 @@ where
                 // 排障时根本看不出是 handler 崩了。
                 tracing::error!(service_id, method, request_id, %text, "handler panic");
                 // guard 已在 unwind 里 drop，这里只剩「回包 + 摘 token」。
-                let body = error_body::encode(0, false, &text);
-                let _ = outer_tx.send(response_frame(request_id, body, true)).await;
+                let body = error_body::encode(0, &text);
+                let _ = outer_tx
+                    .send(response_frame(request_id, body, FLAG_ERR))
+                    .await;
                 outer_cancels.lock().remove(&request_id);
             }
         });
@@ -948,16 +959,10 @@ where
     }
 
     /// 回一个错误体。它也走正常写队列，与业务回包共用同一套顺序保证。
-    async fn send_error(
-        &self,
-        request_id: u64,
-        code: u32,
-        retryable: bool,
-        message: &str,
-    ) -> Result<(), RpcError> {
-        let body = error_body::encode(code, retryable, message);
+    async fn send_error(&self, request_id: u64, code: u8, message: &str) -> Result<(), RpcError> {
+        let body = error_body::encode(code, message);
         self.tx
-            .send(response_frame(request_id, body, true))
+            .send(response_frame(request_id, body, FLAG_ERR))
             .await
             .map_err(|_| RpcError::Closed)
     }
@@ -1010,7 +1015,7 @@ where
         method: u64,
         payload: Bytes,
         deadline_ms: u32,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<Bytes, CallFailure> {
         self.inner
             .call(service_id, method, payload, deadline_ms)
             .await
@@ -1148,8 +1153,9 @@ fn cancel_frame(request_id: u64) -> Bytes {
     base_frame(Kind::Cancel, 0, 0, request_id, 0, 0, Bytes::new())
 }
 
-fn response_frame(request_id: u64, payload: Bytes, is_error: bool) -> Bytes {
-    let flags = if is_error { FLAG_ERR } else { 0 };
+fn response_frame(request_id: u64, payload: Bytes, flags: u8) -> Bytes {
+    // flags 由调用方决定：`0` 成功、`FLAG_ERR` 框架错误、`FLAG_ERR | FLAG_BUSINESS`
+    // 业务错误。三种形态的差别就在这一位，别在这里替调用方猜。
     base_frame(Kind::Response, flags, 0, request_id, 0, 0, payload)
 }
 

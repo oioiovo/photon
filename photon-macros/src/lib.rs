@@ -24,15 +24,12 @@ use syn::{
 struct ServiceArgs {
     id: u16,
     blocking: bool,
-    /// `error = MyError`：业务错误类型；`None` 表示方法直接返回 `RpcError`。
-    error: Option<Type>,
 }
 
 impl syn::parse::Parse for ServiceArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut id = None;
         let mut blocking = false;
-        let mut error = None;
 
         for meta in Punctuated::<Meta, Token![,]>::parse_terminated(input)? {
             match &meta {
@@ -48,24 +45,10 @@ impl syn::parse::Parse for ServiceArgs {
                     }
                 },
                 Meta::Path(path) if path.is_ident("blocking") => blocking = true,
-                Meta::NameValue(nv) if nv.path.is_ident("error") => match &nv.value {
-                    Expr::Path(expr) => {
-                        error = Some(Type::Path(syn::TypePath {
-                            qself: None,
-                            path: expr.path.clone(),
-                        }))
-                    }
-                    other => {
-                        return Err(syn::Error::new_spanned(
-                            other,
-                            "`error` 必须是类型路径，例如 `error = CalcError`",
-                        ));
-                    }
-                },
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "`#[photon::service(...)]` 只接受 `id = N`、`blocking` 与 `error = Type`",
+                        "`#[photon::service(...)]` 只接受 `id = N` 与 `blocking`；错误类型由方法签名表达",
                     ));
                 }
             }
@@ -79,11 +62,7 @@ impl syn::parse::Parse for ServiceArgs {
             )
         })?;
 
-        Ok(Self {
-            id,
-            blocking,
-            error,
-        })
+        Ok(Self { id, blocking })
     }
 }
 
@@ -111,8 +90,10 @@ struct Method {
     kind: MethodKind,
     /// 参数名（dispatch 里要按名字传给用户方法）与类型（decode 的目标）。
     args: Vec<(syn::Ident, Type)>,
-    /// `Result<T, E>` 里的 `T`。
+    /// 成功值的类型：`-> T` 或 `Result<T, E>` 里的 `T`。
     ok_ty: Type,
+    /// 失败类型 `E`；`None` 表示这个方法不可失败。
+    err_ty: Option<Type>,
     /// 显式标了 `#[photon(zero_copy)]`；只有同步 `fn` 才可能为真。
     zero_copy: bool,
 }
@@ -125,7 +106,7 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let mut service = parse_macro_input!(item as ItemTrait);
 
-    let methods = match collect_methods(&service, args.error.as_ref()) {
+    let methods = match collect_methods(&service) {
         Ok(methods) => methods,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -149,6 +130,103 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
         &service, &methods, &args, &client, &server, &helper, &register,
     );
     quote!(#service #generated).into()
+}
+
+/// stub 的失败面类型：可失败 → `CallError<E>`，不可失败 → `RpcError`。
+fn stub_err_ty(m: &Method) -> TokenStream2 {
+    match &m.err_ty {
+        Some(err) => quote! { ::photon::CallError<#err> },
+        None => quote! { ::photon::RpcError },
+    }
+}
+
+/// 参数编码失败的处理：可失败方法收进 `CallError::Failed`，不可失败方法就是
+/// `RpcError` 本身。
+fn stub_pack(m: &Method, packed: TokenStream2) -> TokenStream2 {
+    if m.err_ty.is_some() {
+        quote! {
+            <::photon::codec::Default as ::photon::Codec>::encode(#packed)
+                .map_err(::photon::CallError::Failed)?
+        }
+    } else {
+        quote! { <::photon::codec::Default as ::photon::Codec>::encode(#packed)? }
+    }
+}
+
+/// 把 `Result<Bytes, CallFailure>` 收成 stub 的返回类型。
+///
+/// 三支的来源不同：`Ok` 是成功值（解码失败算本端错误），`Failed` 是本端/对端
+/// 框架判定，`Rejected` 是**对端业务拒绝**——只有它需要契约里的 `E`。
+fn stub_tail(m: &Method, call: TokenStream2) -> TokenStream2 {
+    let ok_ty = &m.ok_ty;
+    match &m.err_ty {
+        Some(err) => quote! {
+            match #call {
+                ::std::result::Result::Ok(reply) =>
+                    <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply)
+                        .map_err(::photon::CallError::Failed),
+                ::std::result::Result::Err(::photon::CallFailure::Failed(err)) =>
+                    ::std::result::Result::Err(::photon::CallError::Failed(err)),
+                ::std::result::Result::Err(::photon::CallFailure::Rejected(tail)) =>
+                    match <::photon::codec::Default as ::photon::Codec>::decode::<#err>(&tail) {
+                        ::std::result::Result::Ok(err) =>
+                            ::std::result::Result::Err(::photon::CallError::Rejected(err)),
+                        ::std::result::Result::Err(e) =>
+                            ::std::result::Result::Err(::photon::CallError::Failed(
+                                ::photon::RpcError::InvalidInput(::std::format!(
+                                    "业务错误帧解码失败（对端契约与本端不一致）：{e}"
+                                )),
+                            )),
+                    },
+            }
+        },
+        None => quote! {
+            match #call {
+                ::std::result::Result::Ok(reply) =>
+                    <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply),
+                ::std::result::Result::Err(::photon::CallFailure::Failed(err)) =>
+                    ::std::result::Result::Err(err),
+                ::std::result::Result::Err(::photon::CallFailure::Rejected(_)) =>
+                    ::std::result::Result::Err(::photon::RpcError::InvalidInput(
+                        ::std::string::String::from(
+                            "不可失败的方法收到业务错误帧：对端契约与本端不一致"
+                        ),
+                    )),
+            }
+        },
+    }
+}
+
+/// dispatch 的 handler 结果 → `HandlerError`。
+///
+/// 可失败方法把 `Err(e)` 就地编码成业务帧的 tail；编码本身失败（按理不该发生，
+/// 但 codec 是可替换的）退化成框架 `0`，绝不再去编码错误本身——那是递归。
+fn dispatch_tail(m: &Method, call: TokenStream2, is_async: bool) -> TokenStream2 {
+    let await_kw = if is_async {
+        quote! { .await }
+    } else {
+        quote! {}
+    };
+    match &m.err_ty {
+        Some(_) => quote! {
+            match #call #await_kw {
+                ::std::result::Result::Ok(out) =>
+                    <::photon::codec::Default as ::photon::Codec>::encode(&out)
+                        .map_err(::photon::HandlerError::from),
+                ::std::result::Result::Err(e) =>
+                    match <::photon::codec::Default as ::photon::Codec>::encode(&e) {
+                        ::std::result::Result::Ok(tail) =>
+                            ::std::result::Result::Err(::photon::HandlerError::Business(tail)),
+                        ::std::result::Result::Err(err) =>
+                            ::std::result::Result::Err(::photon::HandlerError::from(err)),
+                    },
+            }
+        },
+        None => quote! {
+            <::photon::codec::Default as ::photon::Codec>::encode(&#call #await_kw)
+                .map_err(::photon::HandlerError::from)
+        },
+    }
 }
 
 fn expand(
@@ -181,31 +259,29 @@ fn expand(
         let arg_types: Vec<_> = m.args.iter().map(|(_, ty)| ty).collect();
         let hash = hash_ident(name);
         let ok_ty = &m.ok_ty;
-        // 声明了 `error = E` 时，线上/本地的 `RpcError` 都要还原成业务错误类型。
-        let unwrap = match &args.error {
-            Some(err_ty) => {
-                quote! { .map_err(|e: ::photon::RpcError| <#err_ty as ::photon::ServiceError>::from_error(e)) }
-            }
-            None => quote! {},
-        };
-        // 返回错误类型跟着服务级声明走：写了 `error = E`，stub 交出的就是 `E`。
-        let ret_err = match &args.error {
-            Some(err_ty) => quote! { #err_ty },
-            None => quote! { ::photon::RpcError },
-        };
+        let ret_err = stub_err_ty(m);
         let packed = if arg_types.is_empty() {
             quote! { &() }
         } else {
             quote! { &(#(#arg_names),*) }
         };
+        let encode = stub_pack(m, quote! { #packed });
         let name_str = m.name.to_string();
+        let tail = stub_tail(
+            m,
+            quote! {
+                ::photon::__private::instrument(span, self
+                    .handle
+                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms))
+                    .await
+            },
+        );
         quote! {
             /// 发一次请求；期限取客户端上的 `deadline_ms`（默认 0 = 不设期限）。
             pub async fn #name(&self, #(#params),*)
                 -> ::std::result::Result<#ok_ty, #ret_err>
             {
-                let payload =
-                    <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
+                let payload = #encode;
                 // 一次调用一个 span，`request_id` 在 `Session::call` 里回填——那才
                 // 是分配它的地方。`method_name` 是编译期常量，所以客户端这一侧也能
                 // 带上名字（服务端靠 `Service::method_name` 拿同一份名字表）。
@@ -217,12 +293,7 @@ fn expand(
                     deadline_ms = self.deadline_ms,
                     request_id = ::photon::__private::tracing::field::Empty,
                 );
-                let reply = ::photon::__private::instrument(span, self
-                    .handle
-                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms))
-                    .await
-                    #unwrap?;
-                <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
+                #tail
             }
         }
     });
@@ -242,42 +313,35 @@ fn expand(
             let arg_types: Vec<_> = m.args.iter().map(|(_, ty)| ty).collect();
             let hash = hash_ident(name);
             let ok_ty = &m.ok_ty;
-            let unwrap = match &args.error {
-                Some(err_ty) => {
-                    quote! { .map_err(|e: ::photon::RpcError| <#err_ty as ::photon::ServiceError>::from_error(e)) }
-                }
-                None => quote! {},
-            };
-            let ret_err = match &args.error {
-                Some(err_ty) => quote! { #err_ty },
-                None => quote! { ::photon::RpcError },
-            };
+            let ret_err = stub_err_ty(m);
             let packed = if arg_types.is_empty() {
                 quote! { &() }
             } else {
                 quote! { &(#(#arg_names),*) }
             };
+            let encode = stub_pack(m, quote! { #packed });
             let name_str = m.name.to_string();
+            let tail = stub_tail(
+                m,
+                quote! {
+                    self.session.call_named(
+                        Self::SERVICE_ID,
+                        #helper::#hash,
+                        ::std::option::Option::Some(#name_str),
+                        payload,
+                        self.deadline_ms,
+                    )
+                },
+            );
             quote! {
                 /// 发一次请求并阻塞等回包；期限取同步客户端上的 `deadline_ms`。
                 pub fn #name(&self, #(#params),*)
                     -> ::std::result::Result<#ok_ty, #ret_err>
                 {
-                    let payload =
-                        <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
+                    let payload = #encode;
                     // 名字只进 span（同步路径的 span 在会话线程上建，所以这里把
-                    // 编译期常量一起递过去）。语义与 `call` 完全相同。
-                    let reply = self
-                        .session
-                        .call_named(
-                            Self::SERVICE_ID,
-                            #helper::#hash,
-                            ::std::option::Option::Some(#name_str),
-                            payload,
-                            self.deadline_ms,
-                        )
-                        #unwrap?;
-                    <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
+                    // 编译期常量一起递过去）。语义与异步 stub 完全相同。
+                    #tail
                 }
             }
         });
@@ -368,45 +432,34 @@ fn expand(
             }
         };
         let call = quote! { <S as #svc>::#name(&*me, #(#arg_names),*) };
-        // 业务错误在进入 `Response` 之前就换成 `RpcError`，断言放在这里：
-        // 它是唯一知道「这个 error 来自用户 handler」的位置。
-        let wrap = match &args.error {
-            Some(err_ty) => quote! {
-                .map_err(|e| {
-                    let err = <#err_ty as ::photon::ServiceError>::into_error(e);
-                    ::photon::error::assert_business_error(&err);
-                    err
-                })
-            },
-            None => quote! {},
-        };
         let body = match m.kind {
-            MethodKind::Async => quote! {
-                #decode
-                let out = #call.await #wrap?;
-                <::photon::codec::Default as ::photon::Codec>::encode(&out)
-            },
+            MethodKind::Async => {
+                let tail = dispatch_tail(m, call, true);
+                quote! { #decode #tail }
+            }
             // 同步 `fn` 就地执行：它承诺的是「服务端同步完成」，所以包成 async 块
             // 之后首 poll 就跑完，不换线程、也不产生额外的调度点。
-            MethodKind::Sync => quote! {
-                #decode
-                let out = #call #wrap?;
-                <::photon::codec::Default as ::photon::Codec>::encode(&out)
-            },
+            MethodKind::Sync => {
+                let tail = dispatch_tail(m, call, false);
+                quote! { #decode #tail }
+            }
             // 唯一换线程的分支。decode 也搬进闭包：它同样是 CPU 工作，放在 worker 上
             // 等于把省下来的阻塞又还回去。
-            MethodKind::Blocking => quote! {
-                let me = ::std::sync::Arc::clone(&me);
-                ::tokio::task::spawn_blocking(move || {
-                    #decode
-                    let out = #call #wrap?;
-                    <::photon::codec::Default as ::photon::Codec>::encode(&out)
-                })
-                .await
-                .map_err(|join| {
-                    ::photon::RpcError::Internal(format!("blocking handler 未正常结束: {join}"))
-                })?
-            },
+            MethodKind::Blocking => {
+                let tail = dispatch_tail(m, call, false);
+                quote! {
+                    let me = ::std::sync::Arc::clone(&me);
+                    ::tokio::task::spawn_blocking(move || {
+                        #decode
+                        #tail
+                    })
+                    .await
+                    .map_err(|join| ::photon::HandlerError::Framework {
+                        code: 0,
+                        message: ::std::format!("blocking handler 未正常结束: {join}"),
+                    })?
+                }
+            }
         };
         quote! {
             #helper::#hash => { #body }
@@ -577,15 +630,18 @@ fn expand(
                 self: ::std::sync::Arc<Self>,
                 method: u64,
                 payload: ::photon::Bytes,
-            ) -> ::photon::BoxFuture<'static, ::std::result::Result<::photon::Bytes, ::photon::RpcError>>
+            ) -> ::photon::BoxFuture<'static, ::std::result::Result<::photon::Bytes, ::photon::HandlerError>>
             {
                 ::std::boxed::Box::pin(async move {
                     // 内层 `Arc<S>` 单独拎出来：dispatch 只在 L3 spawn 一次，这里不再分层。
                     let me = ::std::sync::Arc::clone(&self.inner);
                     match method {
                         #(#dispatch_arms)*
-                        // 帧格式没问题，是方法没注册：回包侧构造 `Remote{3}` 是允许的。
-                        _ => Err(::photon::RpcError::Remote(::photon::RemoteError::new(3))),
+                        // 帧格式没问题，是方法没注册：这是框架自己的判定，走框架码 3。
+                        _ => Err(::photon::HandlerError::Framework {
+                            code: 3,
+                            message: ::std::string::String::from("unknown method"),
+                        }),
                     }
                 })
             }
@@ -642,7 +698,7 @@ fn rewrite_sigs(service: &mut ItemTrait) {
     }
 }
 
-fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::Result<Vec<Method>> {
+fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
     let mut methods: Vec<Method> = Vec::new();
 
     for item in &service.items {
@@ -734,7 +790,16 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
         }
 
         let (ok_ty, err_ty) = result_types(&sig.output)?;
-        check_error_type(&err_ty, declared_error, sig)?;
+        if let Some(err_ty) = &err_ty
+            && last_ident(err_ty).as_deref() == Some("RpcError")
+        {
+            return Err(syn::Error::new_spanned(
+                err_ty,
+                "契约方法不能返回 `RpcError`：它是框架对本端的判定（超时/断连/编解码失败），\
+handler 既无从产生也无权声明。业务失败请定义自己的类型，例如 `Result<i64, CalcError>`；\
+不可失败的方法直接写 `-> T`",
+            ));
+        }
 
         let hash = method_hash(&sig.ident.to_string());
         if let Some(dup) = methods.iter().find(|m| m.hash == hash) {
@@ -753,6 +818,7 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
             kind,
             args,
             ok_ty,
+            err_ty,
             zero_copy,
         });
     }
@@ -768,29 +834,35 @@ fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::R
 }
 
 /// 从 `-> Result<T, E>` 里取 `(T, E)`。
-fn result_types(output: &ReturnType) -> syn::Result<(Type, Type)> {
+fn result_types(output: &ReturnType) -> syn::Result<(Type, Option<Type>)> {
+    // 不可失败：`-> T` 直接把 T 当成功值，不需要任何错误词汇。
+    if let ReturnType::Type(_, ty) = output
+        && !is_result(ty)
+    {
+        return Ok(((**ty).clone(), None));
+    }
     let ReturnType::Type(_, ty) = output else {
         return Err(syn::Error::new_spanned(
             output,
-            "handler 必须返回 `Result<T, RpcError>`",
+            "方法必须声明成功值：`-> T`，或者 `-> Result<T, E>`（E 由契约自己定义）",
         ));
     };
     let Type::Path(path) = &**ty else {
         return Err(syn::Error::new_spanned(
             ty,
-            "handler 必须返回 `Result<T, RpcError>`",
+            "方法必须声明成功值：`-> T`，或者 `-> Result<T, E>`（E 由契约自己定义）",
         ));
     };
     let Some(last) = path.path.segments.last() else {
         return Err(syn::Error::new_spanned(
             ty,
-            "handler 必须返回 `Result<T, RpcError>`",
+            "方法必须声明成功值：`-> T`，或者 `-> Result<T, E>`（E 由契约自己定义）",
         ));
     };
     if last.ident != "Result" {
         return Err(syn::Error::new_spanned(
             ty,
-            "handler 必须返回 `Result<T, RpcError>`",
+            "方法必须声明成功值：`-> T`，或者 `-> Result<T, E>`（E 由契约自己定义）",
         ));
     }
     let PathArguments::AngleBracketed(generics) = &last.arguments else {
@@ -808,46 +880,20 @@ fn result_types(output: &ReturnType) -> syn::Result<(Type, Type)> {
             "`Result` 必须写出第二个参数（错误类型）",
         ));
     };
-    Ok((ok_ty.clone(), err_ty.clone()))
+    Ok((ok_ty.clone(), Some(err_ty.clone())))
 }
 
-/// 方法返回的错误类型必须与服务级声明一致。
-///
-/// 没写 `error = ...` 时要求 `RpcError`：否则 handler 的 `?` 会把一个框架不认识的
-/// 类型扔给 dispatch，报错发生在展开产物里，用户看到的是「某某 trait 没实现」。
-fn check_error_type(
-    err_ty: &Type,
-    declared: Option<&Type>,
-    sig: &syn::Signature,
-) -> syn::Result<()> {
-    let normalize = |ty: &Type| {
-        let tokens = quote!(#ty).to_string();
-        tokens.replace(' ', "")
-    };
-    let last_ident = |ty: &Type| match ty {
+fn is_result(ty: &Type) -> bool {
+    last_ident(ty).as_deref() == Some("Result")
+}
+
+/// 取类型路径的最后一个标识符：用来认 `Result` / `RpcError` 这类名字，
+/// 不要求写全路径（`std::result::Result` 也能认出来）。
+fn last_ident(ty: &Type) -> Option<String> {
+    match ty {
         Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
         _ => None,
-    };
-
-    match declared {
-        Some(declared) => {
-            if normalize(err_ty) != normalize(declared) {
-                return Err(syn::Error::new_spanned(
-                    sig,
-                    "方法返回的错误类型必须与服务级 `error = ...` 一致",
-                ));
-            }
-        }
-        None => {
-            if last_ident(err_ty).as_deref() != Some("RpcError") {
-                return Err(syn::Error::new_spanned(
-                    sig,
-                    "未声明 `error = Type` 时，handler 必须返回 `Result<T, RpcError>`",
-                ));
-            }
-        }
     }
-    Ok(())
 }
 
 fn hash_ident(name: &syn::Ident) -> syn::Ident {

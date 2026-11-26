@@ -12,7 +12,9 @@ use bytes::BytesMut;
 
 use crate::{
     error::RpcError,
-    proto::{FLAG_ERR, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind},
+    proto::{
+        FLAG_BUSINESS, FLAG_ERR, FLAG_ERR_BUSINESS, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind,
+    },
 };
 
 /// 各字段在 24 字节头中的起始偏移。
@@ -136,12 +138,18 @@ pub fn validate(h: &Header, payload: &[u8]) -> Result<(), RpcError> {
             check_zero(h.method, h.kind, "method")?;
             check_zero(h.deadline_ms, h.kind, "deadline_ms")?;
             check_nonzero(h.request_id, h.kind, "request_id")?;
-            if h.flags & FLAG_ERR != 0 && payload.len() < 8 {
+            // 框架错误帧至少要能读出 `code`；业务错误帧的 payload 是用户类型
+            // 的字节，长度由契约决定（可能为 0），这里不设下限。
+            if h.flags & FLAG_ERR != 0
+                && h.flags & FLAG_BUSINESS == 0
+                && payload.len() < crate::proto::error_body::FRAMEWORK_PREFIX
+            {
                 return Err(RpcError::Protocol {
                     detail: format!(
-                        "{:?} 携带错误体，但 payload 只有 {} 字节，至少需要 8（否则读不出 code）",
+                        "{:?} 携带框架错误体，但 payload 只有 {} 字节，至少需要 {}（否则读不出 code）",
                         h.kind,
-                        payload.len()
+                        payload.len(),
+                        crate::proto::error_body::FRAMEWORK_PREFIX
                     ),
                 });
             }
@@ -195,7 +203,10 @@ pub fn validate(h: &Header, payload: &[u8]) -> Result<(), RpcError> {
 /// 独立的黑名单里各被拒一半，很容易误以为已覆盖。
 fn check_flags(h: &Header) -> Result<(), RpcError> {
     let legal = match h.kind {
-        Kind::Response => matches!(h.flags, 0 | FLAG_ERR),
+        // 业务错误必须同时带 `FLAG_ERR`：只有 bit3 没有 bit0 的帧没有意义。
+        Kind::Response => {
+            matches!(h.flags, 0 | FLAG_ERR | FLAG_ERR_BUSINESS)
+        }
         Kind::GoAway => matches!(h.flags, 0 | FLAG_GOAWAY_FORCE),
         _ => h.flags == 0,
     };

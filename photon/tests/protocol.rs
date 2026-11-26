@@ -8,12 +8,13 @@ use bytes::Bytes;
 
 use photon::error::RpcError;
 use photon::proto::{
-    FLAG_ERR, FLAG_GOAWAY_FORCE, FLAG_STREAM_LAST, HEADER_LEN, Header, Kind, MAX_MESSAGE_LEN, parse,
+    FLAG_BUSINESS, FLAG_ERR, FLAG_GOAWAY_FORCE, FLAG_STREAM_LAST, HEADER_LEN, Header, Kind,
+    MAX_MESSAGE_LEN, parse,
 };
 
-/// 12 字节握手 payload 的真实值：版本 1、flags 0、上限 64 KiB、codec 0、reserved 0。
+/// 12 字节握手 payload 的真实值：版本 2、flags 0、上限 64 KiB、codec 0、reserved 0。
 /// M0 不校验内容，用真实值是为了将来接上握手校验时不必改测试。
-const HANDSHAKE_PAYLOAD: [u8; 12] = [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+const HANDSHAKE_PAYLOAD: [u8; 12] = [2, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
 
 /// 每个 kind 的「语义合法」头，payload 由调用方另给。
 ///
@@ -329,13 +330,20 @@ fn fixed_length_payloads() {
     assert_protocol(parse(frame(&hs, &[0u8; 13])));
     assert!(parse(frame(&hs, &HANDSHAKE_PAYLOAD)).is_ok());
 
-    // Err Response 至少有 8 字节前缀
+    // 框架错误帧至少有 2 字节前缀（`code u8 | reserved u8`）
     let err_resp = Header {
         flags: FLAG_ERR,
         ..legal(Kind::Response)
     };
-    assert_protocol(parse(frame(&err_resp, &[0u8; 7])));
-    assert!(parse(frame(&err_resp, &[0u8; 8])).is_ok());
+    assert_protocol(parse(frame(&err_resp, &[0u8; 1])));
+    assert!(parse(frame(&err_resp, &[0u8, 0])).is_ok());
+
+    // 业务错误帧的 payload 归契约：0 字节也合法，框架不设下限
+    let biz_resp = Header {
+        flags: FLAG_ERR | FLAG_BUSINESS,
+        ..legal(Kind::Response)
+    };
+    assert!(parse(frame(&biz_resp, &[])).is_ok());
 
     // Cancel / GoAway 必须无 payload
     assert_protocol(parse(frame(&legal(Kind::Cancel), &[0u8; 1])));
@@ -424,7 +432,7 @@ fn golden_samples_match_protocol_section_8() {
         ],
     );
 
-    // Response Err（40 字节）：8 字节错误体前缀 + "bad args"
+    // Response Err（34 字节）：2 字节错误体前缀（code + reserved）+ "bad args"
     let response_err = Header {
         flags: FLAG_ERR,
         ..legal(Kind::Response)
@@ -433,9 +441,8 @@ fn golden_samples_match_protocol_section_8() {
         "Response Err",
         &response_err,
         &[
-            0x04, 0x00, 0x00, 0x00, // code = 4（InvalidArgs）
-            0x00, // retryable = 0
-            0x00, 0x00, 0x00, // reserved 必须 0
+            0x04, // code = 4（InvalidArgs）
+            0x00, // reserved 必须 0
             0x62, 0x61, 0x64, 0x20, 0x61, 0x72, 0x67, 0x73, // "bad args"
         ],
         &[
@@ -444,9 +451,8 @@ fn golden_samples_match_protocol_section_8() {
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // request_id = 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // method 必须 0
             0x00, 0x00, 0x00, 0x00, // deadline_ms 必须 0
-            0x04, 0x00, 0x00, 0x00, // code = 4
-            0x00, // retryable = 0
-            0x00, 0x00, 0x00, // reserved
+            0x04, // code = 4
+            0x00, // reserved
             0x62, 0x61, 0x64, 0x20, 0x61, 0x72, 0x67, 0x73, // "bad args"
         ],
     );
@@ -522,7 +528,7 @@ fn golden_samples_match_protocol_section_8() {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // request_id 必须 0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // method 必须 0
             0x00, 0x00, 0x00, 0x00, // deadline_ms 必须 0
-            0x01, 0x00, // protocol_version = 1
+            0x02, 0x00, // protocol_version = 2
             0x00, 0x00, // flags 保留，必须 0
             0x00, 0x00, 0x01, 0x00, // max_message_len = 0x0001_0000（64 KiB）
             0x00, 0x00, // codec_id = 0（postcard）

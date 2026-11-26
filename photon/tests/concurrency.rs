@@ -10,8 +10,8 @@ use std::time::Duration;
 use photon::transport::memory::Memory;
 use photon::transport::tcp::TcpTransport;
 use photon::{
-    ConnectOptions, Endpoint, MessageSink, MessageSource, RpcError, Server, ServiceRegistry,
-    Session, SessionHandle, SessionOptions, TransportOptions,
+    ConnectOptions, Endpoint, MessageSink, MessageSource, Server, ServiceRegistry, Session,
+    SessionHandle, SessionOptions, TransportOptions,
 };
 
 const ID: u16 = 7;
@@ -20,16 +20,16 @@ const SUITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[photon::service(id = 7)]
 trait Calc {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+    async fn add(&self, a: i64, b: i64) -> i64;
 }
 
 struct Calculator;
 
 impl Calc for Calculator {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
+    async fn add(&self, a: i64, b: i64) -> i64 {
         // 故意让耗时随参数抖动，制造乱序：都按参数顺序回包反而掩盖配对问题。
         tokio::time::sleep(Duration::from_millis((a as u64) % 5)).await;
-        Ok(a + b)
+        a + b
     }
 }
 

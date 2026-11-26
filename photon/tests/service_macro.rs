@@ -1,32 +1,35 @@
-//! `#[photon::service]` 的展开产物验收：dispatch、method id、注册、错误码。
+//! `#[photon::service]` 的展开产物验收：dispatch、method id、注册、错误通道。
 //!
-//! 这里不走线上会话——展开出来的东西是不是对的，与传输无关。等到 `Server`
-//! 装配落地，同一套断言会在 memory / local 上各跑一遍。
+//! 这里不走线上会话——展开出来的东西是不是对的，与传输无关。等 `Server` 装配
+//! 落地，同一套断言会在 memory / local 上各跑一遍。
 
 use std::sync::Arc;
 
-use photon::{Bytes, Codec, RemoteError, RpcError, Service, ServiceRegistry};
+use photon::{Bytes, CallError, Codec, HandlerError, RpcError, Service, ServiceRegistry};
+
+/// 契约自己的错误类型：框架不认识它，只负责把字节搬回来。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum CalcError {
+    DivideByZero,
+}
 
 #[photon::service(id = 7)]
 trait Calc {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
-    async fn div(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+    /// 不可失败：签名里连错误类型都不用出现。
+    async fn add(&self, a: i64, b: i64) -> i64;
+    async fn div(&self, a: i64, b: i64) -> Result<i64, CalcError>;
 }
 
 struct CalcImpl;
 
 impl Calc for CalcImpl {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
-        Ok(a + b)
+    async fn add(&self, a: i64, b: i64) -> i64 {
+        a + b
     }
 
-    async fn div(&self, a: i64, b: i64) -> Result<i64, RpcError> {
+    async fn div(&self, a: i64, b: i64) -> Result<i64, CalcError> {
         if b == 0 {
-            return Err(RpcError::Remote(RemoteError {
-                code: 0x10001,
-                retryable: false,
-                message: "divide by zero".into(),
-            }));
+            return Err(CalcError::DivideByZero);
         }
         Ok(a / b)
     }
@@ -61,34 +64,36 @@ async fn dispatch_add_decodes_args_and_encodes_reply() {
 }
 
 #[tokio::test]
-async fn user_error_code_survives_dispatch() {
+async fn business_error_keeps_tail_bytes() {
     let service = Arc::new(CalcService::new(Arc::new(CalcImpl)));
     let payload = photon::codec::Default::encode(&(1i64, 0i64)).expect("编码参数");
 
-    let err = Service::call(service, __photon_calc::HASH_DIV, payload)
+    let HandlerError::Business(tail) = Service::call(service, __photon_calc::HASH_DIV, payload)
         .await
-        .expect_err("除零必须报错");
-
-    let RpcError::Remote(remote) = err else {
-        panic!("handler 自己返回的 Remote 不该被改写：{err:?}");
+        .expect_err("除零必须报错")
+    else {
+        panic!("业务失败必须走 Business 通道");
     };
-    assert_eq!(remote.code, 0x10001);
+
+    // 框架一个字节都不解释：tail 就是契约里 `CalcError` 的 codec 输出。
+    let decoded: CalcError = photon::codec::Default::decode(&tail).expect("业务错误解码");
+    assert_eq!(decoded, CalcError::DivideByZero);
 }
 
 #[tokio::test]
-async fn unknown_method_is_remote_3() {
+async fn unknown_method_is_framework_3() {
     let service = Arc::new(CalcService::new(Arc::new(CalcImpl)));
 
     let err = Service::call(service, 0xdead_beef, Bytes::new())
         .await
         .expect_err("未注册的方法必须报错");
 
-    // 帧格式是对的，只是没有这个方法：必须是 Remote{3}，不是 Protocol——后者会让
+    // 帧格式是对的，只是没有这个方法：必须是框架码 3，不是 Protocol——后者会让
     // 会话以为对端乱发帧而断连。
-    let RpcError::Remote(remote) = err else {
-        panic!("未知方法必须是 Remote{{3}}，实际 {err:?}");
-    };
-    assert_eq!(remote.code, 3);
+    match err {
+        HandlerError::Framework { code, .. } => assert_eq!(code, 3),
+        other => panic!("未知方法必须是框架码 3，实际 {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -104,7 +109,12 @@ async fn bad_payload_is_invalid_input() {
     .await
     .expect_err("截断参数必须报错");
 
-    assert!(matches!(err, RpcError::InvalidInput(_)), "实际 {err:?}");
+    match err {
+        HandlerError::Framework { code, message } => {
+            assert_eq!(code, 4, "参数错必须是框架码 4，实际文案 {message}");
+        }
+        other => panic!("参数错必须是框架码，实际 {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -138,43 +148,43 @@ fn register_twice_is_rejected() {
 /// 三档声明混在同一个 trait 里：调度策略逐方法决定，互不影响。
 #[photon::service(id = 8)]
 trait Mixed {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+    async fn add(&self, a: i64, b: i64) -> i64;
     /// 同步、纯计算：就地跑完，不换线程。
-    fn double(&self, x: i64) -> Result<i64, RpcError>;
+    fn double(&self, x: i64) -> i64;
     /// 同步但会阻塞：唯一换线程的分支。
     #[photon(blocking)]
-    fn slow_double(&self, x: i64) -> Result<i64, RpcError>;
+    fn slow_double(&self, x: i64) -> i64;
     /// 在 blocking 线程里 panic：JoinError 必须变成错误体，而不是挂住请求。
     #[photon(blocking)]
-    fn boom(&self) -> Result<(), RpcError>;
+    fn boom(&self) -> ();
     /// 显式声明零拷贝：只有同步 `fn` 能这么写（async / blocking 都会在展开期被拒）。
     #[photon(zero_copy)]
-    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError>;
+    fn digest(&self, data: Vec<u8>) -> u64;
 }
 
 struct MixedImpl;
 
 impl Mixed for MixedImpl {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
-        Ok(a + b)
+    async fn add(&self, a: i64, b: i64) -> i64 {
+        a + b
     }
 
-    fn double(&self, x: i64) -> Result<i64, RpcError> {
-        Ok(x * 2)
+    fn double(&self, x: i64) -> i64 {
+        x * 2
     }
 
-    fn slow_double(&self, x: i64) -> Result<i64, RpcError> {
+    fn slow_double(&self, x: i64) -> i64 {
         // 故意睡一下：调用方能拿到结果，说明它确实落在另一个线程上跑完了。
         std::thread::sleep(std::time::Duration::from_millis(20));
-        Ok(x * 2)
+        x * 2
     }
 
-    fn boom(&self) -> Result<(), RpcError> {
+    fn boom(&self) -> () {
         panic!("blocking handler 炸了")
     }
 
-    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError> {
-        Ok(u64::try_from(data.len()).unwrap_or(0))
+    fn digest(&self, data: Vec<u8>) -> u64 {
+        u64::try_from(data.len()).unwrap_or(0)
     }
 }
 
@@ -217,7 +227,12 @@ async fn blocking_panic_becomes_error_not_hang() {
     .expect("blocking handler panic 不该让请求永久挂起")
     .expect_err("panic 必须变成错误");
 
-    assert!(matches!(outcome, RpcError::Internal(_)), "实际 {outcome:?}");
+    match outcome {
+        HandlerError::Framework { code, message } => {
+            assert_eq!(code, 0, "panic 归为框架 Internal（0），实际文案 {message}");
+        }
+        other => panic!("panic 必须走框架通道，实际 {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -264,15 +279,15 @@ fn payload_mode_reflects_method_annotation() {
 
 #[photon::service(id = 9)]
 trait Sleepy {
-    async fn nap(&self, ms: u64) -> Result<u64, RpcError>;
+    async fn nap(&self, ms: u64) -> u64;
 }
 
 struct SleepyImpl;
 
 impl Sleepy for SleepyImpl {
-    async fn nap(&self, ms: u64) -> Result<u64, RpcError> {
+    async fn nap(&self, ms: u64) -> u64 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        Ok(ms)
+        ms
     }
 }
 
@@ -323,75 +338,27 @@ async fn client_deadline_reaches_header() {
     );
 }
 
-// ---- 业务错误映射：`#[photon(service(id = N, error = E))]` ----
+// ---- 业务拒绝 vs 本端失败：`CallError` 的两臂 ----
 
-#[derive(Debug)]
-enum BizError {
-    /// 用户码段的业务错误（`code >= 0x1_0000`）。
-    Code(u32, String),
-    /// 框架本地/远端错误，原样兜住，不当业务错误解释。
-    Transport(RpcError),
-}
-
-impl photon::ServiceError for BizError {
-    fn into_error(self) -> RpcError {
-        match self {
-            BizError::Code(code, message) => RpcError::Remote(RemoteError {
-                code,
-                retryable: false,
-                message,
-            }),
-            BizError::Transport(err) => err,
-        }
-    }
-
-    fn from_error(err: RpcError) -> Self {
-        match err {
-            RpcError::Remote(remote) if remote.code >= photon::BUSINESS_CODE_MIN => {
-                BizError::Code(remote.code, remote.message)
-            }
-            other => BizError::Transport(other),
-        }
-    }
-}
-
-#[photon::service(id = 11, error = BizError)]
+#[photon::service(id = 11)]
 trait Ledger {
-    async fn withdraw(&self, amount: i64) -> Result<i64, BizError>;
+    async fn withdraw(&self, amount: i64) -> Result<i64, CalcError>;
 }
 
 struct LedgerImpl;
 
 impl Ledger for LedgerImpl {
-    async fn withdraw(&self, amount: i64) -> Result<i64, BizError> {
+    async fn withdraw(&self, amount: i64) -> Result<i64, CalcError> {
         if amount > 100 {
-            return Err(BizError::Code(0x2_0001, "insufficient funds".into()));
+            return Err(CalcError::DivideByZero);
         }
         Ok(amount)
     }
 }
 
-#[tokio::test]
-async fn business_error_is_remote_user_code() {
-    let service = Arc::new(LedgerService::new(Arc::new(LedgerImpl)));
-    let payload = photon::codec::Default::encode(&(200i64,)).expect("编码参数");
-
-    // 回包侧：业务错误必须已经是 `Remote{ code >= 0x1_0000 }`，否则 debug 会炸。
-    let err = Service::call(service, __photon_ledger::HASH_WITHDRAW, payload)
-        .await
-        .expect_err("必须失败");
-    match err {
-        RpcError::Remote(remote) => {
-            assert_eq!(remote.code, 0x2_0001);
-            assert_eq!(remote.message, "insufficient funds");
-        }
-        other => panic!("期望 Remote，实际 {other:?}"),
-    }
-}
-
 #[cfg(feature = "memory")]
 #[tokio::test]
-async fn business_error_roundtrips_through_session() {
+async fn business_rejection_and_local_failure_are_distinguishable() {
     use photon::{Session, SessionOptions, transport::memory::Memory};
 
     let (client_halves, server_halves) = Memory::pair();
@@ -416,43 +383,21 @@ async fn business_error_roundtrips_through_session() {
 
     let client = LedgerClient::new(handle.clone());
     assert!(matches!(client.withdraw(50).await, Ok(50)));
+
+    // 对端的业务拒绝：`E` 原样回来。
     match client.withdraw(200).await {
-        Err(BizError::Code(0x2_0001, message)) => assert_eq!(message, "insufficient funds"),
-        other => panic!("期望业务错误码 0x2_0001，实际 {other:?}"),
+        Err(CallError::Rejected(CalcError::DivideByZero)) => {}
+        other => panic!("期望 Rejected(DivideByZero)，实际 {other:?}"),
     }
 
-    // 本端错误也要经 `from_error` 收敛，而不是把 `RpcError` 泄给调用方。
+    // 本端失败：`RpcError` 原样回来，不与业务错误混淆。
     client.handle().close().await.expect("关闭");
     match client.withdraw(50).await {
-        Err(BizError::Transport(RpcError::Closed)) => {}
-        other => panic!("期望 Closed 被收敛成 Transport(Closed)，实际 {other:?}"),
-    }
-}
-
-/// 把业务错误写成框架保留段（`3` = UnknownMethod）必须立刻炸，而不是让客户端
-/// 把「余额不足」当成「方法不存在」。
-#[tokio::test]
-async fn business_error_below_user_segment_panics_in_debug() {
-    #[photon::service(id = 12, error = BizError)]
-    trait Broken {
-        async fn bad(&self) -> Result<(), BizError>;
+        Err(CallError::Failed(RpcError::Closed)) => {}
+        other => panic!("期望 Failed(Closed)，实际 {other:?}"),
     }
 
-    struct BrokenImpl;
-    impl Broken for BrokenImpl {
-        async fn bad(&self) -> Result<(), BizError> {
-            // 故意用框架码段。
-            Err(BizError::Code(3, "should be 0x1_0000+".into()))
-        }
-    }
-
-    let service = Arc::new(BrokenService::new(Arc::new(BrokenImpl)));
-    let payload = photon::codec::Default::encode(&()).expect("编码参数");
-    // 断言在 poll 里炸，抓 `JoinError` 即可——不用把整个 runtime 拆出来。
-    let handle = tokio::spawn(Service::call(service, __photon_broken::HASH_BAD, payload));
-    let joined = handle.await;
-    assert!(
-        joined.expect_err("必须 panic").is_panic(),
-        "code 3 必须触发 debug 断言"
-    );
+    // 可重试性由 `RpcError` 自己给，业务错误的重试性写在 `E` 里。
+    let overloaded: CallError<CalcError> = CallError::Failed(RpcError::Overloaded);
+    assert!(overloaded.retryable());
 }

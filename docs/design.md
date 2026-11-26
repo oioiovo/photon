@@ -2,10 +2,11 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落九块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 业务错误映射 `#[photon::service(id = N, error = MyError)]`；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。剩下 `Interceptor` 与 `tracing` span 仍在 M3。
+> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落九块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。剩下 `Interceptor` 与 `tracing` span 仍在 M3。
 >
-> 版本：**v0.30**（删掉 `photon/examples/` 里两个被 `examples/calc-split` 完全覆盖的示例：`calc_server.rs` 与 `calc_client.rs`。同一个 TCP 往返有两条命令、两处预期输出要同步，上一轮那个 `--addr` 的 bug 就出在这里；而它们相对 `calc-split` 没有任何独有信息。留下的三个各有不可替代的角色——`echo` 是唯一绕过 Session 的 L1/L2 证据，`local_calc` 是唯一的 API 面全量（一条命令七形态），`calc_local` 是唯一的 `local` feature 端到端。代码与线格式零改动。
-> 上一版（v0.29.1）（修文档里三处跑不起来的命令：示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项，照 `--addr 127.0.0.1:7001` 抄会得到 `AddrParseError(Socket)`。10.3 / 10.4 的命令与「`--addr` 可覆盖」的说明一并改成位置参数。代码零改动。
+> 版本：**v0.31**（错误模型与契约解耦：契约里不再出现任何框架类型——`async fn add(..) -> i64`、`async fn div(..) -> Result<i64, CalcError>`，`CalcError` 由契约自己定义、自己编码。错误帧由 `flags` bit3 分两条：框架帧仍是 `code u8 | reserved u8 | message`（`code` 只保留 `0..=7`，**删掉业务码段与 `retryable` 字段**，重试性改由规范里的静态表给出），业务帧的 payload 就是 `E` 的 codec 字节、框架一个字节都不解释。删 `ErrorCode`/`ServiceError`/`RemoteError`/`RpcError::Remote`，新增 `PeerRejected { code, message }` 与 `HandlerError`/`CallFailure`/`CallError<E>`；客户端可失败方法交出 `CallError<E>`，不可失败方法交出 `RpcError`。线格式语义变更 → `protocol_version` 1 → 2。)
+> 上一版（v0.30）（删掉 `photon/examples/` 里两个被 `examples/calc-split` 完全覆盖的示例：`calc_server.rs` 与 `calc_client.rs`。同一个 TCP 往返有两条命令、两处预期输出要同步，上一轮那个 `--addr` 的 bug 就出在这里；而它们相对 `calc-split` 没有任何独有信息。留下的三个各有不可替代的角色——`echo` 是唯一绕过 Session 的 L1/L2 证据，`local_calc` 是唯一的 API 面全量（一条命令七形态），`calc_local` 是唯一的 `local` feature 端到端。代码与线格式零改动。
+> 更早（v0.29.1）（修文档里三处跑不起来的命令：示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项，照 `--addr 127.0.0.1:7001` 抄会得到 `AddrParseError(Socket)`。10.3 / 10.4 的命令与「`--addr` 可覆盖」的说明一并改成位置参数。代码零改动。
 > 更早（v0.29）（示例补上「真实发布形态」：`examples/calc-split/` 是一个独立的嵌套 workspace，三个成员分别是契约 `calc-api`（只有 trait 与码段常量）、服务端程序 `calc-server`（impl + main）、客户端程序 `calc-client`（只依赖契约、只调 stub）。判据是依赖树与符号：`cargo tree -p calc-client | grep calc-server` 为空、`nm target/debug/calc-client | grep -c Calculator` = 0，而服务端有 37 个符号。框架代码零改动，线格式零改动。
 > 更早（v0.28.1）（示例目录按「接口 / 实现分文件」重排。`examples/calc_service/` 拆成 `api.rs`（只有 `Calc` trait 与打印/构造错误的小工具）与 `imp.rs`（`Calculator` 与业务逻辑）；**客户端 example 只引 `api.rs`**，服务端与单进程示例才引 `imp.rs`。此前四个 example 都 `#[path]` 引同一个 `mod.rs`，等于把 handler 的业务逻辑编进客户端二进制——`nm target/debug/examples/calc_client | grep Calculator` 当时是有符号的。框架代码零改动。
 > 更早（v0.28）（M3 第十步：`tracing` span 贯穿。一次调用在日志里是一个 span：客户端 `photon.call`（`method_name` 是宏的编译期常量）、服务端 `photon.request`（`method_name` 由新增的 `Service::method_name` 从名字表反查），两边 `request_id` 由 `Session::call` 回填后对齐；handler 里打的日志落在请求 span 里。`photon::__private` 只给宏产物包 span 用，`tracing-subscriber` 只进 dev-dependencies。线格式零改动。
@@ -189,7 +190,7 @@ photon/                          # workspace 根
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs               # 门面：re-export 公共 API
-│   │   ├── error.rs             # RpcError 统一错误类型（含 Remote，见 3.8）
+│   │   ├── error.rs             # RpcError（本端）+ HandlerError/CallFailure/CallError<E>（见 3.8）
 │   │   ├── blocking.rs          # 同步客户端：专属线程 + 自建 runtime（见 5.5）
 │   │   ├── transport.rs         # L1 入口：MessageSource / MessageSink / Transport
 │   │   ├── transport/
@@ -688,85 +689,83 @@ pub trait Codec {
 
 `Bytes::from_owner` 正是为解开这个死结而存在的：owner 持有 chunk 并负责归还，切片零拷贝，同时整体是 `'static + Send`。
 
-### 3.8 错误体：跨进程的错误长什么样
+### 3.8 错误通道：框架判定与业务拒绝各走一条
 
-`flags` bit0 置位表示 `Response` 为 Err，此时 payload 不是业务结果，而是一个**定长头 + 变长文本**的错误体：
+`flags` bit0 置位表示 `Response` 是 Err。**错误帧里装什么，由 bit3 决定**——这是 v0.31 最重要的改动：
 
-```
-[ code: u32 | retryable: u8 | reserved: u24 | message: 剩余字节，UTF-8 ]
-```
-
-共 8 字节前缀，`message` 直接读到 payload 末尾，不做额外长度字段——长度由 L1 保证。
-
-**code 空间划分。v0.7 把 `1..=0xFFFF` 整段留白，结果是服务端自己产生的错误（过载、未知服务、未知方法、参数解码失败）一个码都没有，只能全拍成 `0`——这篇文档里最典型的「设计时留白，实现时卡死」。现在把常用的先定死：**
-
-| code | 名称 | 谁产生 | 客户端拿到后 |
-|---|---|---|---|
-| `0` | `Internal` | 框架（handler panic、不可恢复） | `Remote { code: 0, .. }` |
-| `1` | `Overloaded` | 对端：配额满 / 队列满 / 线程池排不上 | `Remote { code: 1, .. }`，`retryable` 通常 `1` |
-| `2` | `UnknownService` | 对端：`service_id` 未注册 | `Remote { code: 2 }`，**重试无意义** |
-| `3` | `UnknownMethod` | 对端：服务存在但方法未注册 | `Remote { code: 3 }`，**重试无意义** |
-| `4` | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | `Remote { code: 4 }`，**重试无意义** |
-| `5` | `Cancelled` | 对端：收到 Cancel 并中止了 handler | `Remote { code: 5 }`，等价本地放弃 |
-| `6` | `DeadlineExceeded` | 对端：它自己的 deadline 判定到期 | `Remote { code: 6 }` |
-| `7` | `ShuttingDown` | 对端：正在优雅关闭，不再接新请求 | `Remote { code: 7 }`，看 4.6 |
-| `8 ..= 0xFFFF` | — | 现在无定义 | **原样装进 `Remote`，不要拍成 `Internal`**（拍平会丢掉未来版本的信息） |
-| `≥ 0x1_0000` | 用户 | 业务自定义 | `Remote { code, .. }`，语义由用户定义，框架不解释 |
-
-`message` 非法 UTF-8 时用 `String::from_utf8_lossy` 并保留原 `code`——错误体是排障通道，**不能因为文本坏了就把整个错误降级成 `Internal`**。
-
-错误体也是**小端**（与 24 字节头、控制帧统一，见 3.2）；`retryable` 只认 `0`/`1`，其它值按「非 0 即视为可重试」宽松处理，不要报协议错误——错误体是收尾路径，在这里断连只会让排障更难。
-
-**错误分本地 / 远端两类，但边界要重述一遍，v0.7 的说法太绝对：**
-
-- **本地错误**（本端自己产生）：`Timeout` / `Overloaded`（本端配额拒绝）/ `Closed` / `Io` / `Protocol` / `RuntimeDropped` / `InvalidInput` / `Internal`。它们**在发起侧永不上线路**；在回包侧经 `to_wire` 白名单才可能变成错误体（见下）
-- **远端错误**（只能由错误体构造）：`Remote(RemoteError { code, retryable, message })`，**唯一一个变体**，用户业务错误也是它（`code ≥ 0x1_0000`）
-
-规则不是「对端不许说任何话」，而是：**对端可以陈述它自己的状态（我过载了、我判超时了、我要关了），但本端的控制流结论必须由本端产生。** 区别在于：`Remote { code: 1 }` 只是「对方说它忙」，本端仍可决定继续排队或换路；而 `RpcError::Overloaded` 是「本端配额表满了」，请求压根没发出去。两者永不合并、也永不互相转换——合并了就分不清「谁该为放弃负责」。
-
-v0.7 之所以自相矛盾，是因为它既写了「4.3 服务端超配额返回 `Overloaded`」，又在 3.8 把 `Overloaded` 钉成「永不上线路」。现在服务端超配额直接回 `code = 1`。
-
-**「本地变体永不上线」这句话有个隐含前提，v0.10 必须写明：它约束的是「发起请求的一侧」，不是「处理请求的一侧」。** 否则没法自洽——`Remote` 是唯一远端变体，可服务端要回 `code = 1/4/6` 就得有个本地变体当输入；而 `Remote` 又「只能由错误体构造」，服务端手里没有错误体。所以规则改成**方向相关**的两句话：
-
-1. **只有处理请求的一侧**（正在为某个 `request_id` 生成 `Response` 的一侧）可以主动构造 `Remote` 表达自己的状态，也可以把本地变体编成错误体发出去。
-2. **发起请求的一侧**只能从收到的错误体得到 `Remote`，它的本地变体（`Closed` / `Io` / `Protocol` / `Timeout` / `Overloaded` / …）留在本地，不上线路、也不与 `Remote` 互相转换。
-
-落地成**唯一的出口函数**，全项目不允许别处手搓错误体：
-
-```rust
-fn to_wire(e: &RpcError) -> Option<ErrorBody>
-```
-
-白名单（返回 `None` = 「这个错误不能上线，就地降级或直接断连」）：
-
-| `RpcError` 变体 | 上线 code | 场景 |
+| flags | 含义 | payload |
 |---|---|---|
-| `Internal` | `0` | handler panic（`JoinError`）|
-| `Overloaded` | `1` | **入站配额满**（这是回包侧，所以它能上线）|
-| `InvalidInput` | `4` | handler 解码失败 / 参数不合法 |
-| `Cancelled` | `5` | handler 被 `Cancel` 中止 |
-| `Timeout` | `6` | handler 自己的 deadline 到期 |
-| `Remote { code, .. }` | 原码 | 透传；用户业务错误（`code ≥ 0x1_0000`）走这条 |
-| `Closed` / `Io` / `Protocol` / `RuntimeDropped` | `None` | 这些是「本端连路坏了」，没有可回的对象；在回包路径上出现说明框架自身异常，记 `tracing::error!` 后按 `Internal` 兜底（不要静默丢帧）|
+| `0x01`（`FLAG_ERR`） | 框架判定 | 2 字节前缀 + 文本，见下 |
+| `0x09`（`FLAG_ERR\|FLAG_BUSINESS`） | 业务拒绝 | **契约里 `E` 的 codec 字节**，可以是 0 字节；框架一个字节都不解释 |
 
-**`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**，由**回包侧**用统一构造入口 `RemoteError::new(code)` 造一个 `Remote` 再交给 `to_wire` 透传（`Remote` 走原码直通，不重映射）。**只允许三处用它**：查不到 `service_id`、查不到 `method`、`ingress == Draining`（L3 内部那两处实际走 `send_error` 直接写错误体，不必绕成 `RpcError`；构造器留给必须交出 `RpcError` 的调用点，目前是宏的 unknown-method 分支）。这条定死是为了堵两个已经写歪的地方：`04` 的未知方法分支曾自己 `RpcError::Remote(RemoteError::new(3))` 而不说明「这是回包侧允许的行为」（看起来像客户端伪造远端错误）；`03` 又曾把 `Timeout → 6`、`Overloaded → 1` 当成散装规则写，等于绕开了白名单。
+**框架错误体**（只有框架自己产生，所以布局可以定死）：
 
-> M2 验收里的 `0x10001` 业务错误也归这条：它是**示例 handler 自己**构造 `Remote { code: 0x10001 }`（用户码段），与 M3 的 `#[photon(error)]` 派生的映射无关——M2 不需要宏支持错误派生，这也是 M2 能提前验收的原因。
+```
+[ code: u8 | reserved: u8 | message: 剩余字节，UTF-8 ]
+```
 
-`RpcError` 标 `#[non_exhaustive]`。它是公开枚举，不加这个标记，每加一个变体都是 semver 破坏。
+2 字节前缀，`code ∈ 0..=7`，`8..=255` 未定义、收到即报协议错——它给的是「框架为什么失败」，多一个未定义的码只会让客户端把它当业务码猜。`message` 非法 UTF-8 用 `String::from_utf8_lossy` 保留原文，错误体是排障通道，不能因为文本坏了就把整个错误降级。
 
-**业务错误映射（v0.25 落地）**：服务级写 `#[photon::service(id = N, error = E)]`，方法返回 `Result<T, E>`，实现一个 trait 交代两侧语义：
+| code | 名称 | 谁产生 | 可重试（规范里的静态表） |
+|---|---|---|---|
+| `0` | `Internal` | 框架（handler panic、不可恢复） | 否 |
+| `1` | `Overloaded` | 对端：配额满 / 队列满 / 线程池排不上 | **是**（退避后） |
+| `2` | `UnknownService` | 对端：`service_id` 未注册 | 否 |
+| `3` | `UnknownMethod` | 对端：服务存在但方法未注册 | 否 |
+| `4` | `InvalidArgs` | 对端：payload 解码失败 / 参数不合法 | 否 |
+| `5` | `Cancelled` | 对端：收到 Cancel 并中止了 handler | 否 |
+| `6` | `DeadlineExceeded` | 对端：它自己的 deadline 判定到期 | 否（换更长的期限是调用方的策略） |
+| `7` | `ShuttingDown` | 对端：正在优雅关闭，不再接新请求 | **是**（重连后） |
+
+**重试性不上线路。** v0.25 起曾经有一个 `retryable: u8` 字段，v0.31 删掉：同一个码的重试语义是协议的一部分、不会按调用漂移，写成这张表比写成线上字节更强（线上字段会撒谎：服务端随手填 `1`，客户端就真的去重试一个必然失败的请求）。业务错误的重试性属于 `E` 自己，客户端拿到 `Rejected(E)` 就能读它。
+
+**业务拒绝帧的 payload 就是 `E` 的编码结果**，因此 `message` 这类结构完全由契约决定：有人写 `enum CalcError { DivideByZero }`（1 字节），也有人写 `struct MyErr { code: u16, text: String, retry_after_ms: u32 }`。框架只知道「这条是业务拒绝」，不知道里面是什么——这是「契约与框架解耦」在错误通道上的具体形态。
+
+长度上限仍是 L1 的 `max_message_len`（默认 64 KiB）：业务错误不能塞大对象，真要带大上下文请让 `E` 指回一个 ID。
+
+**错误分两类，边界这次只有一句：**
+
+- **框架错误**（本端或线路）：`RpcError`。它描述「这次调用为什么没成功」，**只由框架产生**——客户端拿到它就知道该重连、该退避、还是该改参数。
+- **业务拒绝**（契约层）：类型化的 `E`，由 handler 产生、由框架原样搬运。
+
+`RpcError` 的全部变体（`#[non_exhaustive]`）：
 
 ```rust
-pub trait ServiceError: Sized {
-    fn into_error(self) -> RpcError;      // 回包侧：业务错误 → 线上 Remote{ code >= 0x1_0000 }
-    fn from_error(err: RpcError) -> Self; // 发起侧：Remote / Timeout / Closed / … → 业务错误
+pub enum RpcError {
+    // 本端产生，不上线路
+    Timeout, Overloaded, Closed, Io(..), Protocol { .. }, RuntimeDropped, InvalidInput(..), Internal(..),
+    // 线路而来：对端的框架判定
+    PeerRejected { code: u8, message: String },
 }
 ```
 
-只要一个 impl，不必写两个方向相反的 `From`。**契约只有一句**：`into_error` 必须给出 `Remote { code >= 0x1_0000 }`；debug 构建里 `assert_business_error` 会断言它，release 下编译掉。`from_error` 则必须显式处理本端错误（`Timeout` / `Closed` / …）——它们不该被当成业务错误，这一点只能由用户决定怎么收敛（通常是一个 `Transport(..)` 变体）。
+`PeerRejected` 的出现就是为了不让「本端 `Overloaded`」和「对端说它过载（`code = 1`）」共用一个名字：v0.30 之前两者都叫 `Remote{1}` / `Overloaded`，日志里分不清「谁该为放弃负责」。现在名字不同、来源不同、`retryable()` 也不同（`Overloaded` 为真表示「本端配额满了，可以稍后重试」，`PeerRejected{1}` 为真表示「对端忙，退避后重试」）。
 
-`RpcError::Remote` 仍是唯一的远端变体、`code` 语义仍由用户定义：映射只是把「用户错误 → 这个变体」和「这个变体 → 用户错误」各写一次，不新增第四种错误类别。
+**三个内部类型把「谁负责什么」钉在类型上：**
+
+```rust
+// 回包侧：已经决定回哪种帧，不再有第三种可能
+pub enum HandlerError { Framework { code: u8, message: String }, Business(Bytes) }
+
+// 会话层交给宏的原始失败：业务 tail 还是字节（解码需要 E，会话层不认识用户类型）
+#[doc(hidden)] pub enum CallFailure { Failed(RpcError), Rejected(Bytes) }
+
+// stub 边界的失败面：CallError<E> 只在生成的客户端里出现
+pub enum CallError<E> { Rejected(E), Failed(RpcError) }
+```
+
+`CallError` 的两臂不可合并，正是「业务拒绝」与「框架失败」的边界：前者是 `Ok` 之外的一条正常业务路径（余额不足、除零），后者是这条调用没走通（超时、断连、对端 shutdown）。客户端的处理方式天然不同，塞进一个平坦的错误类型里只会让人写 `match` 猜。
+
+**契约方法的失败面只有两种形状：**
+
+```rust
+async fn add(&self, a: i64, b: i64) -> i64;                       // 不可失败
+async fn div(&self, a: i64, b: i64) -> Result<i64, CalcError>;   // 可失败
+```
+
+`add` 的 stub 返回 `Result<i64, RpcError>`（框架失败仍可能发生，只是没有业务失败）；`div` 的 stub 返回 `Result<i64, CallError<CalcError>>`。契约里**不出现任何框架类型**：没有 `RpcError`、没有 `ServiceError`、没有业务码段，`E` 只要求实现 `Codec`（和成功值同级）。宏在展开期拒绝 `-> Result<T, RpcError>`，因为 handler 既无从产生也无权声明「本端为什么失败」——能声明就会逼出一个假的映射层。
+
+> v0.25 的 `error = E` 属性、`ServiceError` 双向 trait、`code ≥ 0x1_0000` 业务码段，v0.31 全部删除。代价写在明面上：**跨系统整数码透传能力消失**（旧模型里网关可以只看 `code` 就分桶），换来的是契约零框架依赖 + 业务错误结构自由。需要整数码的系统可以把 `code` 放进自己的 `E` 里，那是它自己的事。
 
 ---
 
@@ -838,7 +837,7 @@ where S: MessageSource, K: MessageSink
 
 **并发**：一条通道天然支持任意多 in-flight 请求，但必须有**显式上限**（`pending` 是 `HashMap`，本身不设界）。检查发生在**插入前**：超出配额立即返回 `Err(Overloaded)`，而不是靠 `mpsc` 的 bound 间接反压——后者会让调用方卡在 `send()` 里无声排队，丢掉"过载"这个明确语义。
 
-> **同一个词在两端的含义必须分开（v0.8）**：本端配额满 → `RpcError::Overloaded`（本地错误，请求根本没发出去）；服务端配额满 → 回 `code = 1`，客户端拿到的是 `Remote { code: 1, .. }`。不要把它在客户端再映射成 `Overloaded`，否则「谁该负责放弃」这件事就糊了（见 3.8）。
+> **同一个词在两端的含义必须分开（v0.8）**：本端配额满 → `RpcError::Overloaded`（本地错误，请求根本没发出去）；服务端配额满 → 回 `code = 1`，客户端拿到的是 `PeerRejected { code: 1, .. }`。不要把它在客户端再映射成 `Overloaded`，否则「谁该负责放弃」这件事就糊了（见 3.8）。
 
 配额是**两组而不是一组**：`async_in_flight` / `blocking_in_flight`。理由见 5.3——同步方法吃的是 blocking pool 的线程，异步方法吃的是 task，共用一组额度会让慢的同步请求饿死异步请求。
 
@@ -949,7 +948,7 @@ M5 加全局开关时**用户代码不用改**——属性已经存在，只是�
 | 方向 | `Open` | `Draining` | `Closed` |
 |---|---|---|---|
 | 出站（本端 → 对端） | 接受新请求入 `mpsc` | 拒绝新请求（`RpcError::Closed`），已入队的照常写 | `sink` 已 drop |
-| 入站（对端 → 本端） | 正常 dispatch | 不再 dispatch 新 `Request`（回 `Remote { code: 7 }`），仍收 in-flight 的 `Response` | `source` 已 drop |
+| 入站（对端 → 本端） | 正常 dispatch | 不再 dispatch 新 `Request`（回框架码 7），仍收 in-flight 的 `Response` | `source` 已 drop |
 
 两个方向进入 `Draining` 的触发点**并不对称，而且入站要晚得多（v0.10 定案）**：
 
@@ -970,7 +969,7 @@ M5 加全局开关时**用户代码不用改**——属性已经存在，只是�
 
 这一句话同时解掉 v0.7 空着的三个问题：
 
-- **收到 `GoAway` 的一侧怎么处理新到的 `Request`**：继续 dispatch，直到「双方都已宣告关闭」才拒（回 `Remote { code: 7 }`）。已经在 UDS / pipe 缓冲里的请求不可能「撤回」，既不能静默丢弃（调用方会吊死在超时上），也不能提前拒绝（会把合法请求打死）
+- **收到 `GoAway` 的一侧怎么处理新到的 `Request`**：继续 dispatch，直到「双方都已宣告关闭」才拒（回框架码 7）。已经在 UDS / pipe 缓冲里的请求不可能「撤回」，既不能静默丢弃（调用方会吊死在超时上），也不能提前拒绝（会把合法请求打死）
 - **发起方的出站 pending 要不要等**：要等。清空的是「**本端发出的**、还没拿到 `Response` 的请求」，它们的响应来自对端的**出站**方向，而 `GoAway` 只让对端停止「新发起」，不禁止它回包。v0.7 写「本端 in-flight 清空」没说方向，容易实现成「等对端发来的请求处理完」，方向反了
 - **收到 `GoAway` 的一方怎么知道自己该退出了**：排空即退，**不等 EOF**。socket 上 EOF 只是加速路径，named pipe / shm 连 EOF 都没有；所以收到宣告后要起一个后台收尾任务（`spawn_finish_when_drained`）：等 `pending` 与 `handlers` 双零（`close_timeout` 兜底）→ `shutdown.cancel()`。没有这条，会话会一直挂着，直到用户自己再调 `close()`
 - **谁关哪半边**：谁 `Draining` 完谁关自己的那一半。出站 `Draining` 结束时等队列排空 → writer 退出 → drop `sink`；本端 pending 与 handler 都清零后取消 reader → reader 退出 → drop `source`
@@ -1045,24 +1044,30 @@ pub trait Service: Send + Sync + 'static {
 ### 5.2 声明形态：三档
 
 ```rust
+/// 契约自己的错误类型：只需要 `Codec`，框架不认识它的内容。
+#[derive(Serialize, Deserialize)]
+pub enum CalcError {
+    DivideByZero,
+}
+
 #[photon::service(id = 7)]
 pub trait Calc {
-    /// ① 异步 handler：会 await（查缓存、调下游 RPC）
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+    /// ① 异步 handler：会 await（查缓存、调下游 RPC）；不会失败，所以没有错误类型
+    async fn add(&self, a: i64, b: i64) -> i64;
 
-    /// ② 同步 handler：纯计算、不 await、很轻
-    fn fast_hash(&self, data: Vec<u8>) -> Result<u64, RpcError>;
+    /// ② 同步 handler：纯计算、不 await、很轻；会失败，失败类型由契约定义
+    fn fast_hash(&self, data: Vec<u8>) -> Result<u64, CalcError>;
 
     /// ③ 同步但会阻塞：读文件、同步 DB 驱动
     #[photon(blocking)]
-    fn load(&self, path: String) -> Result<Vec<u8>, RpcError>;
+    fn load(&self, path: String) -> Result<Vec<u8>, CalcError>;
 }
 ```
 
 **`id` 是宏的必填参数（v0.8 补）。** v0.7 只在 6.1 说「`service_id` 由用户显式分配」，5.2 的示例却写裸 `#[photon::service]`——宏从哪拿 id、生成的 client stub 怎么知道要填哪个 `service_id`，都没写。现在定死：
 
 - `#[photon::service(id = N)]`，`N` 是 `u16`，**必须显式写**，不自动编号（自动编号会在「不同 crate 各自注册」时撞号，且顺序一变线上 id 就变）
-- 可选 `error = MyError`：声明后方法写 `Result<T, MyError>`，`MyError` 需实现 `photon::ServiceError`；不写则方法返回 `Result<T, RpcError>`。两种写法不能混在同一 trait 里
+- 方法返回 `T` 或 `Result<T, E>`：`E` 是契约自己的类型，只需实现 `Codec`。**不许写 `Result<T, RpcError>`**（展开期报错）；同一 trait 里两种形状可以混用，每个方法各自决定
 - 宏把 `N` 同时嵌进 client stub（发请求时填 `service_id`）和 `register(registry, svc)`（注册时占号），一处写、两处用，不存在不一致
 - 同一个 `ServiceRegistry` 里撞号 → **注册时直接 `Err`**，不是覆盖（见 6 节机制 1）
 - `id = 0` 允许但建议避开，`0` 没什么特殊含义，只是最容易手滑重复的那个值
@@ -1128,7 +1133,7 @@ match method {
 
 **代价要说清**：`fn` 分支不换线程，意味着它在 poll 它的那个 worker 上**就地跑完**。微秒级无所谓，毫秒级就是 worker 被占住——这正是 5.3 下面那道 debug 告警存在的理由。
 
-**`spawn` 出去的 `JoinHandle` 必须被 await，否则 handler panic 会静默丢失（v0.7）。** L3 那个 `tokio::spawn(svc.call(...))` 如果直接把句柄丢掉，handler 一 panic，客户端只会等到超时——日志里什么都没有，排障时完全看不出是 panic。正确做法是 reader/dispatch 侧 `match handle.await`：`Ok(Ok(resp))` 正常回包，`Ok(Err(e))` 回错误体，`Err(join_err)`（panic 或取消）**编码成 `code = 0`（`Internal`）回包**（客户端拿到的是 `Remote { code: 0, .. }`，见 3.8），本端同时记 `tracing::error!`。`spawn_blocking` 分支同理，`JoinError` 一样要处理。
+**`spawn` 出去的 `JoinHandle` 必须被 await，否则 handler panic 会静默丢失（v0.7）。** L3 那个 `tokio::spawn(svc.call(...))` 如果直接把句柄丢掉，handler 一 panic，客户端只会等到超时——日志里什么都没有，排障时完全看不出是 panic。正确做法是 reader/dispatch 侧 `match handle.await`：`Ok(Ok(resp))` 正常回包，`Ok(Err(e))` 回错误体，`Err(join_err)`（panic 或取消）**编码成 `code = 0`（`Internal`）回包**（客户端拿到的是 `PeerRejected { code: 0, .. }`，见 3.8），本端同时记 `tracing::error!`。`spawn_blocking` 分支同理，`JoinError` 一样要处理。
 
 > 这条的代价是每个请求多一次 `await` 点——本来就在 task 里，等于零成本。省掉它换来的却是「panic 无声」。不值。
 
@@ -1301,7 +1306,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 
 | 字段 | 宽度 | 含义 |
 |---|---|---|
-| `protocol_version` | u16 | 当前定为 1；对端不同直接断开 |
+| `protocol_version` | u16 | 当前定为 2；对端不同直接断开 |
 | `flags` | u16 | 保留，必须 0 |
 | `max_message_len` | u32 | **本端愿意接收**的单帧上限（含 24B 头），取自 `SessionOptions::max_message_len`（v0.10 迁入），见下方规则 3 |
 | `codec_id` | u16 | 由 `Codec::ID` 提供（见 3.6）。0 = postcard，1 = rkyv（M5）。**不是位图**：codec 是构建期选择，泛型方法不是 dyn-safe，不存在「运行期挑一个」 |
@@ -1416,7 +1421,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 33. **协商出来的参数如果没有通路，就等于没协商。** `max_message_len` 是在 `FramedSource` 里执行的，而按铁律② L1 不认识握手——于是「握手成功后放宽上限」这句话没有任何代码能实现。解法是给 L1 一个 `Arc<AtomicU32>` 的不透明旋钮（见 2.3）：L1 只比较数字，不知道这个数字从哪来。
 34. **别拿传输层数字当端到端目标。** 共享内存能到 300 ns 的是「裸 ping-pong」；端到端 RPC 每请求要过 `Box::pin` + `spawn` + oneshot + 两次 mpsc，固定成本就是 100–200 ns。把两个数混成一个验收标准，等于给自己定一个结构上不可能达到的 KPI（见 9 节 M5 与 B.2）。
 35. **SPSC 环的顺序推进会让慢 handler 堵住整条环。** `tail` 只能顺序前进，请求 1 慢、请求 2 快，2 的槽位也不能先归还。「环形队列天然支持并发在飞」只在 payload 不被借用时成立；借用了就必须上块池 + 自由链表（见 B.4）。
-36. **`GoAway` 是「连接级开始收尾」，但两个方向的 `Draining` 触发点并不对称。** 只写「发起方关闭两端」等于偷偷假设了严格 client/server 角色，与 4.4 的双向对等直接冲突；反过来写成「一收到 `GoAway` 就把 ingress 也置 Draining」又会在对端 `GoAway` 之前发出的请求上误回 `Remote{7}`。正确形态：两个方向各有一份 `Open → Draining → Closed` 状态，`egress` 在 `close()` 或收到 `GoAway` 时立即 Draining，`ingress` 只在「双方都宣告过关闭」或超时兜底时才 Draining（见 4.6）。
+36. **`GoAway` 是「连接级开始收尾」，但两个方向的 `Draining` 触发点并不对称。** 只写「发起方关闭两端」等于偷偷假设了严格 client/server 角色，与 4.4 的双向对等直接冲突；反过来写成「一收到 `GoAway` 就把 ingress 也置 Draining」又会在对端 `GoAway` 之前发出的请求上误回框架码 7。正确形态：两个方向各有一份 `Open → Draining → Closed` 状态，`egress` 在 `close()` 或收到 `GoAway` 时立即 Draining，`ingress` 只在「双方都宣告过关闭」或超时兜底时才 Draining（见 4.6）。
 - **「关闭时把字段置空」在 `Arc` 里做不到（v0.10）。** v0.9 的关闭第 3 步写「drop `Session` 的 `tx`」，但 `Session` 被 `Arc` 共享、`close(&self)` 只有 `&self`：`Sender` 是普通字段，既不能单独 drop，`Option::take` 又要 `&mut`；套 `Mutex<Option<Sender>>` 则每帧一次锁。同类问题还有 `reader`/`writer` 的 `JoinHandle`（要从 `&self` 里取出 await）。正确形态：`tx` 保持普通 `Sender`、通道收口交给 writer 自己（取消后排空 `try_recv` 再退），句柄放 `Mutex<Option<JoinHandle>>` 以便 `take()`（见 4.6 第 3/5 步）。**凡是「关闭时把某个字段置空」的写法，先问一句这个类型是不是在 `Arc` 里。**
 - **`Session` 的 codec 泛型参数是假的（v0.10）。** `Service::call` 签名里没有 `C`，宏在 `codec::Default` 上做 en/decode，`C` 只贡献握手的一个 `C::ID`——写 `Session<S, K, OtherCodec>` 会宣告 A 的 id、线上却是 B 的字节，静默错线格式。已删该参数，全项目只用 `Default::ID`（见 4.1、3.6）。
 
@@ -1459,7 +1464,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 - [x] method 哈希（**只哈希方法名**）碰撞与重复检测 + **方法名表** + golden 哨兵测试——v0.17 落地（`xxh3("add") = 0xffb352e13fd28e80`）
 - [x] **`Service::call` 用 `self: Arc<Self>` 接收者**（为 `spawn_blocking` 预留，见 5.1；用 `&self` 后面要返工）
 - [x] `ServiceRegistry` 按 `service_id` 路由（表先静态构建，结构留动态；撞号注册报错）
-- [x] **错误体提前落地**（3.8 的 `code` 表 + `RpcError::Remote`）——M1 已随 `proto/error_body.rs` 完成：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
+- [x] **错误体提前落地**（3.8 的 `code` 表）——M1 已随 `proto/error_body.rs` 完成（v0.31 起框架帧前缀缩到 2 字节、`code` 只保留 `0..=7`）：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
 - [x] 示例组 `local_calc` / `calc_server` / `calc_client`，覆盖 10.3 的**第 1、2、5 三种形态**——v0.18 落地，输出与 10.5 的 M2 四条逐字一致。**v0.30 起 `calc_server` / `calc_client` 已删**（TCP 往返与 `examples/calc-split` 完全重复，两条命令、两处预期输出反而成了同步负担），这一项的历史验收由 v0.18 的提交与 `calc-split` 共同承担
 - [x] `tests/concurrency.rs`：同一套测试在 `tcp` 与 `memory` 上全绿——v0.18 落地（32 并发 + 100 乱序 × 2 条传输）
 - [x] 本阶段**只支持 `async fn` 声明**；`fn` 与 `#[photon(blocking)]` 放到 M3（见 5.2）——v0.17 由宏在展开期强制
@@ -1472,7 +1477,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 - [x] `Handshake` **完整协商**（`max_message_len` 双向落位：reader = 本端声明、writer = 对端声明；`codec_id` 校验在 M2 之后不再变；`payload_mode` 不进握手，见 4.5）——机制 v0.16 已落，v0.22 补齐两个方向各自的证据与三种建连期拒绝
 - [x] `GoAway` 优雅关闭 + 急停（`flags` bit2）+ 按 4.6 的状态表实现两个方向——v0.21 落地（`Session::abort()`、`ingress_draining` 只在双方宣告后置位、收到宣告后排空即收尾）
 - [x] `PayloadMode` 策略落地（默认 Copy；`ZeroCopy` 只对 `fn` + `#[photon(zero_copy)]` 开放，见 4.5）——v0.26 落地（`Service::payload_mode` + 展开期护栏；全局开关随 shm）
-- [x] 业务错误映射（`#[photon(error = MyError)]` → `code ≥ 0x1_0000` 的 `Remote`）——v0.25 落地（`ServiceError` 双向 trait + debug 断言码段）；错误体本身的 `code 0..7` 已在 M2 落地
+- [x] 错误通道解耦——v0.31 落地（契约零框架类型：`-> T` / `-> Result<T, E>`；错误帧按 `flags` bit3 分框架/业务两条，业务帧 payload 就是 `E` 的编码；`CallError<E>` 在 stub 边界分开 `Rejected` 与 `Failed`；框架码 `0..=7` + 静态重试表）
 - [ ] `Interceptor` 链（或接 `tower`，走 `interceptor` feature）
 - [x] `tracing` span 贯穿（span 带 `method_name`，见 3.5）——v0.28 落地（客户端 `photon.call` + 服务端 `photon.request`，`method_name` 走 `Service::method_name`，`request_id` 由 `Session::call` 回填；`tests/tracing_spans.rs` 2 条 + 4 条变异）
 - [x] `examples/calc_local.rs`：两进程本地 IPC，验证「换 transport 不改业务代码」——v0.23 落地（同一二进制 `server` / `client` 两角色，默认 `/tmp/photon-calc.sock`）
@@ -1540,7 +1545,7 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 示例不该只是 `add(2, 2)`。它应当同时是一组冒烟测试，按阶段分两批覆盖：**M2 只做 1、2、5 三种**（此时还没有 Notification / 超时 / GoAway / 同步 handler），M3 才补齐全部七种：
 
 1. 一个成功的一元调用（M2）
-2. 一个返回业务错误的一元调用（M2，错误体走 3.8：`Remote { code ≥ 0x1_0000 }`）
+2. 一个返回业务错误的一元调用（M2 时是 `Remote { code ≥ 0x1_0000 }`；v0.31 起是业务帧，payload 为 `E` 的编码，见 3.8）
 3. 一次 `Notification`（M3）
 4. 一次超时调用（M3，靠头里的 `deadline_ms`，确认拿到 `Timeout` 而不是挂死）
 5. 一次并发调用（M2，同时发 32 个，确认响应不串包）
@@ -1596,7 +1601,7 @@ M2（最小集）：
 ```
 [server] listening on memory (in-process pair, no endpoint)
 [client] add(2, 3) = 5
-[client] div(1, 0) -> Err(Remote(code=0x10001, "divide by zero"))
+[client] div(1, 0) -> Err(Rejected(DivideByZero))
 [client] 32 concurrent calls -> all matched, mismatched = 0
 ```
 
@@ -1613,7 +1618,9 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 `fast_hash` 那一行打的是 FNV-1a 的完整 16 位（`{:#018x}`），省略号在文档里可以留白、在输出里不行——验收要能逐字比对。
 
-两个两进程示例同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`（`calc-split`）或 `local:///tmp/photon-calc.sock`（`calc_local`）；客户端只有三行——`connected to …` / `[client] add(2, 3) = 5` / `[client] div(1, 0) -> Err(Remote(code=0x10001, "divide by zero"))`。它们不跑 `local_calc` 那份七形态全量：跨进程验的是「协议与 transport 通了」，不是把 API 面再走一遍。
+> `div(1, 0)` 那行的文案在 v0.31 变了一次：`Err(Remote(code=0x10001, "divide by zero"))` → `Err(Rejected(DivideByZero))`。**这不是美化，是业务错误不再有号码**——框架不再替业务错误分配码段，`Rejected` 里的东西就是契约自己的 `CalcError`。
+
+两个两进程示例同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`（`calc-split`）或 `local:///tmp/photon-calc.sock`（`calc_local`）；客户端只有三行——`connected to …` / `[client] add(2, 3) = 5` / `[client] div(1, 0) -> Err(Rejected(DivideByZero))`。它们不跑 `local_calc` 那份七形态全量：跨进程验的是「协议与 transport 通了」，不是把 API 面再走一遍。
 
 > **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair()` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
 
@@ -1638,7 +1645,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 ```
 calc-split/
-├── api/      # calc-api（lib）  ：trait + 码段常量 + describe()，两端都依赖它
+├── api/      # calc-api（lib）  ：trait + CalcError + describe()，两端都依赖它
 ├── server/   # calc-server（bin）：impl + main，唯一知道业务逻辑的地方
 └── client/   # calc-client（bin）：只依赖契约，只调 stub
 ```
@@ -1650,7 +1657,8 @@ calc-split/
 
 1. **契约里不出现 `impl <Trait> for ...`**：出现即意味着业务逻辑进了客户端依赖树。
 2. **契约承载 ABI**：trait 形状、DTO 字段顺序（postcard 按位置编码，改顺序等于改线格式）、
-   业务错误码段、`service_id`。它是唯一事实来源，也是版本对齐/兼容治理的落点。
+   **业务错误类型 `E` 的变体顺序**（同理，业务帧就是它的编码）、`service_id`。它是唯一事实来源，
+   也是版本对齐/兼容治理的落点。
 3. **判据不是「看着分开了」**：`cargo tree -p calc-client | grep calc-server` 为空、
    `nm target/debug/calc-client | grep -c Calculator` 为 0。单进程示例（`local_calc`）天然两端都在，
    属于例外，但要在文件头写明理由。

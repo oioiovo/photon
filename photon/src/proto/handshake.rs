@@ -18,7 +18,7 @@ use crate::{
 pub const HANDSHAKE_LEN: usize = 12;
 
 /// 当前协议版本。不等即断连，没有「协商到共同版本」这种柔性逻辑。
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// 默认 codec：postcard。
 pub const CODEC_POSTCARD: u16 = 0;
@@ -278,7 +278,7 @@ mod tests {
         let local = Handshake::default();
 
         let mut other_version = local;
-        other_version.protocol_version = 2;
+        other_version.protocol_version = 3;
         assert!(local.check_against(&other_version).is_err());
 
         let mut other_codec = local;
@@ -324,7 +324,7 @@ mod tests {
         let expected: [u8; 36] = [
             0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 头
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // payload
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // payload
         ];
         assert_eq!(&Handshake::default().encode_frame()[..], &expected);
     }

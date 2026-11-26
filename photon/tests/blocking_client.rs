@@ -16,19 +16,19 @@ use std::time::{Duration, Instant};
 use photon::blocking::BlockingSession;
 use photon::session::{ServiceRegistry, Session, SessionOptions};
 use photon::transport::memory::{Memory, MemorySink, MemorySource};
-use photon::{BUSINESS_CODE_MIN, RemoteError, RpcError, ServiceError};
+use photon::{CallError, RpcError};
 
 /// 外层期限给足余量：用例失败时要变红，不能挂住。
 const SHORT: Duration = Duration::from_millis(30);
 
 #[photon::service(id = 21, blocking)]
 trait SyncCalc {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
-    async fn sleep_ms(&self, ms: u64) -> Result<u64, RpcError>;
+    async fn add(&self, a: i64, b: i64) -> i64;
+    async fn sleep_ms(&self, ms: u64) -> u64;
     /// 永不返回：只可能因为对端取消而结束，用来观察取消是否真的到了服务端。
-    async fn hang(&self) -> Result<i64, RpcError>;
+    async fn hang(&self) -> i64;
     /// 通知目标：没有回包，只数次数。
-    async fn note(&self) -> Result<u64, RpcError>;
+    async fn note(&self) -> u64;
 }
 
 struct SyncCalcImpl {
@@ -37,16 +37,16 @@ struct SyncCalcImpl {
 }
 
 impl SyncCalc for SyncCalcImpl {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
-        Ok(a + b)
+    async fn add(&self, a: i64, b: i64) -> i64 {
+        a + b
     }
 
-    async fn sleep_ms(&self, ms: u64) -> Result<u64, RpcError> {
+    async fn sleep_ms(&self, ms: u64) -> u64 {
         tokio::time::sleep(Duration::from_millis(ms)).await;
-        Ok(ms)
+        ms
     }
 
-    async fn hang(&self) -> Result<i64, RpcError> {
+    async fn hang(&self) -> i64 {
         /// future 被 drop（任务被取消）时置位。
         struct Mark(Arc<AtomicBool>);
         impl Drop for Mark {
@@ -60,42 +60,18 @@ impl SyncCalc for SyncCalcImpl {
         unreachable!("pending 不会完成")
     }
 
-    async fn note(&self) -> Result<u64, RpcError> {
-        Ok(self.notes.fetch_add(1, Ordering::SeqCst) as u64 + 1)
+    async fn note(&self) -> u64 {
+        self.notes.fetch_add(1, Ordering::SeqCst) as u64 + 1
     }
 }
 
-/// 业务错误：验证同步 stub 的三处 `from_error`（encode / call / decode）真的接上了。
-#[derive(Debug, PartialEq, Eq)]
+/// 业务错误：同步 stub 的 `Rejected` 一臂必须把它原样交回调用方。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SyncBiz {
-    Code(u32, String),
-    Transport(String),
+    InsufficientFunds,
 }
 
-impl ServiceError for SyncBiz {
-    fn into_error(self) -> RpcError {
-        match self {
-            Self::Code(code, message) => RpcError::Remote(RemoteError {
-                code,
-                retryable: false,
-                message,
-            }),
-            // 本端错误兜底：业务码段之外的错误没法上线路，收敛成 Internal。
-            Self::Transport(message) => RpcError::Internal(message),
-        }
-    }
-
-    fn from_error(err: RpcError) -> Self {
-        match err {
-            RpcError::Remote(remote) if remote.code >= BUSINESS_CODE_MIN => {
-                Self::Code(remote.code, remote.message)
-            }
-            other => Self::Transport(other.to_string()),
-        }
-    }
-}
-
-#[photon::service(id = 22, blocking, error = SyncBiz)]
+#[photon::service(id = 22, blocking)]
 trait SyncLedger {
     async fn withdraw(&self, amount: i64) -> Result<i64, SyncBiz>;
 }
@@ -105,7 +81,7 @@ struct SyncLedgerImpl;
 impl SyncLedger for SyncLedgerImpl {
     async fn withdraw(&self, amount: i64) -> Result<i64, SyncBiz> {
         if amount > 100 {
-            return Err(SyncBiz::Code(0x2_0001, "insufficient funds".into()));
+            return Err(SyncBiz::InsufficientFunds);
         }
         Ok(amount)
     }
@@ -250,10 +226,10 @@ fn deadline_alone_bounds_the_call() {
     let err = client.sleep_ms(200).expect_err("必须超时");
     // 具体变体取决于「服务端 deadline 与发起侧计时器谁先到点」，两者都在 30 ms 量级，
     // 这是会话层固有的竞争，不在这里钉死：
-    // - `Remote{6}` 说明 header 里的期限被对端读到并执行了；
+    // - `PeerRejected{6}` 说明 header 里的期限被对端读到并执行了；
     // - `Timeout` 说明发起侧先响，同样来自 header 里那个数字（本用例没设外层期限）。
-    let expired = matches!(err, RpcError::Timeout)
-        || matches!(&err, RpcError::Remote(remote) if remote.code == 6);
+    let expired =
+        matches!(err, RpcError::Timeout) || matches!(&err, RpcError::PeerRejected { code: 6, .. });
     assert!(expired, "期望 Timeout 或 Remote{{6}}，实际 {err:?}");
     assert!(
         start.elapsed() < Duration::from_millis(150),
@@ -299,7 +275,10 @@ fn business_error_survives_sync_stub() {
 
     assert_eq!(client.withdraw(50).expect("正常取款"), 50);
     let err = client.withdraw(200).expect_err("超额");
-    assert_eq!(err, SyncBiz::Code(0x2_0001, "insufficient funds".into()));
+    assert!(
+        matches!(err, CallError::Rejected(SyncBiz::InsufficientFunds)),
+        "期望 Rejected(InsufficientFunds)，实际 {err:?}"
+    );
     drop(server);
 }
 

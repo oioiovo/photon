@@ -7,41 +7,37 @@
 
 use std::time::Duration;
 
-use photon::RpcError;
-
-use crate::calc::{Calc, business_error};
+use crate::calc::{Calc, CalcError};
 
 pub struct Calculator;
 
 impl Calc for Calculator {
-    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
-        Ok(a + b)
+    async fn add(&self, a: i64, b: i64) -> i64 {
+        a + b
     }
 
-    async fn div(&self, a: i64, b: i64) -> Result<i64, RpcError> {
+    async fn div(&self, a: i64, b: i64) -> Result<i64, CalcError> {
         if b == 0 {
-            // 用户码段（≥ 0x1_0000）：框架原样透传，不解释、不改写。
-            return Err(business_error(0x10001, "divide by zero"));
+            // 业务错误原样走线路：框架只加一个「这是业务拒绝」的标志位。
+            return Err(CalcError::DivideByZero);
         }
         Ok(a / b)
     }
 
-    async fn ping(&self) -> Result<(), RpcError> {
-        Ok(())
-    }
+    async fn ping(&self) {}
 
-    async fn slow_op(&self, ms: u64) -> Result<u64, RpcError> {
+    async fn slow_op(&self, ms: u64) -> u64 {
         tokio::time::sleep(Duration::from_millis(ms)).await;
-        Ok(ms)
+        ms
     }
 
-    fn fast_hash(&self, data: Vec<u8>) -> Result<u64, RpcError> {
+    fn fast_hash(&self, data: Vec<u8>) -> u64 {
         // FNV-1a：够简单，值也稳定，示例输出才能逐字比对。
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for byte in data {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
-        Ok(hash)
+        hash
     }
 }

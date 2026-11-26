@@ -12,7 +12,7 @@ mod calc_imp;
 
 use std::sync::Arc;
 
-use calc::{CalcBlockingClient, CalcClient, describe, register_calc};
+use calc::{CalcBlockingClient, CalcClient, describe, describe_call, register_calc};
 use calc_imp::Calculator;
 use photon::{ServiceRegistry, Session, SessionOptions, transport::memory::Memory};
 
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client.div(1, 0).await {
         Ok(value) => println!("[client] div(1, 0) = {value}"),
-        Err(err) => println!("[client] div(1, 0) -> {}", describe(&err)),
+        Err(err) => println!("[client] div(1, 0) -> {}", describe_call(&err)),
     }
 
     // 32 个并发：每个请求的参数不同，只要有一份应答串了包就会落在 mismatched 上。

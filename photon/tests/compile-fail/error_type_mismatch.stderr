@@ -1,5 +1,0 @@
-error: 方法返回的错误类型必须与服务级 `error = ...` 一致
- --> tests/compile-fail/error_type_mismatch.rs:9:5
-  |
-9 |     async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

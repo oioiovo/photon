@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use calc::{CalcClient, describe, register_calc};
+use calc::{CalcClient, describe_call, register_calc};
 use calc_imp::Calculator;
 use photon::{
     ConnectOptions, Endpoint, Server, SessionOptions, connect,
@@ -75,7 +75,7 @@ async fn run_client(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
     match client.div(1, 0).await {
         Ok(value) => println!("[client] div(1, 0) = {value}"),
-        Err(err) => println!("[client] div(1, 0) -> {}", describe(&err)),
+        Err(err) => println!("[client] div(1, 0) -> {}", describe_call(&err)),
     }
 
     client.handle().close().await?;

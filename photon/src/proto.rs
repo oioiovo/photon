@@ -30,7 +30,17 @@ pub const FLAG_STREAM_LAST: u8 = 0x02;
 /// `GoAway` 急停，仅 `GoAway` 允许。
 pub const FLAG_GOAWAY_FORCE: u8 = 0x04;
 
-// bit3–7 保留，故意不给常量：给没有合法用途的位起名字，会让人以为它能被写入。
+/// payload 是**业务错误**（契约里 `E` 的字节），仅 `Response` 且 `FLAG_ERR` 同时置位时允许。
+///
+/// 这一位是 v2 的核心：它让业务错误不必借一个整数码来证明「我是业务错误」，
+/// 框架也因此不必解释 payload 的内容（见 `docs/PROTOCOL.md` 3.8）。
+pub const FLAG_BUSINESS: u8 = 0x08;
+
+/// 业务错误帧的 flags 组合（`FLAG_ERR | FLAG_BUSINESS`）。单列一个常量是因为
+/// `matches!` 的模式位置只接受常量路径，`FLAG_ERR | FLAG_BUSINESS` 在那里不是模式。
+pub const FLAG_ERR_BUSINESS: u8 = FLAG_ERR | FLAG_BUSINESS;
+
+// bit4–7 保留，故意不给常量：给没有合法用途的位起名字，会让人以为它能被写入。
 
 /// 消息类型，取值即线上的 `kind` 字节。
 ///

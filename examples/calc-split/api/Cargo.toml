@@ -7,3 +7,5 @@ edition = "2024"
 # 契约 crate 只依赖框架本身：trait 要写 `#[photon::service]`，DTO 要过 codec。
 # 不开 `local`：这份契约与传输无关，具体 transport 由两端的程序决定。
 photon = { path = "../../../photon" }
+# 业务错误类型要过 codec，derive 来自这里；契约自己不定义序列化格式的细节。
+serde = { version = "1", features = ["derive"] }

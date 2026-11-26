@@ -49,7 +49,7 @@ where S: MessageSource, K: MessageSink
 | `inbound` | 与 `outbound` **分开** | 双向会话里「我方过载」与「对方过载」共用一个数字，语义糊掉（v0.10） |
 | `cancels` | reader 在 spawn **之前**登记 | 紧跟 `Request` 到达的 `Cancel` 扑空，取消静默丢失 |
 | `shutdown` | 必须同时被 reader 与 writer 的 `select!` 监听 | 只取消 reader 时，卡在 `sink.send().await` 的 writer 关不掉 |
-| `tx` | 普通 `Sender`，**不是 `Option`** | 置 `None` 会让在途 `Response` 与 `Remote{7}` 都发不出去 |
+| `tx` | 普通 `Sender`，**不是 `Option`** | 置 `None` 会让在途 `Response` 与框架码 `7` 都发不出去 |
 | `phase` + `egress_open` + `peer_goaway` + `closing` | 用一个 `AtomicU8` 表达「整条会话走到哪一步」，三个 bool 各管一件正交的事 | 用单一枚举表达全部状态，必然出现「已 Draining 但仍需回包」无法表达 |
 | `limits` | **在 move 半身进 task 之前**取好 | move 之后 `&self` 再也拿不到 `Arc` |
 | `reader` / `writer` | `Mutex<Option<JoinHandle>>` | 普通字段无法从 `&self` 里 `take()` 出来 await |
@@ -82,7 +82,7 @@ impl<S, K> Session<S, K> where S: MessageSource, K: MessageSink {
 
 1. spawn writer task（`sink` 与 `send_limit` 的 `Arc` 一起 move 进去）；
 2. spawn reader task（`source` 同理）；
-3. **双方各自主动发一条 `Handshake`**（12 字节，首帧，`protocol_version = 1`、`codec::Default::ID`、`opts.max_message_len`）；
+3. **双方各自主动发一条 `Handshake`**（12 字节，首帧，`protocol_version = 2`、`codec::Default::ID`、`opts.max_message_len`）；
 4. 状态 `Connected → Negotiating`，等对端 `Handshake`；
 5. 收到并通过 §9 校验 → `Ready`。此刻把两个上限写进旋钮（L3 存着的 `Arc`）：`limits.0.store(opts.max_message_len)`（本端接收上限）、`limits.1.store(peer.max_message_len)`（对端接收上限，也就是本端发送上限）。握手前两者恒为 64 KiB。
 
@@ -147,7 +147,7 @@ struct InboundGuard { /* 持 Arc<Mutex<InboundQuota>> + Slot */ }
 | `try_acquire(Slot::Async, max_async)` | 未超 `max_async_in_flight` → `async_used += 1`，返回 guard | `InboundGuard::drop` → `-= 1` |
 | `try_acquire(Slot::Blocking, max_blocking)` | 未超 `max_blocking_in_flight` → `blocking_used += 1` | 同上 |
 
-抢不到 → **当场回 `code = 1`**（`Overloaded` 经 `to_wire`，见 6.2），不 spawn、不登记 cancel token。这一步放在「查 registry 之后、spawn 之前」：先查服务是因为 `UnknownService(2)` 比 `Overloaded(1)` 更准确（服务不存在时谈配额没有意义）。
+抢不到 → **当场回框架码 `1`**（`send_error`，见 6.2），不 spawn、不登记 cancel token。这一步放在「查 registry 之后、spawn 之前」：先查服务是因为 `UnknownService(2)` 比 `Overloaded(1)` 更准确（服务不存在时谈配额没有意义）。
 
 `handlers: AtomicUsize` 是给关闭流程用的**契约计数**（7.3 第 2 步）：guard 建立时 +1、drop 时 -1，与 `InboundQuota` 分开是因为关闭要等的是「有没有活没回包」，而不是「配额数字」，后者在正常流量下总是非零。
 
@@ -185,10 +185,10 @@ loop {
 2. 解析头（固定偏移，零分配）→ 按 kind：
    - `Response`：`outbound.lock().pending.remove(id)` → `oneshot.send(...)`；未知 id **静默忽略**并记 `debug`（对端超时后回包是正常竞态）。
    - `Cancel`：`cancels.lock().get(id)` → `token.cancel()`；未知 id 静默忽略。
-   - `GoAway`：`state.egress = Draining`（本端不再发新请求）＋ **`state.peer_goaway = true`**；若 `state.self_goaway` 也已为真（双方都宣告过），则 `state.ingress = Draining`（此后到达的 `Request` 回 `Remote{7}`）。bit2 急停则直接走急停分支（见 6.4）。**注意 `GoAway` 本身不改 `ingress`**，除非满足「双方都已宣告」。
+   - `GoAway`：`state.egress = Draining`（本端不再发新请求）＋ **`state.peer_goaway = true`**；若 `state.self_goaway` 也已为真（双方都宣告过），则 `state.ingress = Draining`（此后到达的 `Request` 回 框架码 `7`）。bit2 急停则直接走急停分支（见 6.4）。**注意 `GoAway` 本身不改 `ingress`**，除非满足「双方都已宣告」。
    - `Request` / `Notification`：先看 `state.ingress`：
-     - `Draining` → **不 dispatch**，直接回 `Remote { code: 7 }`（`Request` 才回，`Notification` 静默丢弃）；
-     - `Open` → 查 `registry[service_id]`：查不到 → 回 `Remote { code: 2 }`（回包侧构造：`send_error(req_id, 2, false, "unknown service")`，见 `02` 7.3）；查得到再走 6.2。
+     - `Draining` → **不 dispatch**，直接回框架码 `7`（`Request` 才回，`Notification` 静默丢弃）；
+     - `Open` → 查 `registry[service_id]`：查不到 → 回框架码 `2`（回包侧陈述：`send_error(req_id, 2, false, "unknown service")`，见 `02` 7.3）；查得到再走 6.2。
 3. `Request` 的准入顺序（一步都不能挪）：
    - **先**入站配额 `inbound.try_acquire(svc.schedule(method))`（`Slot::Async` / `Slot::Blocking` 两张表分别计，v0.19）；抢不到 → 合成 `code = 1` 回包，结束（不 spawn、不登记 token）；
    - **再** `cancels.lock().insert(id, token)`；
@@ -252,28 +252,29 @@ loop {
 | ① | `next_id.fetch_add(1)` → `id`（非 0） | — |
 | ② | `outbound.try_reserve(id, entry, max_async_in_flight)` | 满 → `Err(Overloaded)`（本地错误，请求没发出去） |
 | ③ | `tx.send(bytes).await` | 队列满则等待（这是背压，不是错误）；`tx` 已关 → `Closed` |
-| ④ | 服务端 reader：头解析 → `registry[service_id]` → `inbound.try_acquire(shape)` → 登记 cancel → spawn | 服务缺失 `Remote{2}`；配额满 `Remote{1}`；方法缺失（handler 内 match 落空）`Remote{3}` |
-| ⑤ | handler task：`codec.decode(payload)` → 执行 | 解码失败 `Remote{4}`；panic → `Remote{0}` |
+| ④ | 服务端 reader：头解析 → `registry[service_id]` → `inbound.try_acquire(shape)` → 登记 cancel → spawn | 服务缺失 框架码 `2`；配额满 框架码 `1`；方法缺失（handler 内 match 落空）框架码 `3` |
+| ⑤ | handler task：`codec.decode(payload)` → 执行 | 解码失败 `PeerRejected{4}`；panic → `PeerRejected{0}` |
 | ⑥ | 编码响应 → `tx.send()` | 发送失败 → 连接废弃，pending 全部 `Closed` |
 | ⑦ | 客户端 reader：`pending.remove(id)` → `oneshot.send` | 调用方已放弃 → 忽略，guard 已归还 |
 | ⑧ | 超时 / 取消：guard drop → `remove` + 归还 permit + 发 `Cancel` | 见 6.3 |
 
-**第 ③ 步的 `tx` 在 `Draining` 时也必须可用**——关闭途中要回的 `Response` 和 `Remote{7}` 都走它（`INV-09`）。
+**第 ③ 步的 `tx` 在 `Draining` 时也必须可用**——关闭途中要回的 `Response` 和框架码 `7` 都走它（`INV-09`）。
 
 ### 6.2 dispatch 内部（服务端）
 
-1. `let svc = registry.get(service_id)` → 无 → `send_error(id, 2, false, "unknown service")`（回包侧构造，见 `02` 7.3）；
-2. 扣额度：`svc.schedule(method)` 给出 `Slot::Async | Slot::Blocking` → `inbound.try_acquire(slot, opts)`。**必须在 spawn 之前**：等 `call` 被 poll 才知道走哪个分支，那时额度已经扣过了。抢不到 → `send_error(id, 1, true, "overloaded" | "blocking pool overloaded")`，不登记 cancel token（v0.19）；
-3. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RpcError::Remote(RemoteError::new(3))`（这里必须交出一个 `RpcError`，所以走构造器而不是 `send_error`）；
+1. `let svc = registry.get(service_id)` → 无 → `send_error(id, 2, "unknown service")`（回包侧直接陈述，见 `02` 7.3）；
+2. 扣额度：`svc.schedule(method)` 给出 `Slot::Async | Slot::Blocking` → `inbound.try_acquire(slot, opts)`。**必须在 spawn 之前**：等 `call` 被 poll 才知道走哪个分支，那时额度已经扣过了。抢不到 → `send_error(id, 1, "overloaded" | "blocking pool overloaded")`，不登记 cancel token（v0.19）；
+3. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `Err(HandlerError::Framework { code: 3, message: "unknown method" })`（`Service::call` 的失败面就是 `HandlerError`，不必绕 `RpcError`）；
 4. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
-5. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<(u32, bool, String)>`**（`02-l2-protocol.md` 7.3 的白名单）：
-   - `Ok(Ok(bytes))` → `Response`，flags bit0 = 0；
-   - `Ok(Err(e))` → `to_wire(&e)`：`Some` → `Response` + bit0 = 1；`None`（`Io`/`Protocol`/`RuntimeDropped`）→ 按 `code = 0` 兜底，**不许静默丢帧**；
-   - `Err(JoinError)`（panic）→ `Remote { code: 0 }` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
-6. `#[photon(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `RpcError::Internal`（`to_wire` 无对应码 → `code 0` 兜底），不会需要 L3 再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
+5. 结果映射：`svc.call` 交出 `Result<Bytes, HandlerError>`，**三分支各自成帧**（`02-l2-protocol.md` 7.1）：
+   - `Ok(bytes)` → `Response`，flags = `0`；
+   - `Err(HandlerError::Business(tail))` → `Response`，flags = `0x09`，payload 原样就是 `tail`；
+   - `Err(HandlerError::Framework { code, message })` → `error_body::encode(code, &message)` + flags = `0x01`。`code` 只允许 `0..=7`：`RpcError` 若在 handler 内部被 `into` 成 `HandlerError`，由 `wire()` 决定码，`Io`/`Protocol`/`RuntimeDropped` 落 `0`（**不许静默丢帧**）；
+   - 外层 `Err(JoinError)`（panic）→ 框架码 `0` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
+6. `#[photon(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `HandlerError::Framework { code: 0, .. }`，L3 不必再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
 7. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性：v0.19 起 panic 走 `tracing::error!(service_id, method, request_id, %text)`，不再只有默认 panic hook 的 stderr 一行。
 
-> **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `to_wire` 一张表：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
+> **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `error::wire()` 一张表，且它只服务「`RpcError` 被 `into` 成 `HandlerError`」这一条通道：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
 
 ### 6.3 取消与超时
 
@@ -283,7 +284,7 @@ loop {
 | 调用方放弃 | `call` 的 future 被 drop（`abort` / 上层 `select!` 抢先）同样触发 `CallGuard`：摘表 + 归还配额 | **准确** |
 | 协议 `deadline_ms` | 客户端按「**发送时刻起还剩多少**」填剩余预算；服务端从**解析完 24B 头**开始计时，因此实际可用 = 头部值 + 传输延迟 | **尽力**（能停就停，停不下就跑完丢结果） |
 | `Cancel` 发送 | `PendingEntry::drop` 里 `try_send`：走到 drop 说明结果从未送达（超时 / 放弃 / 断连），告诉对端别算了。**用 `try_send` 不用 `send`**——为一条「别算了」卡在背压上比不发更糟；队列满时对端仍会按 deadline 自行收尾 | 尽力 |
-| `Cancel` 到达 | `async fn` handler：`select!` 到 `token.cancelled()` → 中止，回 `Remote{5}` | 有效 |
+| `Cancel` 到达 | `async fn` handler：`select!` 到 `token.cancelled()` → 中止，回 `PeerRejected{5}` | 有效 |
 | `Cancel` 到达 | `fn` / `#[photon(blocking)]` handler：标记已取消，**继续跑完、结果丢弃、不回 `Response`** | 只丢结果 |
 | 慢 handler 告警 | debug 构建下从 `call` 开始 poll 到结束计时，超过 100 µs 打 `tracing::warn`，提示该方法应加 `#[photon(blocking)]` | 诊断，非语义 |
 
@@ -316,7 +317,7 @@ loop {
 | 方向 | `Open` | `Draining` | `Closed` |
 |---|---|---|---|
 | 出站（本端 → 对端） | 接受新请求入 `mpsc` | 拒绝新请求（`RpcError::Closed`），已入队照常写 | `sink` 已 drop |
-| 入站（对端 → 本端） | 正常 dispatch | 不再 dispatch 新 `Request`（回 `Remote{7}`），仍收在飞 `Response` | `source` 已 drop |
+| 入站（对端 → 本端） | 正常 dispatch | 不再 dispatch 新 `Request`（回框架码 `7`），仍收在飞 `Response` | `source` 已 drop |
 
 ```rust
 struct ClosingState {
@@ -336,14 +337,14 @@ struct ClosingState {
 |---|---|---|---|
 | 本端调 `close()` | `Draining` + `self_goaway = true` | **保持 `Open`** | 只停发起，不停收活：对端在收到我们 `GoAway` 之前发出的请求仍是合法请求 |
 | 收到对端 `GoAway` | `Draining` + `peer_goaway = true` | **保持 `Open`** | 此后到达的都是对端在 `GoAway` 之前发出的，属于必须回完的那类 |
-| **双方都已宣告**（`goaway_sent && peer_goaway`，实现里叫 `ingress_draining`） | — | `Draining` | 到这里「还会有合法在飞请求」的前提不成立；此后到达的 `Request` 回 `Remote{7}` |
+| **双方都已宣告**（`goaway_sent && peer_goaway`，实现里叫 `ingress_draining`） | — | `Draining` | 到这里「还会有合法在飞请求」的前提不成立；此后到达的 `Request` 回 框架码 `7` |
 | 收尾超时（默认 5 s）或急停 | `Closed` | `Closed` | 强制收尾 |
 | reader 出错 / EOF | — | `Closed` | 同 `03` 4.3 |
 | writer 出错 | `Closed` | — | — |
 
 **没有「只关一边」的公开 API**：半关闭是 transport 实现细节，不是会话层 API。
 
-> **为什么 `close()` 也不能立刻让 `ingress` Draining（v0.10 修正 v0.9）**：v0.9 的六步关闭第 1 步写「两个方向同时 Draining」，同时又在验收里承诺「在飞全部完成」。这两句在竞态下必然冲突——对端在收到 `GoAway` 前 1 µs 发出的请求，到本端时 `ingress` 已 Draining，会被打成 `Remote{7}`，而它明明是一个合法请求。所以 `close()` 只影响 `egress`；`ingress` 一律等到「双方都宣告过」或超时兜底。**`Remote{7}` 只在这个窄窗口里出现**（双方都宣告关闭之后仍有请求冒出来），而不是关闭一开始就到处回它。
+> **为什么 `close()` 也不能立刻让 `ingress` Draining（v0.10 修正 v0.9）**：v0.9 的六步关闭第 1 步写「两个方向同时 Draining」，同时又在验收里承诺「在飞全部完成」。这两句在竞态下必然冲突——对端在收到 `GoAway` 前 1 µs 发出的请求，到本端时 `ingress` 已 Draining，会被打成 框架码 `7`，而它明明是一个合法请求。所以 `close()` 只影响 `egress`；`ingress` 一律等到「双方都宣告过」或超时兜底。**框架码 `7` 只在这个窄窗口里出现**（双方都宣告关闭之后仍有请求冒出来），而不是关闭一开始就到处回它。
 
 ### 7.3 优雅关闭六步（`flags` bit2 = 0）
 
@@ -379,13 +380,13 @@ struct ClosingState {
 
 - **`close_timeout`（默认 5 s）从本端调 `close()` 的时刻起算**，不是从对端回 `GoAway` 起算——否则对端不配合时要白等一个完整周期；
 - **「双方宣告后才拒」这条规则更重要**：本端只能靠对端的 `GoAway` 判断它是否还会发请求，丢掉这个信号就没有任何依据（`INV-10b`）；
-- **`Remote{7}` 的窄窗口不变**：只在双方都宣告关闭之后仍有 `Request` 冒出来时出现。
+- **框架码 `7` 的窄窗口不变**：只在双方都宣告关闭之后仍有 `Request` 冒出来时出现。
 
 能力位本身只出现在 `tests/transport.rs` 的 `Harness::PEER_SEES_EOF` 上：声明 `true` 的实现必须真给 EOF，声明 `false` 的必须真给不出（断言「读不到结束信号」）。**不要**把它提进 `Transport` trait 让 L3 分支。
 
 ## 8. 错误映射总表（L3 的唯一权威）
 
-**所有「上线」的错误都过 `to_wire`；本地变体在发起侧永不上线。**
+**所有「上线」的框架错误都过 `error::wire()`（或 `send_error` 的三码白名单）；本地变体在发起侧永不上线。**
 
 | 场景 | 用户看到（发起侧视角） | 是否断连 | 生成方式 |
 |---|---|---|---|
@@ -396,17 +397,17 @@ struct ClosingState {
 | socket / pipe / 环错误 | `RpcError::Io` | 是 | 本地构造 |
 | 本端超时 | `RpcError::Timeout` | 否 | 本地构造 |
 | blocking client 的 runtime 已 drop | `RpcError::RuntimeDropped` | 否（仅同步客户端路径） | 本地构造 |
-| 对端 handler panic | `Remote { code: 0 }` | 否 | 回包侧 `to_wire(Internal)` |
-| 对端入站配额满 | `Remote { code: 1 }` | 否 | 回包侧 `to_wire(Overloaded)` |
-| 服务未注册 | `Remote { code: 2 }` | 否 | 回包侧 `send_error(.., 2, ..)` |
-| 方法未注册 | `Remote { code: 3 }` | 否 | 回包侧 `RemoteError::new(3)`（宏生成的分支） |
-| payload 解码失败 / 参数不合法 | `Remote { code: 4 }` | 否 | 回包侧 `to_wire(InvalidInput)` |
-| 对端按 `Cancel` 中止 | `Remote { code: 5 }` | 否 | 回包侧 `to_wire(Cancelled)` |
-| 对端自己判 deadline | `Remote { code: 6 }` | 否 | 回包侧 `to_wire(Timeout)` |
-| 双方宣告关闭后仍有 `Request` / 对端在优雅关闭 | `Remote { code: 7 }` | 否 | 回包侧 `send_error(.., 7, ..)` |
-| 用户业务错误（`code >= 0x1_0000`，v0.25） | `Remote { code: 0x…, message }` | 否 | handler 的 `ServiceError::into_error` 产出，`to_wire` 走 `Remote` 原码透传；debug 下断言码段 |
+| 对端 handler panic | `PeerRejected { code: 0 }` | 否 | 回包侧 `error_body::encode(0, text)` |
+| 对端入站配额满 | `PeerRejected { code: 1 }` | **是**（退避） | 回包侧 `error_body(1)` |
+| 服务未注册 | `PeerRejected { code: 2 }` | 否 | 回包侧 `send_error(.., 2, ..)` |
+| 方法未注册 | `PeerRejected { code: 3 }` | 否 | `HandlerError::Framework { code: 3 }`（宏生成的分支） |
+| payload 解码失败 / 参数不合法 | `PeerRejected { code: 4 }` | 否 | 回包侧 `error_body(4)` |
+| 对端按 `Cancel` 中止 | `PeerRejected { code: 5 }` | 否 | 回包侧 `HandlerError::Framework { code: 5 }` |
+| 对端自己判 deadline | `PeerRejected { code: 6 }` | 否（换更长期限是调用方策略） | 回包侧 `wire(Timeout)` |
+| 双方宣告关闭后仍有 `Request` / 对端在优雅关闭 | `PeerRejected { code: 7 }` | **是**（重连后） | 回包侧 `send_error(.., 7, ..)` |
+| 用户业务错误（v0.31） | `CallError::Rejected(E)`，**不是 `RpcError`** | 由 `E` 自己表达 | handler 交出 `Err(HandlerError::Business(tail))`，tail 就是 `E` 的编码 |
 
-铁律：**发起侧的本地变体永不因为「对端说了什么」而被构造**；`Remote{code:1}` 也不许在客户端被翻译成 `Overloaded`。回包侧把本地变体编成错误体是**允许的**（否则服务端根本没法表达「我忙」），这条方向区别见 `02-l2-protocol.md` 7.3。
+铁律：**发起侧的本地变体永不因为「对端说了什么」而被构造**；`PeerRejected { code: 1 }` 不许在客户端被翻译成 `Overloaded`。回包侧陈述自己的 `HandlerError` 是**允许的**（否则服务端根本没法表达「我忙」），方向区别见 `02-l2-protocol.md` 7.3。
 
 ---
 
@@ -436,15 +437,15 @@ struct ClosingState {
 | 首帧强制 | 首帧非 `Handshake` → 200 ms 内断连，错误 `Protocol` | M1 |
 | 换 transport | 同一套会话用例在 `memory` 与 `local` 上各跑一遍（8 条 × 2），`session.rs` 一行不改 | M1 |
 | 零拷贝形状 | `memory` 上返回 `Bytes::from_owner`，收发后指针不变（`tests` 里断言 `as_ptr` 相等） | M1 |
-| handler panic | 服务实现 panic → 调用方拿到 `Remote{0}` + panic 文本，会话不断连 | M1 |
+| handler panic | 服务实现 panic → 调用方拿到 `PeerRejected{0}` + panic 文本，会话不断连 | M1 |
 | 对端关闭 | 对端 `close()` 后新调用 200 ms 内变 `Closed`，不挂在 pending 表上 | M1 |
 | 上限方向性 | 对端声明 1 MiB、本端 64 KiB 时 200 KiB 请求发得出去（写上限取对端声明值） | M1 |
 | 杀进程 | 服务端被 kill，客户端 100 ms 内收到明确错误而非挂死 | M3 |
 | 握手失败 | `codec_id` / 版本不等、`reserved != 0`、`max_message_len < 24` → 建连期断连 | 已覆盖（v0.22：`handshake_rejects_bad_fields`） |
 | 配额 | 并发压测后 `outbound.pending` 从未越界；客户端 `max_blocking_in_flight = 0` 仍正常；入站与出站配额互不影响 | M3 |
 | `GoAway`（发起侧） | 任一侧发送后，两侧**新请求**均 `Closed`（`INV-10b`） | M3 |
-| `GoAway`（收活侧） | 对端 `GoAway` 之后到达、但属于「对端 `GoAway` 之前发出」的请求**必须被 dispatch 并回包**，不得回 `Remote{7}`（`INV-10a`） | M3 |
-| 关闭不丢包 | 双方宣告关闭之后到达的 `Request` 收到 `Remote{7}`（明确拒绝，不挂死）（`INV-10c`） | M3 |
+| `GoAway`（收活侧） | 对端 `GoAway` 之后到达、但属于「对端 `GoAway` 之前发出」的请求**必须被 dispatch 并回包**，不得回框架码 `7`（`INV-10a`） | M3 |
+| 关闭不丢包 | 双方宣告关闭之后到达的 `Request` 收到 `PeerRejected { code: 7 }`（明确拒绝，不挂死）（`INV-10c`） | M3 |
 | 关闭超时 | 对端完全不配合时，`close()` 在 `close_timeout` 内返回，不永久挂起 | M3 |
 
 ---

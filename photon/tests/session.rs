@@ -16,7 +16,7 @@ use photon::session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
 use photon::transport::{
     DEFAULT_MAX_MESSAGE_LEN, Endpoint, LocalAddr, MessageSink, MessageSource, TransportOptions,
 };
-use photon::{BoxFuture, RpcError, Schedule, Service};
+use photon::{BoxFuture, CallFailure, HandlerError, RpcError, Schedule, Service};
 
 #[cfg(feature = "local")]
 use photon::transport::Transport;
@@ -101,7 +101,7 @@ impl Service for Echo {
         self: Arc<Self>,
         _method: u64,
         payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         let delay = if self.slow && !payload.is_empty() {
             u64::from(payload[0]) % 7
         } else {
@@ -124,7 +124,7 @@ impl Service for Ack {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         Box::pin(async { Ok(Bytes::from_static(b"ok")) })
     }
 }
@@ -138,7 +138,7 @@ impl Service for BlockingEcho {
         self: Arc<Self>,
         _method: u64,
         payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(Duration::from_millis(200));
@@ -176,7 +176,7 @@ impl Service for WatchCancel {
         self: Arc<Self>,
         _method: u64,
         payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         let started = Arc::clone(&self.started);
         let dropped = Arc::clone(&self.dropped);
         Box::pin(async move {
@@ -196,7 +196,7 @@ impl Service for Counter {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         Box::pin(async move {
             self.0.fetch_add(1, Ordering::AcqRel);
             Ok(Bytes::new())
@@ -215,7 +215,7 @@ impl Service for Gate {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         let started = Arc::clone(&self.started);
         let busy = self.busy;
         Box::pin(async move {
@@ -234,7 +234,7 @@ impl Service for BigReply {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         Box::pin(async { Ok(Bytes::from(vec![0xA5u8; 200 * 1024])) })
     }
 }
@@ -251,7 +251,7 @@ impl Service for Cancellable {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         let started = Arc::clone(&self.started);
         let dropped = Arc::clone(&self.dropped);
         Box::pin(async move {
@@ -290,7 +290,7 @@ impl Service for Boom {
         self: Arc<Self>,
         _method: u64,
         _payload: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    ) -> BoxFuture<'static, Result<Bytes, HandlerError>> {
         panic!("boom: 服务实现炸了")
     }
 }
@@ -421,11 +421,11 @@ async fn unknown_service_returns_remote_2<H: Harness>() {
         .await
         .expect_err("未注册的服务应当报错");
     match err {
-        RpcError::Remote(e) => {
-            assert_eq!(e.code, 2, "UnknownService");
-            assert!(!e.retryable);
+        CallFailure::Failed(RpcError::PeerRejected { code, message }) => {
+            assert_eq!(code, 2, "UnknownService");
+            assert!(!message.is_empty());
         }
-        other => panic!("应当是 Remote{{2}}，实际 {other:?}"),
+        other => panic!("应当是 PeerRejected{{2}}，实际 {other:?}"),
     }
 
     server.close().await.expect("关闭");
@@ -444,16 +444,14 @@ async fn handler_panic_returns_internal<H: Harness>() {
         .await
         .expect_err("服务实现 panic，调用方不该干等到期限");
     match err {
-        RpcError::Remote(e) => {
-            assert_eq!(e.code, 0, "Internal");
-            assert!(!e.retryable);
+        CallFailure::Failed(RpcError::PeerRejected { code, message }) => {
+            assert_eq!(code, 0, "Internal");
             assert!(
-                e.message.contains("boom"),
-                "panic 文本应当带回给调用方：{}",
-                e.message
+                message.contains("boom"),
+                "panic 文本应当带回给调用方：{message}"
             );
         }
-        other => panic!("应当是 Remote{{0}}，实际 {other:?}"),
+        other => panic!("应当是 PeerRejected{{0}}，实际 {other:?}"),
     }
 
     // 一条请求 panic 不该把整条连接打死。
@@ -479,7 +477,10 @@ async fn close_makes_subsequent_calls_closed<H: Harness>() {
         .call(7, 1, Bytes::from_static(b"b"), CALL_DEADLINE)
         .await
         .expect_err("关闭后不应再能调用");
-    assert!(matches!(err, RpcError::Closed), "实际 {err:?}");
+    assert!(
+        matches!(err, CallFailure::Failed(RpcError::Closed)),
+        "实际 {err:?}"
+    );
 
     server.close().await.expect("关闭服务端");
 }
@@ -505,7 +506,7 @@ async fn peer_close_fails_new_calls_closed<H: Harness>() {
             .call(7, 1, Bytes::from_static(b"after"), 1_000)
             .await
             .expect_err("对端已经关了，不该还能成功");
-        if matches!(&err, RpcError::Closed) {
+        if matches!(&err, CallFailure::Failed(RpcError::Closed)) {
             break;
         }
         assert!(
@@ -575,9 +576,9 @@ async fn blocking_quota_is_separate<H: Harness>() {
     for reply in [b1, b2, b3] {
         match reply {
             Ok(_) => served += 1,
-            Err(RpcError::Remote(remote)) if remote.code == 1 && remote.retryable => {
-                overloaded += 1
-            }
+            // 对端回的过载是「线路来的框架码 1」；本端自己的 `Overloaded` 不会
+            // 出现在这里，两者名字不同正是这次模型分离的收益。
+            Err(CallFailure::Failed(RpcError::PeerRejected { code: 1, .. })) => overloaded += 1,
             other => panic!("阻塞请求只该有「成功」和「过载」两种结果：{other:?}"),
         }
     }
@@ -618,14 +619,20 @@ async fn client_timeout_surfaces_and_session_usable<H: Harness>() {
         .call(7, 1, Bytes::new(), 50)
         .await
         .expect_err("50ms 后必须放弃");
-    assert!(matches!(err, RpcError::Timeout), "实际 {err:?}");
+    assert!(
+        matches!(err, CallFailure::Failed(RpcError::Timeout)),
+        "实际 {err:?}"
+    );
 
     // 第二次仍然是 Timeout 而不是 Overloaded：会话没被上一次超时带坏。
     let again = ch
         .call(7, 1, Bytes::new(), 50)
         .await
         .expect_err("第二次同样会超时");
-    assert!(matches!(again, RpcError::Timeout), "实际 {again:?}");
+    assert!(
+        matches!(again, CallFailure::Failed(RpcError::Timeout)),
+        "实际 {again:?}"
+    );
 
     server.close().await.expect("关闭");
 }
@@ -685,7 +692,10 @@ async fn client_abandon_cancels_handler<H: Harness>() {
         .call(7, 1, Bytes::new(), 50)
         .await
         .expect_err("仍然不会返回");
-    assert!(matches!(err, RpcError::Timeout), "实际 {err:?}");
+    assert!(
+        matches!(err, CallFailure::Failed(RpcError::Timeout)),
+        "实际 {err:?}"
+    );
 
     server.close().await.expect("关闭");
 }
@@ -871,11 +881,12 @@ async fn ingress_draining_rejects_late_requests<H: Harness>() {
         let Some(frame) = frame else { continue };
         let header = photon::proto::Header::decode(&frame[..]).expect("头可解");
         if header.kind == photon::proto::Kind::Response && header.request_id == 2 {
-            let body = photon::proto::error_body::decode(&frame[24..]).expect("错误体可解");
-            verdict = Some(body.code);
+            let (code, _message) =
+                photon::proto::error_body::decode(&frame[24..]).expect("错误体可解");
+            verdict = Some(code);
         }
     }
-    assert_eq!(verdict, Some(7), "迟到请求应当是 Remote{{7}}，不是别的");
+    assert_eq!(verdict, Some(7), "迟到请求应当是框架码 7，不是别的");
 
     let _ = closing.await;
 }
