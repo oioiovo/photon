@@ -1,8 +1,9 @@
 //! 示例的**实现半**：`Calculator` 与业务逻辑。
 //!
-//! 只有服务端 example 引它（`calc_server` / `calc_local`），以及单进程的
-//! `local_calc`（它同时扮演两端，本来就是两者都在）。客户端 example 不引，
-//! 否则业务逻辑会被编进客户端二进制——见 `api.rs` 顶部的说明。
+//! 现在只有两个示例引它：`calc_local`（一个二进制两个角色）与单进程的 `local_calc`
+//! （同时扮演两端）。v0.30 删掉 `calc_server` / `calc_client` 后，`photon/examples/`
+//! 里已经没有「纯客户端」的 example 了——那条边界改由 `examples/calc-split/` 的
+//! `calc-client` 守住（它是独立 crate，依赖树里没有服务端）。
 
 use std::time::Duration;
 

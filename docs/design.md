@@ -2,10 +2,11 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory）、`calc_server`+`calc_client`（TCP）、`calc_local`（UDS，两进程）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落九块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 业务错误映射 `#[photon::service(id = N, error = MyError)]`；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。剩下 `Interceptor` 与 `tracing` span 仍在 M3。
+> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落九块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 业务错误映射 `#[photon::service(id = N, error = MyError)]`；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。剩下 `Interceptor` 与 `tracing` span 仍在 M3。
 >
-> 版本：**v0.29.1**（修文档里三处跑不起来的命令：示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项，照 `--addr 127.0.0.1:7001` 抄会得到 `AddrParseError(Socket)`。10.3 / 10.4 的命令与「`--addr` 可覆盖」的说明一并改成位置参数。代码零改动。
-> 上一版（v0.29）（示例补上「真实发布形态」：`examples/calc-split/` 是一个独立的嵌套 workspace，三个成员分别是契约 `calc-api`（只有 trait 与码段常量）、服务端程序 `calc-server`（impl + main）、客户端程序 `calc-client`（只依赖契约、只调 stub）。判据是依赖树与符号：`cargo tree -p calc-client | grep calc-server` 为空、`nm target/debug/calc-client | grep -c Calculator` = 0，而服务端有 37 个符号。框架代码零改动，线格式零改动。
+> 版本：**v0.30**（删掉 `photon/examples/` 里两个被 `examples/calc-split` 完全覆盖的示例：`calc_server.rs` 与 `calc_client.rs`。同一个 TCP 往返有两条命令、两处预期输出要同步，上一轮那个 `--addr` 的 bug 就出在这里；而它们相对 `calc-split` 没有任何独有信息。留下的三个各有不可替代的角色——`echo` 是唯一绕过 Session 的 L1/L2 证据，`local_calc` 是唯一的 API 面全量（一条命令七形态），`calc_local` 是唯一的 `local` feature 端到端。代码与线格式零改动。
+> 上一版（v0.29.1）（修文档里三处跑不起来的命令：示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项，照 `--addr 127.0.0.1:7001` 抄会得到 `AddrParseError(Socket)`。10.3 / 10.4 的命令与「`--addr` 可覆盖」的说明一并改成位置参数。代码零改动。
+> 更早（v0.29）（示例补上「真实发布形态」：`examples/calc-split/` 是一个独立的嵌套 workspace，三个成员分别是契约 `calc-api`（只有 trait 与码段常量）、服务端程序 `calc-server`（impl + main）、客户端程序 `calc-client`（只依赖契约、只调 stub）。判据是依赖树与符号：`cargo tree -p calc-client | grep calc-server` 为空、`nm target/debug/calc-client | grep -c Calculator` = 0，而服务端有 37 个符号。框架代码零改动，线格式零改动。
 > 更早（v0.28.1）（示例目录按「接口 / 实现分文件」重排。`examples/calc_service/` 拆成 `api.rs`（只有 `Calc` trait 与打印/构造错误的小工具）与 `imp.rs`（`Calculator` 与业务逻辑）；**客户端 example 只引 `api.rs`**，服务端与单进程示例才引 `imp.rs`。此前四个 example 都 `#[path]` 引同一个 `mod.rs`，等于把 handler 的业务逻辑编进客户端二进制——`nm target/debug/examples/calc_client | grep Calculator` 当时是有符号的。框架代码零改动。
 > 更早（v0.28）（M3 第十步：`tracing` span 贯穿。一次调用在日志里是一个 span：客户端 `photon.call`（`method_name` 是宏的编译期常量）、服务端 `photon.request`（`method_name` 由新增的 `Service::method_name` 从名字表反查），两边 `request_id` 由 `Session::call` 回填后对齐；handler 里打的日志落在请求 span 里。`photon::__private` 只给宏产物包 span 用，`tracing-subscriber` 只进 dev-dependencies。线格式零改动。
 > 更早（v0.27）（M3 第九步：同步客户端落地。`photon::blocking::BlockingSession` 把一条会话连同它的 runtime 搬到专属线程上，调用方只投递命令 + `recv_timeout` 等回包；服务级 `#[photon::service(id = N, blocking)]` 额外生成 `<Svc>BlockingClient`，方法全是同步 `fn`。**取消 `blocking` feature**：模块零新依赖，而 `#[cfg(feature = "blocking")]` 写进宏产物会被解析成下游 crate 的 feature，留着只是个空开关。`try_current` 的告警面也一并删掉——future 从不在调用方线程上跑，那个危险场景在结构上不存在。）
@@ -55,6 +56,7 @@
 
 | **v0.18** | **M2 收尾：服务端装配、客户端连接、示例与并发验收，线格式零改动**。① **`Server<T>`**：`bind(ep, transport_opts, session_opts)` → `register`（撞号 `Err` 不覆盖）→ `serve` / `serve_with`。注册表**按值**持有、`serve` 时才包 `Arc`：把「运行中改注册表」从类型上排除，比事后加锁便宜；`registry()` 交出 `&mut ServiceRegistry` 让宏生成的 `register_calc(server.registry(), svc)` 直接可用，`transport()` 交出 listener（端口写 `0` 的测试靠它拿真地址）。accept 循环里连接级错误（`ConnectionAborted` / `ConnectionReset` / `Interrupted` / `WouldBlock`）记一行继续，listener 级错误才返回 `Err`——`while let Ok(..)` 会把 listener 死亡静默吞掉。② **`Session::wait_closed()`**：`closed: Arc<Notify>` + 进 `Closed` 的唯一写点；`serve` 循环靠它知道「这条连接不用再持有」。**先建 waiter 再看状态**，反序会丢通知并留下永久等待。③ **客户端拆成两步**：`connect::<T>(ep, ConnectOptions)` 拿 `SessionHandle`，`CalcClient::new(handle)` 包一层。原因是 `CalcClient` 只泛型化到半身 `CalcClient<S, K>`——`Memory::pair` 不实现 `Transport`，若 stub 绑在 `Transport` 上，`local_calc` 根本用不了同一份 stub；`connect` 本身还要等握手到 `Ready`（`codec_id`/版本不符在 connect 上就报错，而不是第一次业务调用超时）。④ **示例**：`examples/calc_service/mod.rs`（共用 `Calc` 服务，两个 example `#[path]` 各引一次）、`local_calc`（memory pair，四条输出与 10.5 逐字一致）、`calc_server`/`calc_client`（TCP，客户端 50 ms 间隔重试、2 s 预算）。⑤ **`tests/concurrency.rs`**：32 并发 + 100 乱序，同一套断言在 `memory` 与 `tcp` 上各跑一遍，比对「每个请求拿到的是不是自己的值」，整体套 10 s 超时（卡住必须变失败）。变异验证：把 dispatch 的已注册分支改成不可达 → 两条用例同时红。⑥ 全量 39 + 1 + 2 + 9 + 8 + 16 + 21 + 3 全绿。**同步改动**：`detail/03`（`wait_closed` / `set_closed` 的写法与原因）、`detail/04`（§4 stub 改为半身泛型、§10 三小节按实现重写）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
 | **v0.19** | **M3 第一步：三档声明形态与调度分流，线格式零改动**。① **宏**：`async fn` / `fn` / `#[photon(blocking)] fn` 三档都接受，形态判定在展开期写死（`MethodKind::{Async, Sync, Blocking}`），`rewrite_sigs` 只改 `async fn`（同步 `fn` 本来就没有 future 可改写）；方法级 `#[photon(...)]` 展开后从 trait 上摘掉——留着 rustc 会去解析一个不存在的属性并报错。② **dispatch 三分支**：`async` 分支 await；`fn` 分支包进 async 块首 poll 就地跑完（不换线程）；`blocking` 分支 `spawn_blocking`，**decode 搬进闭包**（它也是 CPU 工作），`JoinError` 映射 `Internal`（线上按 `0` 兜底）。③ **`Service::schedule(method) -> Schedule`**：额度必须在「进 handler」之前扣，那时只有 `service_id + method`，还看不到实现内部分支——所以调度类别由生成代码交出来（默认 `Async`，只有 `blocking` 方法生成 `Blocking`；没有 blocking 方法时干脆不生成，用 trait 默认实现）。④ **入站配额拆两张**：`InboundQuota{async_used, blocking_used}` + `try_acquire(Slot)` 一次持锁完成「检查 + 计数」，`InboundGuard` 按 slot 归还；阻塞池满时异步请求照跑。⑤ **debug 慢 handler 告警**：超过 100 µs 打 `tracing::warn` 提示加 `#[photon(blocking)]`；顺手把 handler panic 也改成 `tracing::error!`（原来只回包不记日志，服务端看起来「什么都没发生」）。⑥ **验收**：`tests/service_macro.rs` 12 条（同步就地执行、blocking 走线程池、blocking panic 不挂住、`schedule` 逐方法正确）、`tests/session.rs` 18 条（新增「阻塞额度只有 1 个 → 一次成功两次过载、异步不受影响」，`memory`/`local` 各一遍）、`tests/compile-fail/` 换成 `blocking_on_async` / `unknown_method_attr`（`sync_method` 已合法，删除）。变异验证：把 `Schedule::Blocking` 也映射到 `Slot::Async` → 两条配额用例同时红。全量 39 + 1 + 2 + 9 + 12 + 18 + 21 + 3 全绿。**同步改动**：`detail/04`（§3 属性表标未实现、§4 产物补 `schedule`、§5 三分支与 `schedule`、§9 检查表与 trybuild 清单）、`detail/03`（§6.2 补 slot 选择与阻塞分支的 `JoinError`、§6.3 补慢 handler 告警）、`design.md` 5.1 / 5.3 片段、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
+| **v0.30** | **删掉被替代的两个示例，代码零改动**。① **删** `photon/examples/calc_server.rs`（39 行）与 `calc_client.rs`（62 行）：它们的 TCP 往返与 `examples/calc-split` 完全重复，且相对三 crate 形态没有任何独有信息；保留只会产生两份命令、两份预期输出，同步义务落空时就是文档骗人（v0.29.1 的 `--addr` 即此）。② **留存判据**：`echo.rs`（唯一绕过 Session 的裸字节往返，是「L1 单独可用」的证据）、`local_calc.rs`（唯一把七种 API 形态塞进一个文件、一条命令跑完）、`calc_local.rs`（唯一端到端跑 `local` feature）。③ **代价与补偿**：`photon/examples/` 里不再有「纯客户端」示例，所以「业务逻辑不进客户端二进制」这条判据改由 `examples/calc-split` 守（`nm target/debug/calc-client | grep -c Calculator` = 0、`cargo tree -p calc-client | grep calc-server` 为空），形态更强（跨依赖边界而不是跨文件）。④ 文档同步：1.3 目录树、10.1 表、10.3/10.4/10.5 命令与预期输出、M2 清单条目、10.6/10.7、`detail/04` §11、`calc_service/{api,imp}.rs` 与 `calc_local.rs` 的头部注释。 |
 | **v0.29.1** | **修文档里跑不起来的命令（代码零改动）**。示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项；照文档抄 `--addr 127.0.0.1:7001` 会得到 `AddrParseError(Socket)`，服务端和客户端都起不来。10.3 的四条命令、10.4 的「`--addr` 可覆盖」说明与三 crate 命令块一并改成位置参数，并写明原因。这是文档与代码不一致，不是代码问题。 |
 | **v0.29** | **示例补上真实发布形态：三 crate，框架零改动**。① **新增 `examples/calc-split/`**（独立嵌套 workspace，不进根 workspace，所以根上的 `cargo test --features local` 不受影响）：`api/`（`calc-api`，契约：trait + `CODE_DIVIDE_BY_ZERO` + `describe`）、`server/`（`calc-server`，impl + `main`）、`client/`（`calc-client`，只依赖契约、只调 stub + 重试建连）。② **为什么三 crate**：`#[photon::service]` 一次展开两产物（stub 与服务端包装），但只有 `Service::call` 的分载体依赖实现类型；把实现放在独立 crate 里，客户端**在编译和依赖层面**都拿不到业务逻辑，比「同一 package 里分文件」更彻底（后者只是不引，依赖仍是同一套）。③ **为什么 `photon` 自己不拆 client/server**：会话是对称的（一条 `Session` 同时读写、既能服务也能发起，4.4），拆开会让「同一 peer 既当服务端又当客户端」无法表达，也会破坏「契约只写一份」；真要减体积用 feature，不拆 crate。④ **验收**：`cargo run -p calc-server` + `cargo run -p calc-client` 实跑输出与 `calc_server` / `calc_client` 逐字一致；`cargo tree -p calc-client | grep -c calc-server` = 0；`nm` 里客户端 0 个 `Calculator` 符号、服务端 37 个（客户端只有空壳 `CalcServer` 与 `register_calc`，不含业务代码）。**同步改动**：10.1 示例表新增一行、新增 §10.7「发布形态：三 crate」（依赖图 + 三条铁律 + 判据）、1.3 目录树、`detail/04` §11、`detail/00` 与 `PROTOCOL.md` 版本指向。 |
 | **v0.28.1** | **示例的接口与实现分文件，框架零改动**。① **症状**：`examples/calc_service/mod.rs` 同时放着 `Calc` trait、`Calculator` 实现与打印工具，四个 example 都 `#[path]` 整份引入——客户端 example 因此把 handler 的业务逻辑编进了自己的二进制（`calc_client` 里能找到 `Calculator` 的符号与 `divide by zero` 的字符串）。② **为什么不是洁癖**：`#[photon::service]` 展开的产物里，只有 `Service::call` 的 `match` 分支体真正依赖实现类型；把实现编进客户端等于**分发业务逻辑**，也让客户端多背一份永不执行、却可能带敏感常量的代码。③ **改法**：拆成 `calc_service/api.rs`（trait + `service_id()` / `ping_method()` / `describe()` / `business_error()`，纯接口，客户端只引它）与 `calc_service/imp.rs`（`Calculator` + impl，服务端引）；`calc_server` / `calc_local` 两个 example 额外 `#[path = "calc_service/imp.rs"] mod calc_imp;`。④ **单进程示例是例外且写明理由**：`local_calc` 同时扮演两端，本来就两半都在。⑤ **验收**：`nm target/debug/examples/calc_client | grep -c Calculator` = 0（客户端），`calc_server` 有符号；三个 example 实跑输出与 v0.28 逐字一致（`local_calc` 十行、TCP 往返、UDS 两进程）。**同步改动**：1.3 目录树（`calc_service/` 下两文件）、8 节新增具名条目、`detail/04` §11 的示例约定。 |
@@ -210,12 +212,10 @@ photon/                          # workspace 根
 │   ├── examples/                # 可直接 cargo run 的示例，见第 10 节
 │   │   ├── echo.rs              # M0：裸字节往返
 │   │   ├── local_calc.rs        # M2/M3：单进程全链路（一条命令跑通，十行输出）
-│   │   ├── calc_server.rs       # M2：两进程，服务端
-│   │   ├── calc_client.rs       # M2：两进程，客户端
 │   │   ├── calc_local.rs        # M3：两进程本地 IPC（架构验收）
-│   │   └── calc_service/         # 四个 calc 示例共用的服务（各自 `#[path]` 引入）
-│   │       ├── api.rs          # 只有 trait 与打印/构造错误的小工具（客户端只引这个）
-│   │       └── imp.rs          # `Calculator` 与业务逻辑（只服务端引）
+│   │   └── calc_service/         # `local_calc` / `calc_local` 共用的服务（各自 `#[path]` 引入）
+│   │       ├── api.rs          # 只有 trait 与打印/构造错误的小工具（独立程序里客户端只引这个）
+│   │       └── imp.rs          # `Calculator` 与业务逻辑（只有扮演服务端的那半引）
 │   ├── tests/                   # 跨 transport 的一致性测试
 │   │   ├── transport.rs         # M0：不依赖 Session，直接测 L1 收发与帧边界
 │   │   ├── protocol.rs          # M0：24B 头 + 逐 kind 校验 + 帧长上限 + 逐字节样例
@@ -1460,7 +1460,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 - [x] **`Service::call` 用 `self: Arc<Self>` 接收者**（为 `spawn_blocking` 预留，见 5.1；用 `&self` 后面要返工）
 - [x] `ServiceRegistry` 按 `service_id` 路由（表先静态构建，结构留动态；撞号注册报错）
 - [x] **错误体提前落地**（3.8 的 `code` 表 + `RpcError::Remote`）——M1 已随 `proto/error_body.rs` 完成：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
-- [x] 示例组 `local_calc` / `calc_server` / `calc_client`，覆盖 10.3 的**第 1、2、5 三种形态**——v0.18 落地，输出与 10.5 的 M2 四条逐字一致
+- [x] 示例组 `local_calc` / `calc_server` / `calc_client`，覆盖 10.3 的**第 1、2、5 三种形态**——v0.18 落地，输出与 10.5 的 M2 四条逐字一致。**v0.30 起 `calc_server` / `calc_client` 已删**（TCP 往返与 `examples/calc-split` 完全重复，两条命令、两处预期输出反而成了同步负担），这一项的历史验收由 v0.18 的提交与 `calc-split` 共同承担
 - [x] `tests/concurrency.rs`：同一套测试在 `tcp` 与 `memory` 上全绿——v0.18 落地（32 并发 + 100 乱序 × 2 条传输）
 - [x] 本阶段**只支持 `async fn` 声明**；`fn` 与 `#[photon(blocking)]` 放到 M3（见 5.2）——v0.17 由宏在展开期强制
 
@@ -1521,10 +1521,9 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 |---|---|---|---|---|
 | `echo` | 1 | `tcp` | M0 | 24 字节头编解码、长度前缀、消息边界正确 |
 | `local_calc` | 1 | `memory` | M2 | **最小集**全链路（stub → session → dispatch → codec → 返回），第 1/2/5 三形态；**一条命令可跑** |
-| `calc_server` / `calc_client` | 2 | `tcp` | M2 | 真·跨进程 IPC，首次端到端（同样只验最小集） |
 | `local_calc`（补齐形态） | 1 | `memory` | M3（v0.24 / v0.27 已落地） | 七种形态全跑（Notification / 超时 / GoAway / 同步 handler）+ 同步客户端（第二条会话，服务端在自己的线程上） |
 | `calc_local` | 2 | `local` | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收） |
-| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | 2 | `tcp` | M3（v0.29 新增） | **真实发布形态**：契约 / 服务端 / 客户端三个 crate，客户端依赖树里没有服务端（见 10.7） |
+| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | 2 | `tcp` | M3（v0.29 新增） | **真实发布形态**：契约 / 服务端 / 客户端三个 crate，客户端依赖树里没有服务端（见 10.7）；**TCP 跨进程这一形态自 v0.30 起只由它承担** |
 
 ### 10.2 为什么必须有一个「单进程示例」
 
@@ -1558,12 +1557,16 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 cargo run --example local_calc
 ```
 
-两进程（两个终端，TCP）：
+两进程（两个终端，TCP）：只有三 crate 形态——v0.30 删掉 `calc_server` / `calc_client` 后，`photon/examples/` 里不再有 TCP 示例：
 
 ```
-cargo run --example calc_server -- 127.0.0.1:7001
-cargo run --example calc_client -- 127.0.0.1:7001
+cd examples/calc-split
+cargo run -p calc-server -- 127.0.0.1:7001
+cargo run -p calc-client -- 127.0.0.1:7001
 ```
+
+这是独立的嵌套 workspace，不进根 workspace——根上的 `cargo test --features local` 不会因为它变慢。
+判据见 10.7：`cargo tree -p calc-client | grep calc-server` 为空、客户端二进制里没有 `Calculator` 符号。
 
 两进程（两个终端，本地 IPC；只在 Unix 上，`local` 不是默认 feature）：
 
@@ -1580,20 +1583,9 @@ cargo run --example echo
 
 约定：
 
-- server 侧默认监听 `127.0.0.1:7001`，第一个位置参数覆盖地址（不是 `--addr` 选项，示例只读 `args().nth(1)`）
+- server 侧默认监听 `127.0.0.1:7001`，第一个位置参数覆盖地址（不是 `--addr` 选项，示例只读 `args().nth(1)`；`calc_local` 是 `server|client <sock>` 两段位置参数）
 - client 侧必须**重试连接**而非固定 `sleep`，最多等 2s（否则在不同机器上时序会飘）
 - 所有示例必须能在 Windows 与 Linux 上无额外系统依赖运行（这是默认 feature 集的约束，见 1.3.1）
-
-**三 crate（真实发布形态，两个终端）**：
-
-```
-cd examples/calc-split
-cargo run -p calc-server -- 127.0.0.1:7001
-cargo run -p calc-client -- 127.0.0.1:7001
-```
-
-这是独立的嵌套 workspace，不进根 workspace——根上的 `cargo test --features local` 不会因为它变慢。
-判据见 10.7：`cargo tree -p calc-client | grep calc-server` 为空、客户端二进制里没有 `Calculator` 符号。
 
 ### 10.5 预期输出与验收门槛
 
@@ -1621,7 +1613,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 `fast_hash` 那一行打的是 FNV-1a 的完整 16 位（`{:#018x}`），省略号在文档里可以留白、在输出里不行——验收要能逐字比对。
 
-`calc_server` / `calc_client` 同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`；`calc_local` 换成 `local:///tmp/photon-calc.sock`，客户端侧三行与上面 `calc_client` 一致（`connected to local://…` 之后是 `add` / `div`）。
+两个两进程示例同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`（`calc-split`）或 `local:///tmp/photon-calc.sock`（`calc_local`）；客户端只有三行——`connected to …` / `[client] add(2, 3) = 5` / `[client] div(1, 0) -> Err(Remote(code=0x10001, "divide by zero"))`。它们不跑 `local_calc` 那份七形态全量：跨进程验的是「协议与 transport 通了」，不是把 API 面再走一遍。
 
 > **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair()` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
 
@@ -1641,7 +1633,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 ### 10.7 发布形态：三 crate
 
-`photon/examples/` 里的示例是**单个 package 的 example target**，只能演示 API 形状；真实项目里
+`photon/examples/` 里的示例是**单个 package 的 example target**，只能演示 API 形状（TCP 那种形态自 v0.30 起只在 `calc-split` 保留：`calc_server` / `calc_client` 已删，理由见 10.6）；真实项目里
 契约、服务端、客户端是三件编译边界不同的事。`examples/calc-split/` 就是那种形态（独立嵌套 workspace）：
 
 ```

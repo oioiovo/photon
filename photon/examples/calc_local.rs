@@ -5,11 +5,12 @@
 //! cargo run --features local --example calc_local -- client /tmp/photon-calc.sock
 //! ```
 //!
-//! 与 `calc_server` / `calc_client` 的业务代码逐行相同，只换了 `Endpoint` 与
+//! 与 `examples/calc-split` 的 `calc-server` 业务代码逐行相同，只换了 `Endpoint` 与
 //! `Transport` 类型——这就是「换 transport 不改业务代码」的可执行证据。
 
-// 同一个二进制既是服务端又是客户端，所以两半都引；分成两个 example 时
-// 客户端那一半只引 `api.rs`（见 `calc_client.rs`）。
+// 同一个二进制既是服务端又是客户端，所以两半都引。分成两个程序时，客户端那一半
+// 只该引 `api.rs`——那个形态见 `examples/calc-split/`（客户端是独立 crate，依赖树里
+// 连服务端都看不到）。
 #[path = "calc_service/api.rs"]
 mod calc;
 #[path = "calc_service/imp.rs"]
@@ -84,7 +85,7 @@ async fn run_client(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 async fn connect_with_retry(
     ep: &Endpoint,
 ) -> Result<CalcClient<LocalSource, LocalSink>, Box<dyn std::error::Error>> {
-    // 与 `calc_client` 同样按「重试 + 预算」处理时序：服务端可能晚起几百毫秒。
+    // 与 `examples/calc-split` 的 `calc-client` 同样按「重试 + 预算」处理时序：服务端可能晚起几百毫秒。
     let deadline = Instant::now() + CONNECT_BUDGET;
     loop {
         match connect::<LocalTransport>(ep, ConnectOptions::default()).await {
