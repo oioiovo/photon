@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use photon::proto::handshake::Handshake;
 use photon::session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
 use photon::transport::{
     DEFAULT_MAX_MESSAGE_LEN, Endpoint, LocalAddr, MessageSink, MessageSource, TransportOptions,
@@ -222,6 +223,19 @@ impl Service for Gate {
             tokio::time::sleep(busy).await;
             Ok(Bytes::from_static(b"done"))
         })
+    }
+}
+
+/// 回一个很大的 payload：用来验证「本端声明值决定接收上限」。
+struct BigReply;
+
+impl Service for BigReply {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        _payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        Box::pin(async { Ok(Bytes::from(vec![0xA5u8; 200 * 1024])) })
     }
 }
 
@@ -928,6 +942,100 @@ fn control_frame(
     header.encode().into()
 }
 
+/// 本端声明的上限决定**接收**：客户端敢收 1 MiB，服务端（默认 64 KiB）发 200 KiB
+/// 就必须收得下。这条与 `peer_declared_limit_governs_sending` 合起来才是「两个
+/// 方向各用各的」的完整证据，缺一条都只能证明一半。
+async fn own_declared_limit_governs_recv<H: Harness>() {
+    let client_opts = SessionOptions {
+        max_message_len: 1024 * 1024,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, Arc::new(BigReply)),
+        SessionOptions::default(),
+        client_opts,
+    )
+    .await;
+
+    let reply = ch
+        .call(7, 1, Bytes::new(), CALL_DEADLINE)
+        .await
+        .expect("客户端声明了 1 MiB，就该收得下 200 KiB");
+    assert_eq!(reply.len(), 200 * 1024);
+
+    server.close().await.expect("关闭");
+}
+
+/// 握手阶段的三种「谈不拢」都必须在**建连时**断掉，而不是拖到第一次业务调用。
+async fn handshake_rejects_bad_fields<H: Harness>() {
+    // 三条各自独立断连。第三条不能用 `Handshake::encode`——它对 < 24 的值有
+    // `debug_assert`（那是本端的编程错误），对端发来的坏值只能手写字节。
+    let cases = [
+        (
+            "codec 不一致",
+            Handshake {
+                codec_id: 1,
+                ..Handshake::default()
+            }
+            .encode_frame(),
+        ),
+        (
+            "版本不一致",
+            Handshake {
+                protocol_version: 9,
+                ..Handshake::default()
+            }
+            .encode_frame(),
+        ),
+        ("max_message_len 装不下头", raw_handshake_frame(1, 20, 0)),
+    ];
+
+    for (what, bad) in cases {
+        let ((s_src, s_sink), (_c_src, mut c_sink)) = H::connected().await;
+        let (server, _sh) = Session::new(
+            s_src,
+            s_sink,
+            registry_with(7, Arc::new(Ack)),
+            SessionOptions::default(),
+        )
+        .expect("服务端会话");
+
+        c_sink.send(bad).await.expect("握手帧应当发得出");
+
+        let closed = tokio::time::timeout(Duration::from_millis(300), async {
+            while !server.is_closed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "{what}：会话没有在建连阶段断开");
+        assert!(
+            server.close().await.is_ok() || server.is_closed(),
+            "收尾应当干净"
+        );
+    }
+}
+
+/// 手写一条握手帧：`Handshake::encode` 会 `debug_assert` 拦掉非法上限，
+/// 但「对端发来一个坏值」这条路径只能绕过它才能造出来。
+fn raw_handshake_frame(protocol_version: u16, max_message_len: u32, codec_id: u16) -> Bytes {
+    let header = photon::proto::Header {
+        kind: photon::proto::Kind::Handshake,
+        flags: 0,
+        service_id: 0,
+        request_id: 0,
+        method: 0,
+        deadline_ms: 0,
+    };
+    let mut buf = header.encode();
+    let mut payload = [0u8; 12];
+    payload[0..2].copy_from_slice(&protocol_version.to_le_bytes());
+    payload[4..8].copy_from_slice(&max_message_len.to_le_bytes());
+    payload[8..10].copy_from_slice(&codec_id.to_le_bytes());
+    buf.extend_from_slice(&payload);
+    buf.freeze()
+}
+
 /// 把同一组用例挂到每个实现上。这里只有签名，用例体一行不改。
 macro_rules! suite {
     ($name:ident, $H:ty) => {
@@ -987,6 +1095,16 @@ macro_rules! suite {
             #[tokio::test]
             async fn client_abandon_cancels_handler() {
                 super::client_abandon_cancels_handler::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn own_declared_limit_governs_recv() {
+                super::own_declared_limit_governs_recv::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn handshake_rejects_bad_fields() {
+                super::handshake_rejects_bad_fields::<$H>().await
             }
 
             #[tokio::test]

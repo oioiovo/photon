@@ -86,9 +86,13 @@ impl<S, K> Session<S, K> where S: MessageSource, K: MessageSink {
 4. 状态 `Connected → Negotiating`，等对端 `Handshake`；
 5. 收到并通过 §9 校验 → `Ready`。此刻把两个上限写进旋钮（L3 存着的 `Arc`）：`limits.0.store(opts.max_message_len)`（本端接收上限）、`limits.1.store(peer.max_message_len)`（对端接收上限，也就是本端发送上限）。握手前两者恒为 64 KiB。
 
+   这两行必须各有一条验收，否则「两个方向各用各的」只被证明了半边：`peer_declared_limit_governs_sending`（对端声明 1 MiB → 本端能发 200 KiB，证明 `limits.1`）与 `own_declared_limit_governs_recv`（本端声明 1 MiB → 收得下对端 200 KiB 的回包，证明 `limits.0`）。变异验证就删对应那一行：前者删 `limits.1`、后者删 `limits.0`，各自只让本方向的用例变红。
+
 > 双方都主动发，不做「客户端先发、服务端再回」的角色机——4.4 的双向对等要求这样做，否则服务端回调客户端时握手语义要分两套。
 >
 > 握手时还要做两条**建会话前**的校验：`opts.max_message_len >= 24`；shm transport 上 `opts.max_message_len <= slot_size`（`slot_size` 从段头读，见 L1 6.4）。两者不满足直接拒绝，不要拖到运行时才发现帧超限。
+>
+> 对端发来的坏值走另一条路：`Handshake::decode` 拒 payload 长度 / 保留位 / `< 24`，`check_against` 拒版本与 codec，失败即 `fail()`（建连期断连，`INV-02`）。**造这类反例不要用 `Handshake::encode`**——它对 `< 24` 有 `debug_assert`，拦的是「我方发错」这种编程错误，对端发错走的是网络，`encode` 根本造不出那个字节；用例里只能手写 payload（`raw_handshake_frame`）。
 
 ---
 
@@ -432,7 +436,7 @@ struct ClosingState {
 | 对端关闭 | 对端 `close()` 后新调用 200 ms 内变 `Closed`，不挂在 pending 表上 | M1 |
 | 上限方向性 | 对端声明 1 MiB、本端 64 KiB 时 200 KiB 请求发得出去（写上限取对端声明值） | M1 |
 | 杀进程 | 服务端被 kill，客户端 100 ms 内收到明确错误而非挂死 | M3 |
-| 握手失败 | `codec_id` 不等 / `reserved != 0` → 断连 | M3 |
+| 握手失败 | `codec_id` / 版本不等、`reserved != 0`、`max_message_len < 24` → 建连期断连 | 已覆盖（v0.22：`handshake_rejects_bad_fields`） |
 | 配额 | 并发压测后 `outbound.pending` 从未越界；客户端 `max_blocking_in_flight = 0` 仍正常；入站与出站配额互不影响 | M3 |
 | `GoAway`（发起侧） | 任一侧发送后，两侧**新请求**均 `Closed`（`INV-10b`） | M3 |
 | `GoAway`（收活侧） | 对端 `GoAway` 之后到达、但属于「对端 `GoAway` 之前发出」的请求**必须被 dispatch 并回包**，不得回 `Remote{7}`（`INV-10a`） | M3 |
