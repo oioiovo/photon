@@ -1,0 +1,6 @@
+# 独立的嵌套 workspace：不并进仓库根 workspace，所以根上的
+# `cargo test --features local` 不会因为这里多了三个 package 而变慢或被干扰。
+# 三个成员的分工见 README.md。
+[workspace]
+members = ["api", "server", "client"]
+resolver = "3"

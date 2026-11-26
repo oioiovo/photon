@@ -1,4 +1,6 @@
 //! 两进程示例的服务端：`cargo run --example calc_server -- [addr]`（默认 `127.0.0.1:7001`）。
+//! 真实发布形态请用 `examples/calc-split/`（契约 / 服务端 / 客户端三个 crate）；这里的同一个
+//! example target 是「单 package 内最小两进程」，`calc_client` 之所以能只引 `api.rs`，靠的是模块拆分。
 
 // 只有接口半：业务实现不参与客户端的编译，见 `calc_service/api.rs` 顶部说明。
 #[path = "calc_service/api.rs"]

@@ -1,0 +1,9 @@
+[package]
+name = "calc-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calc-api = { path = "../api" }
+photon = { path = "../../../photon" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

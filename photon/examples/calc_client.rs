@@ -1,4 +1,5 @@
 //! 两进程示例的客户端：`cargo run --example calc_client -- [addr]`。
+//! 真实发布形态请用 `examples/calc-split/`：那里的 `calc-client` 是独立 crate，依赖树里就没有服务端。
 //!
 //! 连接是**重试**的：服务端可能比客户端晚几百毫秒起，固定 `sleep` 在不同机器上
 //! 会飘（本地绿、CI 红）。最多等 2 s，超时才算失败。
