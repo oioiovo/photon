@@ -190,7 +190,7 @@ loop {
    - **再** `cancels.lock().insert(id, token)`；
    - **再** `tokio::spawn(...)`，把 `Bytes` move 进去；`handlers += 1`；
    - handler 结束时由 guard 移除 token、`handlers -= 1`、归还入站配额。
-4. `Notification` 同样走配额与 spawn，但**不回包**，失败只记日志。
+4. `Notification` 与 `Request` 共用同一个 `dispatch`（查服务 → 扣额度 → spawn），差别只有 `want_reply = false`：**未注册服务、额度不足都只记日志，绝不回 `Response`**——给通知回包是协议噪声，对端没有对应的 pending，收到只会丢掉。
 
 ### 4.2 为什么 decode 不在 reader 里
 
@@ -275,8 +275,10 @@ loop {
 
 | 机制 | 实现口径 | 语义强度 |
 |---|---|---|
-| 客户端超时 | `tokio::time::timeout` 包住 `oneshot` 的 await；超时由 guard 回收 entry + permit，并**顺手发 `Cancel`** | **准确**（本端判定） |
+| 客户端超时 | `tokio::time::timeout` 包住 `oneshot` 的 await；超时由 `CallGuard` 回收 entry + permit | **准确**（本端判定） |
+| 调用方放弃 | `call` 的 future 被 drop（`abort` / 上层 `select!` 抢先）同样触发 `CallGuard`：摘表 + 归还配额 | **准确** |
 | 协议 `deadline_ms` | 客户端按「**发送时刻起还剩多少**」填剩余预算；服务端从**解析完 24B 头**开始计时，因此实际可用 = 头部值 + 传输延迟 | **尽力**（能停就停，停不下就跑完丢结果） |
+| `Cancel` 发送 | `PendingEntry::drop` 里 `try_send`：走到 drop 说明结果从未送达（超时 / 放弃 / 断连），告诉对端别算了。**用 `try_send` 不用 `send`**——为一条「别算了」卡在背压上比不发更糟；队列满时对端仍会按 deadline 自行收尾 | 尽力 |
 | `Cancel` 到达 | `async fn` handler：`select!` 到 `token.cancelled()` → 中止，回 `Remote{5}` | 有效 |
 | `Cancel` 到达 | `fn` / `#[photon(blocking)]` handler：标记已取消，**继续跑完、结果丢弃、不回 `Response`** | 只丢结果 |
 | 慢 handler 告警 | debug 构建下从 `call` 开始 poll 到结束计时，超过 100 µs 打 `tracing::warn`，提示该方法应加 `#[photon(blocking)]` | 诊断，非语义 |
@@ -284,6 +286,7 @@ loop {
 必须写进文档的三条：
 
 - **同步 handler 不可中止**——同步代码里没有可中断点，任何声称能「停掉」它的机制都是假的。所以长耗时计算不要写成 sync 方法。
+- **超时与 `Cancel` 的分工**：超时是本端判定，一定准确；`Cancel` 是尽力通知，可能因队列满而丢掉。只靠 `deadline_ms` 让服务端停下也成立（它从解析完头开始计时），`Cancel` 的价值在于「客户端已放弃、服务端还没醒来」的那段——客户端判超时的时刻早于服务端 deadline 到期。
 - **服务端 deadline 只是尽力**——给每个请求挂一个 `sleep`，在万级 QPS 下就是万级 timer 注册。要精确只能换粗粒度 timer wheel，那是优化不是语义承诺。
 - **`deadline_ms` 填的是剩余预算，不是原始超时**——如果调用方在队列里等了 20 ms 才真正写出去，头里就必须扣掉这 20 ms。填原始值的实现会让服务端在「客户端早就放弃了」之后还在算，浪费且掩盖真实超时。
 

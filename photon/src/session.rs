@@ -120,6 +120,8 @@ struct OutboundTable {
 struct PendingEntry {
     tx: Option<oneshot::Sender<Result<Bytes, RpcError>>>,
     table: Arc<Mutex<OutboundTable>>,
+    /// 还没拿到结果就被丢弃：调用方不等了，顺手告诉对端别再算。
+    cancel: Option<(mpsc::Sender<Bytes>, u64)>,
 }
 
 impl PendingEntry {
@@ -135,9 +137,33 @@ impl Drop for PendingEntry {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Err(RpcError::Closed));
+            // 走到这里说明结果从未送达（超时、放弃、断连）：对端那条 handler 还在算，
+            // 告诉它别算了。`try_send` 而不是 `send`——为了发一条「别算了」而卡在
+            // 背压上比不发更糟；队列满时对端仍会按 deadline 自行收尾。
+            if let Some((frames, request_id)) = self.cancel.take()
+                && frames.try_send(cancel_frame(request_id)).is_err()
+            {
+                tracing::debug!(request_id, "cancel 帧未能入队，交由对端 deadline 收尾");
+            }
         }
         let mut table = self.table.lock();
         table.async_used = table.async_used.saturating_sub(1);
+    }
+}
+
+/// 调用方一侧的收尾钩子：`call` 的 future 被丢弃（超时、被 abort）时把 pending
+/// 摘掉。摘掉这一步同时归还配额，并触发 `PendingEntry::drop` 里的 `Cancel`。
+struct CallGuard {
+    table: Arc<Mutex<OutboundTable>>,
+    request_id: u64,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        // 锁作用域必须在这里结束：entry 的 `Drop` 还会再锁同一把锁，而
+        // `parking_lot::Mutex` 不可重入。
+        let entry = { self.table.lock().pending.remove(&self.request_id) };
+        drop(entry);
     }
 }
 
@@ -386,9 +412,16 @@ where
                 PendingEntry {
                     tx: Some(tx),
                     table: Arc::clone(&self.outbound),
+                    cancel: Some((self.tx.clone(), request_id)),
                 },
             );
         }
+
+        // 后面任何提前返回 / 超时 / future 被丢弃，都靠它摘表 + 发 Cancel。
+        let _guard = CallGuard {
+            table: Arc::clone(&self.outbound),
+            request_id,
+        };
 
         let frame = request_frame(service_id, request_id, method, deadline_ms, payload);
         if self.tx.send(frame).await.is_err() {
@@ -406,12 +439,30 @@ where
             match timeout(Duration::from_millis(u64::from(deadline_ms)), rx).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err(RpcError::Closed),
-                Err(_) => {
-                    drop(self.take_pending(request_id));
-                    Err(RpcError::Timeout)
-                }
+                Err(_) => Err(RpcError::Timeout),
             }
         }
+    }
+
+    /// 发一条通知：不占 pending 名额，也永远没有回包。
+    ///
+    /// 失败只能靠日志察觉——这正是「用通知换一次往返」的代价，调用方必须自愿接受。
+    pub async fn notify(
+        &self,
+        service_id: u16,
+        method: u64,
+        payload: Bytes,
+    ) -> Result<(), RpcError> {
+        self.wait_ready().await?;
+        if !self.egress_open.load(Ordering::Acquire) {
+            return Err(RpcError::Closed);
+        }
+        // 协议要求 `request_id != 0`：通知也要能被日志和对端 handler 区分开。
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(notification_frame(service_id, request_id, method, payload))
+            .await
+            .map_err(|_| RpcError::Closed)
     }
 
     /// 优雅关闭：宣告 → 等在飞归零 → 停两个 task → 兜底。
@@ -579,10 +630,11 @@ where
                 Ok(())
             }
 
-            Kind::Request => self.dispatch_request(header, payload).await,
+            Kind::Request => self.dispatch(header, payload, true).await,
 
             // M1 不实现通知投递：没有回包通道，静默丢弃比假装处理更诚实。
-            Kind::Notification => Ok(()),
+            // 通知与请求共用「查服务 → 扣额度 → spawn」这一套，差别只有「不回包」。
+            Kind::Notification => self.dispatch(header, payload, false).await,
 
             Kind::Cancel => {
                 if let Some(token) = self.cancels.lock().get(&header.request_id) {
@@ -610,14 +662,25 @@ where
         }
     }
 
-    async fn dispatch_request(
+    async fn dispatch(
         self: &Arc<Self>,
         header: Header,
         payload: Bytes,
+        want_reply: bool,
     ) -> Result<(), RpcError> {
         let Some(svc) = self.registry.get(header.service_id) else {
-            self.send_error(header.request_id, 2, false, "unknown service")
-                .await?;
+            // 通知没有回包通道：给它回一个 `Response` 反而是协议噪声（对端没有对应的
+            // pending，只会被丢掉），所以这里只记日志。
+            if want_reply {
+                self.send_error(header.request_id, 2, false, "unknown service")
+                    .await?;
+            } else {
+                tracing::debug!(
+                    service_id = header.service_id,
+                    request_id = header.request_id,
+                    "notification 指向未注册的服务，已丢弃"
+                );
+            }
             return Ok(());
         };
 
@@ -648,7 +711,16 @@ where
                 Slot::Async => "overloaded",
                 Slot::Blocking => "blocking pool overloaded",
             };
-            self.send_error(header.request_id, 1, true, message).await?;
+            if want_reply {
+                self.send_error(header.request_id, 1, true, message).await?;
+            } else {
+                tracing::warn!(
+                    service_id = header.service_id,
+                    request_id = header.request_id,
+                    message,
+                    "notification 因额度不足被丢弃"
+                );
+            }
             return Ok(());
         };
 
@@ -708,18 +780,26 @@ where
                     }
                 }
 
-                let frame = match outcome {
-                    Ok(body) => response_frame(request_id, body, false),
-                    Err(e) => {
-                        // 框架级故障（Io / Protocol / RuntimeDropped）没有合适的业务码，
-                        // 按 `0` 兜底；但回包路径上绝不静默丢帧。
-                        let (code, retryable, message) =
-                            error_body::to_wire(&e).unwrap_or_else(|| (0, false, format!("{e}")));
-                        let body = error_body::encode(code, retryable, &message);
-                        response_frame(request_id, body, true)
+                if !want_reply {
+                    // 通知没有回包通道，失败只能记日志：静默吞掉等于让调用方
+                    // 以为「发到了」，而服务端什么都没发生。
+                    if let Err(e) = &outcome {
+                        tracing::warn!(service_id, method, request_id, %e, "notification handler 失败");
                     }
-                };
-                let _ = tx.send(frame).await;
+                } else {
+                    let frame = match outcome {
+                        Ok(body) => response_frame(request_id, body, false),
+                        Err(e) => {
+                            // 框架级故障（Io / Protocol / RuntimeDropped）没有合适的业务码，
+                            // 按 `0` 兜底；但回包路径上绝不静默丢帧。
+                            let (code, retryable, message) = error_body::to_wire(&e)
+                                .unwrap_or_else(|| (0, false, format!("{e}")));
+                            let body = error_body::encode(code, retryable, &message);
+                            response_frame(request_id, body, true)
+                        }
+                    };
+                    let _ = tx.send(frame).await;
+                }
 
                 cancels.lock().remove(&request_id);
                 // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
@@ -812,6 +892,16 @@ where
             .await
     }
 
+    /// 发通知：只有「发出去」这一个结果，没有回包可等。
+    pub async fn notify(
+        &self,
+        service_id: u16,
+        method: u64,
+        payload: Bytes,
+    ) -> Result<(), RpcError> {
+        self.inner.notify(service_id, method, payload).await
+    }
+
     pub async fn close(&self) -> Result<(), RpcError> {
         self.inner.close().await
     }
@@ -900,6 +990,22 @@ fn request_frame(
         deadline_ms,
         payload,
     )
+}
+
+fn notification_frame(service_id: u16, request_id: u64, method: u64, payload: Bytes) -> Bytes {
+    base_frame(
+        Kind::Notification,
+        0,
+        service_id,
+        request_id,
+        method,
+        0,
+        payload,
+    )
+}
+
+fn cancel_frame(request_id: u64) -> Bytes {
+    base_frame(Kind::Cancel, 0, 0, request_id, 0, 0, Bytes::new())
 }
 
 fn response_frame(request_id: u64, payload: Bytes, is_error: bool) -> Bytes {

@@ -7,6 +7,7 @@
 #![cfg(any(feature = "memory", feature = "local"))]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -147,6 +148,56 @@ impl Service for BlockingEcho {
 
     fn schedule(&self, _method: u64) -> Schedule {
         Schedule::Blocking
+    }
+}
+
+/// handler 永不返回，并在被丢弃（= 取消）时记一笔。
+///
+/// 用 `Drop` 而不是「读到某个标志」：future 被 `select!` 抢先返回时就是 drop，
+/// 这是唯一能观测「取消真的发生了」的时点。
+struct WatchCancel {
+    started: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+struct DropMark(Arc<AtomicUsize>);
+
+impl Drop for DropMark {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Service for WatchCancel {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        let started = Arc::clone(&self.started);
+        let dropped = Arc::clone(&self.dropped);
+        Box::pin(async move {
+            started.fetch_add(1, Ordering::AcqRel);
+            let _mark = DropMark(dropped);
+            std::future::pending::<()>().await;
+            Ok(payload)
+        })
+    }
+}
+
+/// 只计数：验证通知也会进 handler（只是不回包）。
+struct Counter(Arc<AtomicUsize>);
+
+impl Service for Counter {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        _payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(Bytes::new())
+        })
     }
 }
 
@@ -455,6 +506,148 @@ async fn blocking_quota_is_separate<H: Harness>() {
     server.close().await.expect("关闭");
 }
 
+/// 超时要在客户端准时暴露，且会话不能因此坏掉。
+///
+/// 这条**测不出「guard 有没有摘表」**：服务端带着同一个 `deadline_ms`，会在几乎同一
+/// 时刻回一个 `Remote{6}`，reader 收到后照样把 entry 摘掉——一个漏掉的泄漏被对端的
+/// 回包顺手掩盖。真正能隔离 guard 的用例是下面的 `client_abandon_cancels_handler`
+/// （期限为 0，对端永远不会自己结束）。这条留在这里是因为「超时后会话还能用」本身
+/// 就值得锁住。
+async fn client_timeout_surfaces_and_session_usable<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let service: Arc<dyn Service> = Arc::new(WatchCancel {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+    });
+
+    // 只给 1 个异步额度：泄漏一次，下一次就必然 Overloaded。
+    let server_opts = SessionOptions {
+        max_async_in_flight: 1,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, service),
+        server_opts,
+        SessionOptions::default(),
+    )
+    .await;
+
+    let err = ch
+        .call(7, 1, Bytes::new(), 50)
+        .await
+        .expect_err("50ms 后必须放弃");
+    assert!(matches!(err, RpcError::Timeout), "实际 {err:?}");
+
+    // 第二次仍然是 Timeout 而不是 Overloaded：会话没被上一次超时带坏。
+    let again = ch
+        .call(7, 1, Bytes::new(), 50)
+        .await
+        .expect_err("第二次同样会超时");
+    assert!(matches!(again, RpcError::Timeout), "实际 {again:?}");
+
+    server.close().await.expect("关闭");
+}
+
+/// 调用方直接丢掉 future（不是超时）时，向对端发 `Cancel` 让 handler 停下。
+///
+/// 这条用例**必须用 `deadline_ms = 0`**：头里带期限的话，服务端自己会在同一时刻
+/// 超时把 handler 丢掉，`Cancel` 到底有没有发就测不出来——那正是「看起来在测，
+/// 其实什么都没测」的假用例。
+async fn client_abandon_cancels_handler<H: Harness>() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let service: Arc<dyn Service> = Arc::new(WatchCancel {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+    });
+
+    let server_opts = SessionOptions {
+        max_async_in_flight: 1,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, service),
+        server_opts,
+        SessionOptions::default(),
+    )
+    .await;
+
+    let call = tokio::spawn({
+        let ch = ch.clone();
+        async move { ch.call(7, 1, Bytes::new(), 0).await }
+    });
+
+    // 等 handler 真的开始跑，再丢掉调用方。
+    let started_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while started.load(Ordering::Acquire) == 0 && tokio::time::Instant::now() < started_deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(started.load(Ordering::Acquire), 1, "handler 应当已经开始");
+
+    call.abort();
+    let _ = call.await;
+
+    // 没有 `Cancel` 的话，这条 handler 会一直挂在 `pending()` 上（期限为 0）。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while dropped.load(Ordering::Acquire) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::Acquire),
+        1,
+        "丢掉 future 必须发 Cancel，让对端 handler 停下来"
+    );
+
+    // pending 与额度也一起收回来了：再发一次会超时，而不是撞 Overloaded。
+    let err = ch
+        .call(7, 1, Bytes::new(), 50)
+        .await
+        .expect_err("仍然不会返回");
+    assert!(matches!(err, RpcError::Timeout), "实际 {err:?}");
+
+    server.close().await.expect("关闭");
+}
+
+/// 通知走完整 dispatch（查服务 → 扣额度 → handler），只是没有回包。
+async fn notification_reaches_handler<H: Harness>() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let service: Arc<dyn Service> = Arc::new(Counter(Arc::clone(&hits)));
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, service),
+        SessionOptions::default(),
+        SessionOptions::default(),
+    )
+    .await;
+
+    ch.notify(7, 1, Bytes::from_static(b"ping"))
+        .await
+        .expect("通知应当发得出去");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while hits.load(Ordering::Acquire) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(hits.load(Ordering::Acquire), 1, "通知必须进 handler");
+
+    // 通知连发三条：不占 pending、不产生回包，连接照样可用。
+    for _ in 0..3 {
+        ch.notify(7, 1, Bytes::new()).await.expect("通知");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(hits.load(Ordering::Acquire), 4, "三条通知都要到");
+
+    // 通知指向未注册服务：只丢，不断连。
+    ch.notify(99, 1, Bytes::new()).await.expect("发出即可");
+    let reply = ch
+        .call(7, 1, Bytes::new(), CALL_DEADLINE)
+        .await
+        .expect("连接仍可用");
+    assert!(reply.is_empty());
+
+    server.close().await.expect("关闭");
+}
+
 /// 把同一组用例挂到每个实现上。这里只有签名，用例体一行不改。
 macro_rules! suite {
     ($name:ident, $H:ty) => {
@@ -504,6 +697,21 @@ macro_rules! suite {
             #[tokio::test]
             async fn blocking_quota_is_separate() {
                 super::blocking_quota_is_separate::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn client_timeout_surfaces_and_session_usable() {
+                super::client_timeout_surfaces_and_session_usable::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn client_abandon_cancels_handler() {
+                super::client_abandon_cancels_handler::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn notification_reaches_handler() {
+                super::notification_reaches_handler::<$H>().await
             }
         }
     };

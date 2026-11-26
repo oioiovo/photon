@@ -347,6 +347,22 @@ pub async fn connect<T: Transport>(ep: &Endpoint, opts: ConnectOptions)
 - `connect` 内部顺序固定：`transport.connect(ep, &transport_opts)` → `Session::new(source, sink, empty_registry, session_opts)` → 取 `SessionHandle` 包进客户端。
 - **客户端也传非空 `registry` 的情形**：4.4 的双向对等允许服务端回调客户端，若确实要暴露回调服务，就注册到自己的 registry；否则传 `ServiceRegistry::empty()`（**不是 `None`**，`Session::new` 的签名如此）。
 
+**`SessionHandle` 的三个发起入口（v0.20 补齐）**：
+
+```rust
+impl<S, K> SessionHandle<S, K> {
+    pub async fn call(&self, service_id: u16, method: u64, payload: Bytes, deadline_ms: u32)
+        -> Result<Bytes, RpcError>;         // 有回包；deadline_ms = 0 表示不设期限
+    pub async fn notify(&self, service_id: u16, method: u64, payload: Bytes)
+        -> Result<(), RpcError>;            // 无回包；`Ok(())` 只代表「发出去了」
+    pub async fn close(&self) -> Result<(), RpcError>;
+}
+```
+
+- `notify` 与 `call` 共用同一条 `tx` 队列、同样的背压，只是**不插 pending 表**——因此它不占出站配额，也不会有超时或 `Cancel`。代价是失败不可观测：服务端 handler 报错时只写 `tracing::warn!`，调用方永远看到 `Ok(())`。要确认结果就改用 `call`。
+- 服务端侧的 `Notification` 与 `Request` 走同一个 `dispatch`（查服务 → 扣额度 → spawn），差别只有 `want_reply = false`：**未注册服务、额度不足都只记日志，绝不回 `Response`**。给通知回一个 `Response` 是协议噪声：对端没有对应 pending，收到只会丢掉。
+- `deadline_ms` 的客户端语义是「本端愿意等多久」，因此它同时决定头里的剩余预算。放弃（超时或 future 被 drop）时 `CallGuard` 摘表并触发 `Cancel`，见 `03` 6.3。
+
 ### 10.4 完整的装配清单（照抄这一条就不会漏）
 
 | 步骤 | 服务端 | 客户端 |
