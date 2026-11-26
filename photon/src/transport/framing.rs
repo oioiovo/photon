@@ -29,6 +29,7 @@ const LEN_PREFIX: usize = 4;
 const MIN_MESSAGE_LEN: usize = 24;
 
 /// 把底层读半包成消息源。
+#[derive(Debug)]
 pub struct FramedSource<S> {
     inner: S,
     /// 跨消息复用：容量按上一条消息增长并保留，避免每帧重新分配。
@@ -114,6 +115,7 @@ impl<S: AsyncRead + Unpin + Send> MessageSource for FramedSource<S> {
 }
 
 /// 把底层写半包成消息出口。
+#[derive(Debug)]
 pub struct FramedSink<S> {
     inner: S,
     limit: Arc<AtomicU32>,

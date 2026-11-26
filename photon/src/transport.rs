@@ -16,6 +16,9 @@ use bytes::Bytes;
 
 pub mod framing;
 
+#[cfg(feature = "tcp")]
+pub mod tcp;
+
 /// 握手前两侧固定的单帧上限，也是两个旋钮的初值。
 pub const DEFAULT_MAX_MESSAGE_LEN: u32 = 64 * 1024;
 
@@ -126,7 +129,8 @@ impl fmt::Display for MemoryAddr {
 /// 同一份值的两个来源，而 L1 在握手前也用不上它们。
 #[derive(Debug, Clone)]
 pub struct TransportOptions {
-    /// `connect` 的超时；`accept` 不受它约束。
+    /// `connect` 的超时；`accept` 不受它约束。注意 `0` 表示「立即超时」而不是
+    /// 「不限」——要长等待就设一个大值，别用 0 表达无限。
     pub connect_timeout: Duration,
     /// 共享内存实现是否忙轮询。对流式实现无意义。
     pub spin_hint: bool,
