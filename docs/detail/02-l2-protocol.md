@@ -52,7 +52,7 @@
 
 1. 分配 `BytesMut::with_capacity(len + 24)`（或从 L1 读缓冲 `split_to` 出带 headroom 的段）；
 2. 先写 24 字节占位（或 `advance(24)`）；
-3. `codec.encode_into(payload_struct, &mut buf)` 直接写进同一块；
+3. `Default::encode_into(payload_struct, &mut buf)` 直接写进同一块；
 4. 回填头。
 
 顺序反过来（先 encode payload 再拼头）就是每帧多一次 memcpy，1 KiB 消息多拷 1 KiB，M4 实测会平白低 10–20%。
@@ -154,12 +154,15 @@ L2 只负责「头 + 裸 payload 的边界」。`codec.decode` 发生在 L3 spaw
 pub trait Codec {
     const ID: u16;   // postcard = 0，rkyv = 1（M5）
 
-    fn encode_into<T: Serialize, B: BufMut>(&self, value: &T, dst: &mut B) -> Result<(), RpcError>;
-    fn decode<T: DeserializeOwned>(&self, src: &Bytes) -> Result<T, RpcError>;
+    // 无 `&self`：codec 是无状态类型，写法就是 `Default::decode(&payload)`
+    fn encode_into<T: Serialize + ?Sized, B: BufMut + ?Sized>(value: &T, dst: &mut B) -> Result<(), RpcError>;
+    fn decode<T: DeserializeOwned>(src: &Bytes) -> Result<T, RpcError>;
 
-    fn encode<T: Serialize>(&self, value: &T) -> Result<Bytes, RpcError>; // 便利包装，默认实现
+    fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Bytes, RpcError>; // 便利包装，默认实现
 }
 ```
+
+**为什么方法不带 `&self`（v0.17 修）**：`codec::Default` 是**类型**而不是值，带 `&self` 的写法只能落到实例上，宏与业务代码里写 `Default::decode(&payload)` 会直接找不到方法（得先造一个 `Default::default()`）。codec 本身没有任何状态，接收者只是噪音；去掉之后「文档里的调用写法」与「能编译的调用写法」才是同一个。
 
 三条硬约束：
 
@@ -268,14 +271,16 @@ src/proto/
   header.rs     24B encode / decode + 逐 kind 校验（M0 就做，否则端到端无法验证）
   error_body.rs code 表、8B 前缀编解码、RemoteError ↔ 错误体、`to_wire()` 白名单
   handshake.rs  Handshake 的 12B 编解码与语义比对（已落地）；GoAway / Cancel 的 payload 恒空，由 header::validate 覆盖，不再单开文件
-  codec.rs      Codec trait + `codec::Default` 别名（由 feature 决定）
-  codec/
-    postcard.rs postcard 实现（默认，ID = 0）
-    rkyv.rs     M5，ID = 1，独立 feature
+src/codec.rs    Codec trait + `codec::Default` 别名（由 feature 决定）
+src/codec/
+  postcard.rs   postcard 实现（默认，ID = 0）
+  rkyv.rs       M5，ID = 1，独立 feature
 src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 ```
 
 **两个 `parse` 入口**：帧长上限不是常量——它来自握手，且两个方向可以不同。`parse()` 用 `MAX_MESSAGE_LEN` 这个常量上限，供单测与 M0 的固定上限场景；`Session` 的 reader 用 `parse_with_limit(msg, 本端声明值)`。二者只是把上限当参数，校验逻辑同一份。
+
+**codec 不在 `proto/` 下（v0.17 修）**：v0.11 起模块表把 `codec.rs` 写在 `src/proto/` 里，而实现放在 `src/codec.rs`（对外路径 `photon::codec::Default` 也一直是顶层的）。两者只能留一个，现在按实现走：`codec` 是 L2 的**能力**，但它的模块位置与 `proto` 平级——`Codec` 不解析头、不看 kind，把它关进 `proto` 只会让「关掉 codec feature 就没有错误类型」那类荒唐依赖再出现一次。
 
 **模块文件是 `proto.rs` 而不是 `proto/mod.rs`（2024 风格）**：入口文件与子目录同名并列，`proto.rs` 里用 `pub mod header;` 声明子模块。`codec.rs` 与 `codec/` 同理。
 

@@ -2,9 +2,9 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M1 — 多路复用已落地**（`Session` 能在 `memory` 与 `local` 上跑通同一套用例），下一步 M2。
+> 当前阶段：**M2 — 类型安全 API 进行中**（`codec::Default` 与 `#[photon::service]` 已落地：trait 一次声明即得 client stub、dispatch 与注册函数），下一步示例组 `local_calc` 与跨 transport 并发用例。
 >
-> 版本：**v0.16**（L3 `Session` 骨架、错误体、握手首帧强制与 panic 兜底落地；同时把错误出口函数的签名与实现对齐（`to_wire -> Option<(code, retryable, message)>`）。线格式、字节布局与 17 条校验零改动）
+> 版本：**v0.17**（M2 第一步落地：`codec.rs` + `codec/postcard.rs`（`ID = 0`）、`#[photon::service(id = N)]` 展开成 `CalcClient` / `CalcService<S>` / `register_calc` / `__photon_calc` 工具模块，method id 用 xxh3 只哈希方法名并冻结 golden 向量，宏与 dispatch 的验收用例与 trybuild 编译期拒绝一并到位。线格式、字节布局与 17 条校验零改动）
 
 ## 变更记录
 
@@ -26,6 +26,8 @@
 | **v0.13** | **`Transport::bind` 改为异步，线格式零改动**。① 原同步签名与实现的真实前置条件不符：tokio 的 `TcpListener::from_std` 必须把 fd 注册进当前 runtime 的 driver，取不到 `Handle` 时 `Handle::current()` 直接 panic（`there is no reactor running`），而签名返回 `io::Result` 又让调用方以为失败一定可处理——错误类型错位。② 改为返回 `impl Future<Output = io::Result<Self>> + Send`：实现可直接用 `tokio::net::TcpListener::bind().await`，不再需要 `std::net::TcpListener::bind` + `set_nonblocking` + `from_std` 三步，也不需要运行时的 `try_current` 补丁——「必须被某个 executor poll」成为类型上的前置条件，漏掉是编译错误而不是构造期 panic。③ 三个发起动作（`bind` / `connect` / `accept`）由此统一在 async 世界，`detail/01` 的 `L1-C4` 改为「三者皆异步」。④ 门面代价口径修正：`AnyTransport::bind` 现在同样要一次 `Box::pin`，但一个进程只调一次，不在热路径。**同步改动**：`design.md` 2 节 trait 片段与 2.5 门面代价段、`detail/01` `L1-C4` / 模块表 / §6.1 / §7.2、`detail/04` `Server::bind` 签名与装配清单、`detail/00` 版本指向、`PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 | **v0.14** | **`memory` 落地，`Memory::pair` 去掉 `opts`，线格式零改动**。① 产出 `transport/memory.rs`：`pair()` 造两条单向 `mpsc`（容量 `DEFAULT_QUEUE_CAPACITY = 1024`，实现常量不是协议约定）；读半把通道 `None` 映射 `UnexpectedEof`（返回空消息会让 L2 误诊成「头不完整」），读侧超上限报 `InvalidData`，写侧超上限报 `InvalidInput` 且连接保持可用。② **不实现 `Transport`**：`bind` / `connect` / `accept` 对「已经接好的一对 channel」没有对应动作，造一个按名字查找的注册表等于给它加一套不该有的寻址。③ `pair(opts)` → `pair()`：`TransportOptions` 的 `connect_timeout` 与 `spin_hint` 对进程内配对都无意义，收下不用就是坏参数。④ 新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体只写一份，`tcp` 与 `memory` 各跑一遍（12 条全绿）——这是 M0 对 L1 抽象的唯一客观证据。**同步改动**：`design.md` 2.7 与 10.5、`detail/01` §3 目录树与 §6.3、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 | **v0.16** | **M1 落地：`Session` 骨架 + 错误体，线格式零改动**。① 产出 `session.rs`：`pending` 表（`PendingEntry` 带 `Drop` guard，超时/取消/panic 三条路径都回收配额）+ reader/writer 两个 task（`Source`/`Sink` 都是 `&mut self` 且非 `Sync`，拆开之后「谁来保证不并发写」在结构上不存在）+ 首帧强制 `Handshake` + `SessionOptions{max_message_len, close_timeout, handshake_timeout, max_async_in_flight}`。② 产出 `proto/error_body.rs`：8B 前缀编解码与 `to_wire`；**签名对齐实现**：`to_wire(&RpcError) -> Option<(u32, bool, String)>`，`Io`/`Protocol`/`RuntimeDropped` 返回 `None` 由调用方按 `0` 兜底（不静默丢帧），`Closed` 映射 `7`（回包侧说「正在关闭」是准确陈述）。③ `proto::parse` 拆出 `parse_with_limit`：帧长上限来自握手且两方向可以不同，写死 64 KiB 会让「对端声明 1 MiB」永远收不到大帧（真 bug，测试抓到）。④ handler panic 兜底：外层 task `await` 里层 `JoinHandle`，`JoinError` → `Remote{0}` + panic 文本；代价是每请求多一次 `spawn`（换 `catch_unwind` 要引入 `futures`，留待压测后再议）。⑤ `memory` 零拷贝形状验证：`Bytes::from_owner` 收发后 `as_ptr` 不变。⑥ `tests/session.rs` 改成「用例体一份 + `Harness` 两种实现」，8 条用例在 `memory` 与 `local` 各跑一遍（16 条）——M1 的「换 transport 不改上层」由此变成可执行断言。⑦ `limit_knob` 套 10 s 超时：卡住要变失败，而不是让整个测试二进制挂着。**同步改动**：`detail/02`（`parse` 双入口、`to_wire` 签名与 code 表、模块表）、`detail/03`（§6.2 的 spawn/JoinError 口径、§10 验收表补 3 行并纠正首帧窗口）、`detail/00` 与 `PROTOCOL.md` 版本指向、`design.md` M1 清单与 M2 错误体项勾选。 |
+
+| **v0.17** | **M2 第一步落地：codec + 宏 + dispatch，线格式零改动**。① **codec**：`Codec` 的方法改成**不带 `&self` 的关联函数**（实现无状态，`codec::Default` 是类型而不是值），于是宏与业务代码可以照文档直接写 `Default::decode(&payload)`；`postcard` 用 `to_extend` + 自定义 `Extend<u8>` 适配器直接写进 `BufMut`，不再摊一次临时 `Vec`；编码失败与解码失败都落 `InvalidInput`（线上 `4`），不因参数错断连。② **宏**：`#[photon::service(id = N)]` 要求 `id` 显式（自动编号会跨 crate 撞号），`blocking` 参数在 M2 直接报编译错误而不是生成半成品；方法级 `#[photon(...)]`、同步 `fn`、非 `&self` 接收者、非 `Result` 返回、参数写成模式解构，全部在展开期报错。③ **`async fn` 与 `Send` 的死结**：trait 里的原生 `async fn` 不保证 future 是 `Send`，而 dispatch 的 `BoxFuture` 要求 `Send`——宏把签名改写成 `fn(...) -> impl Future<Output = R> + Send + '_`（RPITIT），实现侧照旧写 `async fn`，`Send` 由编译器逐 impl 验证。④ **dispatch 只能落在本地类型上**：`impl<S: Calc> Service for S` 在用户 crate 里过不了孤儿规则（`Service` 来自 photon，`S` 是裸类型参数，`E0210`），所以生成 `CalcService<S>` 包一层 `Arc<S>` 再实现 `Service`；副作用是**同一实现类型可以同时实现多个服务 trait**，v0.9 的「一类型一服务」限制随之消失。⑤ **`SERVICE_ID` 只放在能被命名的地方**：trait 里带默认值的关联常量无法写成 `Calc::SERVICE_ID`（`E0790`），因此只在 `CalcClient::SERVICE_ID` 与 `mod __photon_calc::SERVICE_ID` 暴露，两处都取同一个字面量。⑥ **验收**：`tests/service_macro.rs` 8 条（dispatch 往返、用户码 `0x10001` 透传、未知方法 `Remote{3}`、截断 payload → `InvalidInput`、注册与撞号、方法名表与 golden 哈希）；`tests/compile-fail/` 3 条（同步 `fn`、缺 `id`、`blocking` 参数）用 `trybuild` 冻结报错文本；`photon-macros` 3 条（`xxh3("add")` 冻结向量、命名敏感性、snake_case）。全量 39 + 9 + 8 + 1 + 16 + 21 + 3 全绿，`fmt --check` 与 `clippy --all-targets --features local` 干净。**同步改动**：`detail/02`（§6 trait 签名改为无 `self`、§9 模块表把 codec 移到 `src/codec.rs`）、`detail/04`（§4 产物表改为 `CalcService<S>` 并补孤儿规则与 `Send` 改写两段、§5 dispatch 样例对齐实现、§9 编译期检查补两行）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
 | **v0.15** | **`local` 落地 + drop 契约改判**。① 产出 `transport/local.rs`：Unix 上手搓 `tokio::net::UnixStream`（零新依赖，约 240 行含测试），`OwnedWriteHalf::drop` 免费拿到 `SHUT_WR`；`Endpoint::Local(LocalAddr)` + `local` feature（不进默认集）；Windows 开启该 feature 直接 `compile_error!`（named pipe 无半关闭、server 需 per-connection 新建，没有测试环境不写）。② **把 2.1 的 drop 契约从「必须尽力半关闭写方向（验收项）」改判为「drop 后本端不再写」**，对端能否观测 EOF 降级为**实现能力**，正确性改由 `GoAway` + `close_timeout` 兜底——原写法需要给 named pipe 开例外条款，而需要例外才成立的契约不是契约。③ `tests/transport.rs` 的 `Harness` 增加 `const PEER_SEES_EOF: bool` 能力位，EOF 用例改为「按声明断言」，同一份用例体覆盖 3 个实现（21 条）。④ 顺带修一处测试自身的缺陷：`limit_knob` 先写 500 KiB 再读，在 UDS 缓冲区上会自堵（tcp 的缓冲够大所以没暴露），改为 `join!` 并发推进。 |
 
 ---
@@ -159,11 +161,11 @@ photon/                          # workspace 根
 │   │   ├── proto/
 │   │   │   ├── header.rs        # 24 字节语义头 + 手工编解码
 │   │   │   ├── error_body.rs    # 错误体 8B 前缀 + code 表（见 3.8）
-│   │   │   ├── handshake.rs     # Handshake 12B 编解码；GoAway / Cancel 的 payload 恒空
-│   │   │   ├── codec.rs         # Codec trait（含 const ID）+ codec::Default 别名
-│   │   │   └── codec/
-│   │   │       ├── postcard.rs  # 默认实现，ID = 0
-│   │   │       └── rkyv.rs      # feature = "codec-rkyv"，M5，ID = 1
+│   │   │   └── handshake.rs     # Handshake 12B 编解码；GoAway / Cancel 的 payload 恒空
+│   │   ├── codec.rs             # Codec trait（含 const ID）+ codec::Default 别名（L2 的能力，独立于 proto）
+│   │   ├── codec/
+│   │   │   ├── postcard.rs      # 默认实现，ID = 0
+│   │   │   └── rkyv.rs          # feature = "codec-rkyv"，M5，ID = 1
 │   │   ├── session.rs           # L3 入口：Session（pending map + 读写任务 + Closing 状态）
 │   │   ├── session/
 │   │   │   ├── client.rs        # 异步客户端
@@ -180,6 +182,8 @@ photon/                          # workspace 根
 │   ├── tests/                   # 跨 transport 的一致性测试
 │   │   ├── transport.rs         # M0：不依赖 Session，直接测 L1 收发与帧边界
 │   │   ├── protocol.rs          # M0：24B 头 + 逐 kind 校验 + 帧长上限 + §8 逐字节样例
+│   │   ├── service_macro.rs     # M2：宏展开产物的行为验收（dispatch / 错误码 / 注册）
+│   │   ├── compile-fail/        # M2：trybuild 冻结的编译期拒绝用例
 │   │   ├── roundtrip.rs         # M1+
 │   │   ├── concurrency.rs       # M1+
 │   │   └── shutdown.rs          # M3：两个方向的 GoAway、JoinHandle 必须结束
@@ -1356,15 +1360,15 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 
 ### M2 — 类型安全 API（2–3 天，最小集）
 
-- [ ] `photon-macros`：`#[photon::service(id = N)]`（独立 crate，`id` 必填，见 5.2）
-- [ ] 生成 client stub + `match` dispatch
-- [ ] method 哈希（**只哈希方法名**）碰撞与重复检测 + **方法名表** + golden 哨兵测试
-- [ ] **`Service::call` 用 `self: Arc<Self>` 接收者**（为 `spawn_blocking` 预留，见 5.1；用 `&self` 后面要返工）
-- [ ] `ServiceRegistry` 按 `service_id` 路由（表先静态构建，结构留动态；撞号注册报错）
+- [x] `photon-macros`：`#[photon::service(id = N)]`（独立 crate，`id` 必填，见 5.2）——v0.17 落地
+- [x] 生成 client stub + `match` dispatch——v0.17 落地（`CalcClient` / `CalcService<S>` / `register_calc`）
+- [x] method 哈希（**只哈希方法名**）碰撞与重复检测 + **方法名表** + golden 哨兵测试——v0.17 落地（`xxh3("add") = 0xffb352e13fd28e80`）
+- [x] **`Service::call` 用 `self: Arc<Self>` 接收者**（为 `spawn_blocking` 预留，见 5.1；用 `&self` 后面要返工）
+- [x] `ServiceRegistry` 按 `service_id` 路由（表先静态构建，结构留动态；撞号注册报错）
 - [x] **错误体提前落地**（3.8 的 `code` 表 + `RpcError::Remote`）——M1 已随 `proto/error_body.rs` 完成：只有把 `2` / `3` / `4` 这几个码做出来，M2 的「未知服务 / 未知方法 / 参数解码失败」才有可观测结果，否则只能都拍成 `Internal`，验收没法写
 - [ ] 示例组 `local_calc` / `calc_server` / `calc_client`，覆盖 10.3 的**第 1、2、5 三种形态**
 - [ ] `tests/concurrency.rs`：同一套测试在 `tcp` 与 `memory` 上全绿
-- [ ] 本阶段**只支持 `async fn` 声明**；`fn` 与 `#[photon(blocking)]` 放到 M3（见 5.2）
+- [x] 本阶段**只支持 `async fn` 声明**；`fn` 与 `#[photon(blocking)]` 放到 M3（见 5.2）——v0.17 由宏在展开期强制
 
 **验收**：两进程跑通；改方法签名后编译失败提示清晰。**注意 M2 不包含 Notification / 超时 / GoAway / 同步 handler**——v0.6 把 10.3 的七种形态全压给 M2，而 M2 又只支持 `async fn`，按现文根本不可能通过（v0.7 拆分）。
 

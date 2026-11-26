@@ -1,0 +1,7 @@
+error: `blocking` 参数要生成的同步客户端属于 M3：它需要自建 runtime + 内外两层超时，现在生成出来只是一段没人验证过的代码
+ --> tests/compile-fail/blocking_service.rs:5:1
+  |
+5 | #[photon::service(id = 7, blocking)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `photon::service` (in Nightly builds, run with -Z macro-backtrace for more info)

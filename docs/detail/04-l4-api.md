@@ -86,13 +86,24 @@ pub trait Service: Send + Sync + 'static {
 
 | 产物 | 形状 | 说明 |
 |---|---|---|
-| `CalcClient` | 持 `SessionHandle`，三个方法全是 `async fn` | 线上永远异步，与声明形态无关 |
-| `impl Service for Calc` | `fn call(self: Arc<Self>, method, payload)`，内部 `match method` | 三分支，`Box::pin`，见第 5 节 |
-| `register_calc(registry, svc)` | 用 `photon::service` 的 `7` 占号 | 与 stub 共用同一个 `id` 字面量，一处写两处用 |
-| `CalcClient::SERVICE_ID` / `Calc::SERVICE_ID` | `const u16` | 排障与日志用 |
+| `CalcClient<T>` | 持 `SessionHandle<T::Source, T::Sink>`，方法全是 `async fn` | 线上永远异步，与声明形态无关 |
+| `CalcService<S>` | 包一层 `Arc<S>`，`impl Service`，内部 `match method` | 见下方「为什么是包装类型而不是 blanket impl」，v0.17 修 |
+| `register_calc(registry, svc)` | 用 `Calc` 上的 `id` 占号，内部 `CalcService::new(svc)` | 与 stub 共用同一个 `id` 字面量，一处写两处用 |
+| `CalcClient::SERVICE_ID` / `mod __photon_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
 | `mod __photon_calc` 内的 `METHOD_NAMES` | `&[(u64, &'static str)]` | span / `UnknownMethod` 日志 / panic 报告 |
 | `mod __photon_calc` 内的 `HASH_<METHOD>` 常量 | `const u64` | 编译期哈希值，`match` 的键 |
 | `BlockingCalcClient` | 持自建或共享的 runtime + `SessionHandle`，方法全是 `fn` | 仅 `blocking` 参数 + feature 同时成立时生成 |
+
+**为什么是包装类型 `CalcService<S>` 而不是 blanket impl（v0.17 修）**。v0.9–v0.16 一直写的是 `impl<S: Calc + Send + Sync + 'static> Service for S`，看着最省事（`Arc::new(my_calc)` 直接进注册表）。实际写出来在**用户 crate 里必然编译失败**：`Service` 来自 photon、`S` 是裸类型参数，展开代码属于下游 crate，孤儿规则不允许「外部 trait + 裸参数」（`E0210`）。只有两种出路：把 `Service` 改成 phantom 参数（等于让 L3 认不出服务），或者包一层本地类型。后者多一层指针解引用与一次 `Arc::clone`，代价可以忽略，收益是**同一实现类型可以同时实现多个服务 trait**——v0.9 里「一个类型只能属于一个服务」的限制不再存在。`register_calc(registry, svc)` 的签名保持不变，包装发生在宏内部。
+
+**`async fn` 必须改写成带 `Send` 的 RPITIT（v0.17 修）**。trait 里的原生 `async fn` 只保证「返回一个 future」，**不保证它是 `Send`**；而 dispatch 要交出 `BoxFuture`（内含 `+ Send`），于是 `Box::pin(async move { … svc.add(a, b).await … })` 直接报「future cannot be sent between threads safely」。宏因此把 trait 方法的签名改写成：
+
+```rust
+fn add(&self, a: i64, b: i64) -> impl ::std::future::Future<Output = Result<i64, RpcError>>
+    + ::std::marker::Send + '_;
+```
+
+实现侧**照旧写 `async fn`**（编译器认这个形状），`Send` 由它逐 impl 验证：handler 里持有了一个 `!Send` 的东西（例如 `Rc`）会在用户自己的代码上编译失败，而不是等到运行期发现 task 起不来。这也是不用 `async-trait` 的唯一理由——`async-trait` 会把 future 装进 `Box`，与我们「不为每请求多买一次 alloc」的口径相反。
 
 **所有辅助项必须包进一个按服务命名的模块（v0.10 修）**。v0.9 的写法是在模块级直接生成 `METHOD_NAMES` / `HASH_ADD` / `SERVICE_ID` 这些固定名字——**同一个模块里写两个 `#[photon::service]` 就必然重名编译失败**，而「一个模块放几个服务」是完全正常的用法。规则：
 
@@ -114,18 +125,25 @@ mod __photon_calc {          // 模块名 = __photon_ + 服务名的小写 snake
 ## 5. dispatch 展开
 
 ```rust
-match method {
-    HASH_ADD  => Box::pin(async move { me.add(a, b).await }),
-    HASH_FAST => Box::pin(async move { me.fast_hash(data) }),
-    HASH_LOAD => Box::pin(async move {
-        let me = me.clone();
-        // decode 必须在闭包里：一次线程切换干两件事（反序列化 + 执行）
-        tokio::task::spawn_blocking(move || {
-            let path: PathBuf = Default::decode(&payload)?;
-            me.load(path)
-        }).await?
-    }),
-    _ => return Box::pin(async { Err(RpcError::Remote(RemoteError::new(3))) }), // UnknownMethod：回包侧构造，合法
+// `CalcService<S>` 的 call：整个 dispatch 只包一层 Box，分支里不再各自 Box::pin
+fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+    Box::pin(async move {
+        let me = Arc::clone(&self.inner);            // 内层 Arc<S>：本层不再分层
+        match method {
+            HASH_ADD => {
+                let (a, b): (i64, i64) = Default::decode(&payload)?;   // async / fn 分支在 call 开头解
+                let out = <S as Calc>::add(&*me, a, b).await?;
+                Default::encode(&out)
+            }
+            HASH_LOAD => {                                                    // M3：fn + blocking
+                tokio::task::spawn_blocking(move || {                         // decode 必须在闭包里
+                    let path: PathBuf = Default::decode(&payload)?;
+                    me.load(path)
+                }).await?
+            }
+            _ => Err(RpcError::Remote(RemoteError::new(3))),                  // UnknownMethod：回包侧构造，合法
+        }
+    })
 }
 ```
 
@@ -201,13 +219,15 @@ match method {
 | 检查 | 时机 | 报错要求 |
 |---|---|---|
 | `id` 缺失 / 不是 `u16` 字面量 | 展开 | 指出「必须写 `id = N`」，并给一行正确写法 |
+| 方法不是 `async fn`（M2）/ 服务带 `blocking` 参数（M2） | 展开 | 直接说「留到 M3」，并指明该写什么；**不许降级成同步 stub**（v0.17 起由 `tests/compile-fail/` 冻结文本） |
+| 接收者不是 `&self`、返回不是 `Result`、参数是模式解构 | 展开 | 定位到具体方法，说明展开需要「简单标识符参数 + `Result` 返回」 |
 | 方法名重复或哈希相撞 | 展开 | 常量断言式检查；报出两个方法名 |
 | `async fn` + `blocking` | 展开 | 「同步方法才需要 `blocking`」 |
 | `async fn` + `zero_copy` | 展开 | 「`zero_copy` 只对 `fn` 开放」 |
 | 注册撞号 | 运行期（注册时） | `Err`，**不覆盖**已有服务 |
 | 改方法签名 | 编译期 | 在用户侧编译失败，错误信息必须定位到具体方法 |
 
-测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。
+测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。v0.17 已落地三条：同步 `fn`、缺 `id`、`blocking` 参数；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。
 
 ---
 

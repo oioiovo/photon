@@ -26,6 +26,26 @@ pub struct RemoteError {
     pub message: String,
 }
 
+impl RemoteError {
+    /// 回包侧主动构造 `Remote` 的唯一入口，只给三个码用：`2` UnknownService、
+    /// `3` UnknownMethod、`7` ShuttingDown。
+    ///
+    /// 发起侧不许用它——那边只能从错误体解出 `Remote`，自己造等于凭空伪造
+    /// 对端状态。
+    pub fn new(code: u32) -> Self {
+        Self {
+            code,
+            retryable: false,
+            message: match code {
+                2 => "unknown service".into(),
+                3 => "unknown method".into(),
+                7 => "shutting down".into(),
+                other => format!("remote error {other}"),
+            },
+        }
+    }
+}
+
 /// RPC 调用或协议处理中可能出现的全部错误。
 #[derive(Debug, Error)]
 #[non_exhaustive]

@@ -1,22 +1,27 @@
 //! photon —— 轻量 RPC/IPC 框架。
 //!
 //! 分层自下而上：L1 传输 → L2 协议（24 字节头）→ L3 会话 → L4 API。
-//! 每层只依赖下一层：L2 不认识 `Transport`，L3 不认识字节序。当前处于 M0，
-//! 只有 L2 可用。
+//! 每层只依赖下一层：L2 不认识 `Transport`，L3 不认识字节序。
+//!
+//! 当前 L1/L2/L3 可用（M1 完成），L4 的 `#[photon::service]` 已落地（M2 进行中：
+//! 只有 `async fn` 形态，同步 handler 与同步客户端留到 M3）。
 
+pub mod codec;
 pub mod error;
 pub mod proto;
 pub mod session;
 pub mod transport;
 
+/// 宏展开里要用 `::photon::Bytes`，所以这里必须公开重导出。
+pub use bytes::Bytes;
+pub use codec::Codec;
 pub use error::{RemoteError, RpcError};
+pub use photon_macros::service;
 pub use session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use bytes::Bytes;
 
 /// 装箱后的 `Send` future。
 ///
