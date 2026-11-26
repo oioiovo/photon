@@ -1405,12 +1405,12 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 
 ### M0 — 传输与消息帧（1–1.5 天）
 
-- [ ] **`MessageSource` / `MessageSink` / `Transport` trait（消息导向形状）**
-- [ ] `transport/framing.rs`：长度前缀 + 读满 + 上限校验
-- [ ] `Tcp` 实现
-- [ ] `proto/header.rs`：**24 字节**语义头的手工 `encode` / `decode` + 逐 kind 字段校验（属 L2，但 M0 一并做掉，否则无法验证端到端）
-- [ ] **`memory` 变体（进程内 channel）**——用它验证消息导向接口能不能真的塞进零拷贝
-- [ ] `examples/echo.rs` 可 `cargo run --example echo` 直接跑通（见 10.4）
+- [x] **`MessageSource` / `MessageSink` / `Transport` trait（消息导向形状）**——v0.13 落地（`bind` 改为异步）
+- [x] `transport/framing.rs`：长度前缀 + 读满 + 上限校验——v0.13 落地（`FramedSource` / `FramedSink`）
+- [x] `Tcp` 实现——`eb4d817` 落地（`bind` / `connect` / `accept` 三入口）
+- [x] `proto/header.rs`：**24 字节**语义头的手工 `encode` / `decode` + 逐 kind 字段校验（属 L2，但 M0 一并做掉，否则无法验证端到端）——`2e3f97a` 落地（含 9 条协议用例）
+- [x] **`memory` 变体（进程内 channel）**——`c7280f4` 落地（不实现 `Transport`，`pair()` 无参）
+- [x] `examples/echo.rs` 可 `cargo run --example echo` 直接跑通（见 10.4）——`75064a5` 落地
 
 **验收**：`Tcp` 与 `memory` 两个实现共用**同一套传输层测试**（`tests/transport.rs`，不依赖 `Session`——M1 才引入），一行不改。这一步过了，说明 L1 抽象成立；如果 `memory` 塞不进去，现在返工代价为零。
 
