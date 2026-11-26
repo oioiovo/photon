@@ -294,3 +294,137 @@ async fn client_deadline_reaches_header() {
         started.elapsed()
     );
 }
+
+// ---- 业务错误映射：`#[photon(service(id = N, error = E))]` ----
+
+#[derive(Debug)]
+enum BizError {
+    /// 用户码段的业务错误（`code >= 0x1_0000`）。
+    Code(u32, String),
+    /// 框架本地/远端错误，原样兜住，不当业务错误解释。
+    Transport(RpcError),
+}
+
+impl photon::ServiceError for BizError {
+    fn into_error(self) -> RpcError {
+        match self {
+            BizError::Code(code, message) => RpcError::Remote(RemoteError {
+                code,
+                retryable: false,
+                message,
+            }),
+            BizError::Transport(err) => err,
+        }
+    }
+
+    fn from_error(err: RpcError) -> Self {
+        match err {
+            RpcError::Remote(remote) if remote.code >= photon::BUSINESS_CODE_MIN => {
+                BizError::Code(remote.code, remote.message)
+            }
+            other => BizError::Transport(other),
+        }
+    }
+}
+
+#[photon::service(id = 11, error = BizError)]
+trait Ledger {
+    async fn withdraw(&self, amount: i64) -> Result<i64, BizError>;
+}
+
+struct LedgerImpl;
+
+impl Ledger for LedgerImpl {
+    async fn withdraw(&self, amount: i64) -> Result<i64, BizError> {
+        if amount > 100 {
+            return Err(BizError::Code(0x2_0001, "insufficient funds".into()));
+        }
+        Ok(amount)
+    }
+}
+
+#[tokio::test]
+async fn business_error_is_remote_user_code() {
+    let service = Arc::new(LedgerService::new(Arc::new(LedgerImpl)));
+    let payload = photon::codec::Default::encode(&(200i64,)).expect("编码参数");
+
+    // 回包侧：业务错误必须已经是 `Remote{ code >= 0x1_0000 }`，否则 debug 会炸。
+    let err = Service::call(service, __photon_ledger::HASH_WITHDRAW, payload)
+        .await
+        .expect_err("必须失败");
+    match err {
+        RpcError::Remote(remote) => {
+            assert_eq!(remote.code, 0x2_0001);
+            assert_eq!(remote.message, "insufficient funds");
+        }
+        other => panic!("期望 Remote，实际 {other:?}"),
+    }
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn business_error_roundtrips_through_session() {
+    use photon::{Session, SessionOptions, transport::memory::Memory};
+
+    let (client_halves, server_halves) = Memory::pair();
+    let mut registry = ServiceRegistry::empty();
+    register_ledger(&mut registry, Arc::new(LedgerImpl)).expect("注册");
+
+    let (_server, _) = Session::new(
+        server_halves.0,
+        server_halves.1,
+        Arc::new(registry),
+        SessionOptions::default(),
+    )
+    .expect("建服务端会话");
+    let (client_session, handle) = Session::new(
+        client_halves.0,
+        client_halves.1,
+        Arc::new(ServiceRegistry::empty()),
+        SessionOptions::default(),
+    )
+    .expect("建客户端会话");
+    client_session.wait_ready().await.expect("握手");
+
+    let client = LedgerClient::new(handle.clone());
+    assert!(matches!(client.withdraw(50).await, Ok(50)));
+    match client.withdraw(200).await {
+        Err(BizError::Code(0x2_0001, message)) => assert_eq!(message, "insufficient funds"),
+        other => panic!("期望业务错误码 0x2_0001，实际 {other:?}"),
+    }
+
+    // 本端错误也要经 `from_error` 收敛，而不是把 `RpcError` 泄给调用方。
+    client.handle().close().await.expect("关闭");
+    match client.withdraw(50).await {
+        Err(BizError::Transport(RpcError::Closed)) => {}
+        other => panic!("期望 Closed 被收敛成 Transport(Closed)，实际 {other:?}"),
+    }
+}
+
+/// 把业务错误写成框架保留段（`3` = UnknownMethod）必须立刻炸，而不是让客户端
+/// 把「余额不足」当成「方法不存在」。
+#[tokio::test]
+async fn business_error_below_user_segment_panics_in_debug() {
+    #[photon::service(id = 12, error = BizError)]
+    trait Broken {
+        async fn bad(&self) -> Result<(), BizError>;
+    }
+
+    struct BrokenImpl;
+    impl Broken for BrokenImpl {
+        async fn bad(&self) -> Result<(), BizError> {
+            // 故意用框架码段。
+            Err(BizError::Code(3, "should be 0x1_0000+".into()))
+        }
+    }
+
+    let service = Arc::new(BrokenService::new(Arc::new(BrokenImpl)));
+    let payload = photon::codec::Default::encode(&()).expect("编码参数");
+    // 断言在 poll 里炸，抓 `JoinError` 即可——不用把整个 runtime 拆出来。
+    let handle = tokio::spawn(Service::call(service, __photon_broken::HASH_BAD, payload));
+    let joined = handle.await;
+    assert!(
+        joined.expect_err("必须 panic").is_panic(),
+        "code 3 必须触发 debug 断言"
+    );
+}

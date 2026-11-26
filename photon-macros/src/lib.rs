@@ -22,12 +22,15 @@ use syn::{
 struct ServiceArgs {
     id: u16,
     blocking: bool,
+    /// `error = MyError`：业务错误类型；`None` 表示方法直接返回 `RpcError`。
+    error: Option<Type>,
 }
 
 impl syn::parse::Parse for ServiceArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut id = None;
         let mut blocking = false;
+        let mut error = None;
 
         for meta in Punctuated::<Meta, Token![,]>::parse_terminated(input)? {
             match &meta {
@@ -43,10 +46,24 @@ impl syn::parse::Parse for ServiceArgs {
                     }
                 },
                 Meta::Path(path) if path.is_ident("blocking") => blocking = true,
+                Meta::NameValue(nv) if nv.path.is_ident("error") => match &nv.value {
+                    Expr::Path(expr) => {
+                        error = Some(Type::Path(syn::TypePath {
+                            qself: None,
+                            path: expr.path.clone(),
+                        }))
+                    }
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "`error` 必须是类型路径，例如 `error = CalcError`",
+                        ));
+                    }
+                },
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "`#[photon::service(...)]` 只接受 `id = N` 与 `blocking`",
+                        "`#[photon::service(...)]` 只接受 `id = N`、`blocking` 与 `error = Type`",
                     ));
                 }
             }
@@ -60,7 +77,11 @@ impl syn::parse::Parse for ServiceArgs {
             )
         })?;
 
-        Ok(Self { id, blocking })
+        Ok(Self {
+            id,
+            blocking,
+            error,
+        })
     }
 }
 
@@ -88,7 +109,7 @@ struct Method {
     kind: MethodKind,
     /// 参数名（dispatch 里要按名字传给用户方法）与类型（decode 的目标）。
     args: Vec<(syn::Ident, Type)>,
-    /// `Result<T, RpcError>` 里的 `T`。
+    /// `Result<T, E>` 里的 `T`。
     ok_ty: Type,
 }
 
@@ -111,7 +132,7 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    let methods = match collect_methods(&service) {
+    let methods = match collect_methods(&service, args.error.as_ref()) {
         Ok(methods) => methods,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -167,6 +188,18 @@ fn expand(
         let arg_types: Vec<_> = m.args.iter().map(|(_, ty)| ty).collect();
         let hash = hash_ident(name);
         let ok_ty = &m.ok_ty;
+        // 声明了 `error = E` 时，线上/本地的 `RpcError` 都要还原成业务错误类型。
+        let unwrap = match &args.error {
+            Some(err_ty) => {
+                quote! { .map_err(|e: ::photon::RpcError| <#err_ty as ::photon::ServiceError>::from_error(e)) }
+            }
+            None => quote! {},
+        };
+        // 返回错误类型跟着服务级声明走：写了 `error = E`，stub 交出的就是 `E`。
+        let ret_err = match &args.error {
+            Some(err_ty) => quote! { #err_ty },
+            None => quote! { ::photon::RpcError },
+        };
         let packed = if arg_types.is_empty() {
             quote! { &() }
         } else {
@@ -175,14 +208,16 @@ fn expand(
         quote! {
             /// 发一次请求；期限取客户端上的 `deadline_ms`（默认 0 = 不设期限）。
             pub async fn #name(&self, #(#params),*)
-                -> ::std::result::Result<#ok_ty, ::photon::RpcError>
+                -> ::std::result::Result<#ok_ty, #ret_err>
             {
-                let payload = <::photon::codec::Default as ::photon::Codec>::encode(#packed)?;
+                let payload =
+                    <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
                 let reply = self
                     .handle
                     .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms)
-                    .await?;
-                <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply)
+                    .await
+                    #unwrap?;
+                <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
             }
         }
     });
@@ -201,17 +236,29 @@ fn expand(
             }
         };
         let call = quote! { <S as #svc>::#name(&*me, #(#arg_names),*) };
+        // 业务错误在进入 `Response` 之前就换成 `RpcError`，断言放在这里：
+        // 它是唯一知道「这个 error 来自用户 handler」的位置。
+        let wrap = match &args.error {
+            Some(err_ty) => quote! {
+                .map_err(|e| {
+                    let err = <#err_ty as ::photon::ServiceError>::into_error(e);
+                    ::photon::error::assert_business_error(&err);
+                    err
+                })
+            },
+            None => quote! {},
+        };
         let body = match m.kind {
             MethodKind::Async => quote! {
                 #decode
-                let out = #call.await?;
+                let out = #call.await #wrap?;
                 <::photon::codec::Default as ::photon::Codec>::encode(&out)
             },
             // 同步 `fn` 就地执行：它承诺的是「服务端同步完成」，所以包成 async 块
             // 之后首 poll 就跑完，不换线程、也不产生额外的调度点。
             MethodKind::Sync => quote! {
                 #decode
-                let out = #call?;
+                let out = #call #wrap?;
                 <::photon::codec::Default as ::photon::Codec>::encode(&out)
             },
             // 唯一换线程的分支。decode 也搬进闭包：它同样是 CPU 工作，放在 worker 上
@@ -220,7 +267,7 @@ fn expand(
                 let me = ::std::sync::Arc::clone(&me);
                 ::tokio::task::spawn_blocking(move || {
                     #decode
-                    let out = #call?;
+                    let out = #call #wrap?;
                     <::photon::codec::Default as ::photon::Codec>::encode(&out)
                 })
                 .await
@@ -429,7 +476,7 @@ fn rewrite_sigs(service: &mut ItemTrait) {
     }
 }
 
-fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
+fn collect_methods(service: &ItemTrait, declared_error: Option<&Type>) -> syn::Result<Vec<Method>> {
     let mut methods: Vec<Method> = Vec::new();
 
     for item in &service.items {
@@ -510,7 +557,8 @@ fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
             args.push((pat_ident.ident.clone(), (*pat_ty.ty).clone()));
         }
 
-        let ok_ty = result_ok_type(&sig.output)?;
+        let (ok_ty, err_ty) = result_types(&sig.output)?;
+        check_error_type(&err_ty, declared_error, sig)?;
 
         let hash = method_hash(&sig.ident.to_string());
         if let Some(dup) = methods.iter().find(|m| m.hash == hash) {
@@ -542,8 +590,8 @@ fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
     Ok(methods)
 }
 
-/// 从 `-> Result<T, RpcError>` 里取 `T`。
-fn result_ok_type(output: &ReturnType) -> syn::Result<Type> {
+/// 从 `-> Result<T, E>` 里取 `(T, E)`。
+fn result_types(output: &ReturnType) -> syn::Result<(Type, Type)> {
     let ReturnType::Type(_, ty) = output else {
         return Err(syn::Error::new_spanned(
             output,
@@ -571,13 +619,58 @@ fn result_ok_type(output: &ReturnType) -> syn::Result<Type> {
     let PathArguments::AngleBracketed(generics) = &last.arguments else {
         return Err(syn::Error::new_spanned(ty, "`Result` 上必须写出类型参数"));
     };
-    match generics.args.first() {
-        Some(GenericArgument::Type(ok_ty)) => Ok(ok_ty.clone()),
-        _ => Err(syn::Error::new_spanned(
+    let Some(GenericArgument::Type(ok_ty)) = generics.args.first() else {
+        return Err(syn::Error::new_spanned(
             ty,
             "`Result` 的第一个参数必须是成功类型",
-        )),
+        ));
+    };
+    let Some(GenericArgument::Type(err_ty)) = generics.args.iter().nth(1) else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`Result` 必须写出第二个参数（错误类型）",
+        ));
+    };
+    Ok((ok_ty.clone(), err_ty.clone()))
+}
+
+/// 方法返回的错误类型必须与服务级声明一致。
+///
+/// 没写 `error = ...` 时要求 `RpcError`：否则 handler 的 `?` 会把一个框架不认识的
+/// 类型扔给 dispatch，报错发生在展开产物里，用户看到的是「某某 trait 没实现」。
+fn check_error_type(
+    err_ty: &Type,
+    declared: Option<&Type>,
+    sig: &syn::Signature,
+) -> syn::Result<()> {
+    let normalize = |ty: &Type| {
+        let tokens = quote!(#ty).to_string();
+        tokens.replace(' ', "")
+    };
+    let last_ident = |ty: &Type| match ty {
+        Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        _ => None,
+    };
+
+    match declared {
+        Some(declared) => {
+            if normalize(err_ty) != normalize(declared) {
+                return Err(syn::Error::new_spanned(
+                    sig,
+                    "方法返回的错误类型必须与服务级 `error = ...` 一致",
+                ));
+            }
+        }
+        None => {
+            if last_ident(err_ty).as_deref() != Some("RpcError") {
+                return Err(syn::Error::new_spanned(
+                    sig,
+                    "未声明 `error = Type` 时，handler 必须返回 `Result<T, RpcError>`",
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 fn hash_ident(name: &syn::Ident) -> syn::Ident {

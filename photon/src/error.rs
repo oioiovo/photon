@@ -9,6 +9,24 @@
 
 use thiserror::Error;
 
+/// 用户业务码的起点：`code >= 这段` 由用户定义语义，框架不解释。
+///
+/// 低于这段是框架保留段（见各码的表）；业务错误写成 `3` 会被客户端当成
+/// 「方法不存在」，所以 `ServiceError::into_error` 在 debug 构建里断言这条边界。
+pub const BUSINESS_CODE_MIN: u32 = 0x1_0000;
+
+/// 业务错误的 debug 断言：`into_error` 的结果必须是用户码段的 `Remote`。
+///
+/// 生成的 dispatch 在每个 handler 之后调它。release 下整个调用被编译掉，
+/// 它存在的意义是让「把业务错误写成 code 5」在第一次跑测试时就炸，而不是等
+/// 客户端把超时错认成业务错误。
+pub fn assert_business_error(err: &RpcError) {
+    debug_assert!(
+        matches!(err, RpcError::Remote(remote) if remote.code >= BUSINESS_CODE_MIN),
+        "业务错误必须映射为 `Remote {{ code >= 0x1_0000 }}`，实际是 {err:?}"
+    );
+}
+
 /// 对端返回的错误，唯一「对端陈述它自己状态」的变体。
 ///
 /// `code` 的保留段由框架定义，8..0xFFFF 原样透传，≥ 0x1_0000 由用户定义、

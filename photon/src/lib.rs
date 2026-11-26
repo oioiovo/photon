@@ -16,7 +16,7 @@ pub mod transport;
 /// 宏展开里要用 `::photon::Bytes`，所以这里必须公开重导出。
 pub use bytes::Bytes;
 pub use codec::Codec;
-pub use error::{RemoteError, RpcError};
+pub use error::{BUSINESS_CODE_MIN, RemoteError, RpcError};
 pub use photon_macros::service;
 pub use session::{
     ConnectOptions, Server, ServiceRegistry, Session, SessionHandle, SessionOptions,
@@ -45,6 +45,30 @@ pub enum Schedule {
     Async,
     /// 占一个 blocking-pool 额度，在 `spawn_blocking` 线程上执行。
     Blocking,
+}
+
+/// 业务错误与线上错误体之间的双向映射。
+///
+/// `#[photon::service(id = N, error = MyError)]` 之后，方法返回 `Result<T, MyError>`，
+/// 生成代码在每个 handler 上调用 [`ServiceError::into_error`]、在每个客户端方法上
+/// 调用 [`ServiceError::from_error`]。只要求一个 impl、两个方向，而不是两个 `From`
+/// 实现——`From` 的方向依赖孤儿规则，用户一旦要把 `RpcError` 往自己的错误类型里塞，
+/// 靠 `impl From<RpcError> for MyError` 才行，而反方向又得 `impl From<MyError> for
+/// RpcError`，两处分散、容易只写一半。
+///
+/// 契约只有一句：**`into_error` 必须返回 `RpcError::Remote`，`code ≥ 0x1_0000`**。
+/// 低于这段是框架保留段（`2` UnknownService、`3` UnknownMethod、`7` ShuttingDown
+/// 等），业务错误占了它，客户端看到的就是「方法不存在」这种假象。debug 构建里
+/// 框架会断言这一点（release 下 `debug_assert` 编译掉，不留分支）。
+pub trait ServiceError: Sized {
+    /// 回包侧：把业务错误变成要上线路的 `RpcError`。
+    fn into_error(self) -> RpcError;
+
+    /// 发起侧：把本地或远端错误还原成业务错误类型。
+    ///
+    /// 收到的可能是 `Remote`（业务错误或框架码），也可能是本端的 `Timeout` /
+    /// `Closed` / `Io` 等——实现方通常把后者收敛成一个「未分类失败」变体。
+    fn from_error(err: RpcError) -> Self;
 }
 
 /// 被暴露为 RPC 服务的对象。

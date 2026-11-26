@@ -404,6 +404,7 @@ struct ClosingState {
 | 对端按 `Cancel` 中止 | `Remote { code: 5 }` | 否 | 回包侧 `to_wire(Cancelled)` |
 | 对端自己判 deadline | `Remote { code: 6 }` | 否 | 回包侧 `to_wire(Timeout)` |
 | 双方宣告关闭后仍有 `Request` / 对端在优雅关闭 | `Remote { code: 7 }` | 否 | 回包侧 `send_error(.., 7, ..)` |
+| 用户业务错误（`code >= 0x1_0000`，v0.25） | `Remote { code: 0x…, message }` | 否 | handler 的 `ServiceError::into_error` 产出，`to_wire` 走 `Remote` 原码透传；debug 下断言码段 |
 
 铁律：**发起侧的本地变体永不因为「对端说了什么」而被构造**；`Remote{code:1}` 也不许在客户端被翻译成 `Overloaded`。回包侧把本地变体编成错误体是**允许的**（否则服务端根本没法表达「我忙」），这条方向区别见 `02-l2-protocol.md` 7.3。
 

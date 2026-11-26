@@ -178,6 +178,33 @@ fn schedule(&self, method: u64) -> Schedule {
 
 ---
 
+## 5.1 业务错误映射（v0.25）
+
+服务级写 `error = E` 之后，方法签名与两侧转换都由展开产物负责：
+
+```rust
+#[photon::service(id = 11, error = BizError)]
+trait Ledger { async fn withdraw(&self, amount: i64) -> Result<i64, BizError>; }
+
+// dispatch：handler 的 `E` 先换成 `RpcError` 再进 `Response`
+let out = <S as Ledger>::withdraw(&*me, amount).await.map_err(|e| {
+    let err = <BizError as ::photon::ServiceError>::into_error(e);
+    ::photon::error::assert_business_error(&err);   // debug：必须是 code >= 0x1_0000
+    err
+})?;
+
+// stub：`call` / `encode` / `decode` 三处都可能给出 `RpcError`，全部转回 `E`
+let payload = codec::encode(&(amount,)).map_err(BizError::from_error)?;
+let reply = handle.call(..).await.map_err(BizError::from_error)?;
+codec::decode(&reply).map_err(BizError::from_error)
+```
+
+三处 `from_error` 缺一不可：`encode` 失败（参数编码错）与 `decode` 失败（回包结构错）都是 `InvalidInput`，它们和 `Timeout` / `Closed` 一样必须落到业务错误类型里，否则调用方拿到的是一个 `E` 里夹着 `RpcError` 的缝合产物。
+
+**为什么是一个 trait 而不是两个 `From`**：`impl From<E> for RpcError` 与 `impl From<RpcError> for E` 分处两个方向，用户只写一半时，报错点是展开产物里的某个 `?`（「the trait `From<…>` is not implemented」），根本指不到「你少写了一个方向」。`ServiceError` 一个 impl 同时交代两侧，且 `from_error` 是普通函数——它逼着实现方显式决定「本端 `Timeout` 怎么收敛」，这个决定不该被 `From` 的默认语义糊过去。
+
+**debug 断言的必要性**：业务错误写成 `code 3` 会被客户端当成 `UnknownMethod`，`code 6` 会被当成 deadline——两种都是「看起来框架坏了」的假象，且只有在线日志里才能回溯。`assert_business_error` 在 `into_error` 之后立刻检查，release 下 `debug_assert!` 整体编译掉，不留分支。
+
 ## 6. 配额与线程池
 
 | 配额 | 谁消费 | 默认 | 说明 |
