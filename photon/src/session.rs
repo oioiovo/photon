@@ -27,7 +27,7 @@ use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Service,
+    Schedule, Service,
     error::{RemoteError, RpcError},
     proto::{
         Decoded, FLAG_ERR, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind, MAX_MESSAGE_LEN,
@@ -141,26 +141,66 @@ impl Drop for PendingEntry {
     }
 }
 
+/// 入站额度分两类：异步任务占 task，`#[photon(blocking)]` 方法占 blocking 线程。
+///
+/// 混用一个计数器会造出一种很难查的故障：一批慢的阻塞 handler 把额度吃满，
+/// 此时异步请求明明跑得动，却同样收到 `Overloaded`——过载信号失去意义。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Async,
+    Blocking,
+}
+
 /// 入站配额。与出站分开计数：双向会话里「我过载」和「对端过载」不是一回事。
 struct InboundQuota {
     async_used: usize,
+    blocking_used: usize,
+}
+
+impl InboundQuota {
+    /// 检查与计数在同一次持锁内完成。分成两次（先查后加）会让两个并发请求
+    /// 同时通过检查，然后再一起把计数推过上限。
+    fn try_acquire(&mut self, slot: Slot, opts: &SessionOptions) -> bool {
+        let (used, max) = match slot {
+            Slot::Async => (&mut self.async_used, opts.max_async_in_flight),
+            Slot::Blocking => (&mut self.blocking_used, opts.max_blocking_in_flight),
+        };
+        if *used >= max {
+            return false;
+        }
+        *used += 1;
+        true
+    }
+
+    fn release(&mut self, slot: Slot) {
+        let used = match slot {
+            Slot::Async => &mut self.async_used,
+            Slot::Blocking => &mut self.blocking_used,
+        };
+        *used = used.saturating_sub(1);
+    }
 }
 
 /// 持有一次入站 handler 的配额，drop 即归还，并同步减掉 handler 契约计数。
 struct InboundGuard {
     quota: Arc<Mutex<InboundQuota>>,
     handlers: Arc<AtomicUsize>,
+    slot: Slot,
 }
 
 impl Drop for InboundGuard {
     fn drop(&mut self) {
-        {
-            let mut quota = self.quota.lock();
-            quota.async_used = quota.async_used.saturating_sub(1);
-        }
+        self.quota.lock().release(self.slot);
         self.handlers.fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+/// debug 构建下慢 handler 的告警阈值。
+///
+/// 宏没法知道 handler 里会不会读文件，只能退一步在运行期量：超过这个数就说明
+/// 它不该待在 runtime worker 上，应当加 `#[photon(blocking)]`。
+#[cfg(debug_assertions)]
+const SLOW_HANDLER_WARN: Duration = Duration::from_micros(100);
 
 /// 一条会话。
 pub struct Session<S, K>
@@ -227,7 +267,10 @@ where
                 pending: HashMap::new(),
                 async_used: 0,
             })),
-            inbound: Arc::new(Mutex::new(InboundQuota { async_used: 0 })),
+            inbound: Arc::new(Mutex::new(InboundQuota {
+                async_used: 0,
+                blocking_used: 0,
+            })),
             handlers: Arc::new(AtomicUsize::new(0)),
             cancels: Arc::new(Mutex::new(HashMap::new())),
             registry,
@@ -579,23 +622,33 @@ where
         };
 
         // 先查服务再谈配额：服务不存在时「你过载了」是假话。
+        //
+        // 占哪类额度由 `Service::schedule` 决定——调度策略是展开期写死的属性，
+        // 但扣额度发生在「进 handler」之前，那时还看不到实现里的分支。
+        let slot = match svc.schedule(header.method) {
+            Schedule::Async => Slot::Async,
+            Schedule::Blocking => Slot::Blocking,
+        };
         let guard = {
             let mut quota = self.inbound.lock();
-            if quota.async_used >= self.opts.max_async_in_flight {
-                None
-            } else {
-                quota.async_used += 1;
+            if quota.try_acquire(slot, &self.opts) {
                 self.handlers.fetch_add(1, Ordering::AcqRel);
                 Some(InboundGuard {
                     quota: Arc::clone(&self.inbound),
                     handlers: Arc::clone(&self.handlers),
+                    slot,
                 })
+            } else {
+                None
             }
         };
 
         let Some(guard) = guard else {
-            self.send_error(header.request_id, 1, true, "overloaded")
-                .await?;
+            let message = match slot {
+                Slot::Async => "overloaded",
+                Slot::Blocking => "blocking pool overloaded",
+            };
+            self.send_error(header.request_id, 1, true, message).await?;
             return Ok(());
         };
 
@@ -607,6 +660,7 @@ where
         let cancels = Arc::clone(&self.cancels);
         let shutdown = self.shutdown.clone();
         let request_id = header.request_id;
+        let service_id = header.service_id;
         let method = header.method;
         let deadline_ms = header.deadline_ms;
 
@@ -626,6 +680,9 @@ where
                     }
                 };
 
+                #[cfg(debug_assertions)]
+                let started_at = std::time::Instant::now();
+
                 let outcome = tokio::select! {
                     biased;
                     _ = token.cancelled() => Err(RpcError::Remote(RemoteError {
@@ -637,6 +694,19 @@ where
                     _ = deadline => Err(RpcError::Timeout),
                     res = svc.call(method, payload) => res,
                 };
+
+                #[cfg(debug_assertions)]
+                {
+                    let elapsed = started_at.elapsed();
+                    if elapsed > SLOW_HANDLER_WARN {
+                        tracing::warn!(
+                            service_id,
+                            method,
+                            ?elapsed,
+                            "handler 超过 100µs 仍占用 runtime worker，考虑加 #[photon(blocking)]"
+                        );
+                    }
+                }
 
                 let frame = match outcome {
                     Ok(body) => response_frame(request_id, body, false),
@@ -659,8 +729,12 @@ where
             if let Err(join) = inner.await
                 && join.is_panic()
             {
+                let text = panic_text(join);
+                // 只回包不记日志，就变成「客户端收到 code 0，服务端日志一片安静」，
+                // 排障时根本看不出是 handler 崩了。
+                tracing::error!(service_id, method, request_id, %text, "handler panic");
                 // guard 已在 unwind 里 drop，这里只剩「回包 + 摘 token」。
-                let body = error_body::encode(0, false, &panic_text(join));
+                let body = error_body::encode(0, false, &text);
                 let _ = outer_tx.send(response_frame(request_id, body, true)).await;
                 outer_cancels.lock().remove(&request_id);
             }

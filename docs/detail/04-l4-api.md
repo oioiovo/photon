@@ -52,7 +52,7 @@ pub trait Service: Send + Sync + 'static {
 | 参数 | 是否必填 | 类型 | 规则 |
 |---|---|---|---|
 | `id` | **必填** | `u16` | 显式分配，不自动编号；`0` 允许但建议避开 |
-| `blocking` | 可选 | 标志 | 生成 `BlockingXxxClient`；还需 crate 开 `blocking` feature |
+| `blocking` | 可选 | 标志 | 生成 `BlockingXxxClient`；还需 crate 开 `blocking` feature。**尚未实现**（v0.19：宏遇到它直接报错，指引用方法级 `#[photon(blocking)]`） |
 
 `id` 必填的三条理由：宏否则无从填 `service_id`；自动编号会在「不同 crate 各自注册」时撞号；顺序一变线上 id 就变。
 
@@ -60,8 +60,8 @@ pub trait Service: Send + Sync + 'static {
 
 | 属性 | 适用 | 语义 |
 |---|---|---|
-| `#[photon(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking` |
-| `#[photon(zero_copy)]` | 仅 `fn` | 该方法的入站 payload 允许直传（v1 无行为差异，语法先定） |
+| `#[photon(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking`（v0.19 生效） |
+| `#[photon(zero_copy)]` | 仅 `fn` | 该方法的入站 payload 允许直传。**尚未实现**（v0.19：宏直接报错，等 `PayloadMode` 与 shm 一起落地） |
 | `#[photon(error = MyError)]` | 服务级/方法级 | M3：把业务错误映射成 `code ≥ 0x1_0000` 的 `Remote` |
 
 **不合法的组合必须在编译期报错**，不能降级为警告：`async fn` + `blocking`、`async fn` + `zero_copy`、`fn` 不带 `blocking` 却出现在 blocking client 里（后者由生成逻辑自然规避）。
@@ -88,11 +88,12 @@ pub trait Service: Send + Sync + 'static {
 |---|---|---|
 | `CalcClient<S, K>` | 持 `SessionHandle<S, K>`，方法全是 `async fn` | 只泛型化到半身，见 v0.18 说明；线上永远异步，与声明形态无关 |
 | `CalcService<S>` | 包一层 `Arc<S>`，`impl Service`，内部 `match method` | 见下方「为什么是包装类型而不是 blanket impl」，v0.17 修 |
+| `<CalcService<S> as Service>::schedule` | 逐个 blocking 方法比 `method`，其余落 `Async` | 有 blocking 方法时才生成；没有就用 trait 默认实现（v0.19） |
 | `register_calc(registry, svc)` | 用 `Calc` 上的 `id` 占号，内部 `CalcService::new(svc)` | 与 stub 共用同一个 `id` 字面量，一处写两处用 |
 | `CalcClient::SERVICE_ID` / `mod __photon_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
 | `mod __photon_calc` 内的 `METHOD_NAMES` | `&[(u64, &'static str)]` | span / `UnknownMethod` 日志 / panic 报告 |
 | `mod __photon_calc` 内的 `HASH_<METHOD>` 常量 | `const u64` | 编译期哈希值，`match` 的键 |
-| `BlockingCalcClient` | 持自建或共享的 runtime + `SessionHandle`，方法全是 `fn` | 仅 `blocking` 参数 + feature 同时成立时生成 |
+| `BlockingCalcClient` | 持自建或共享的 runtime + `SessionHandle`，方法全是 `fn` | 仅 `blocking` 参数 + feature 同时成立时生成。**尚未实现**（v0.19） |
 
 **为什么是包装类型 `CalcService<S>` 而不是 blanket impl（v0.17 修）**。v0.9–v0.16 一直写的是 `impl<S: Calc + Send + Sync + 'static> Service for S`，看着最省事（`Arc::new(my_calc)` 直接进注册表）。实际写出来在**用户 crate 里必然编译失败**：`Service` 来自 photon、`S` 是裸类型参数，展开代码属于下游 crate，孤儿规则不允许「外部 trait + 裸参数」（`E0210`）。只有两种出路：把 `Service` 改成 phantom 参数（等于让 L3 认不出服务），或者包一层本地类型。后者多一层指针解引用与一次 `Arc::clone`，代价可以忽略，收益是**同一实现类型可以同时实现多个服务 trait**——v0.9 里「一个类型只能属于一个服务」的限制不再存在。`register_calc(registry, svc)` 的签名保持不变，包装发生在宏内部。
 
@@ -130,20 +131,37 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
     Box::pin(async move {
         let me = Arc::clone(&self.inner);            // 内层 Arc<S>：本层不再分层
         match method {
-            HASH_ADD => {
-                let (a, b): (i64, i64) = Default::decode(&payload)?;   // async / fn 分支在 call 开头解
+            HASH_ADD => {                                            // async fn：本处 await
+                let (a, b): (i64, i64) = Default::decode(&payload)?;  // async / fn 分支在 call 开头解
                 let out = <S as Calc>::add(&*me, a, b).await?;
                 Default::encode(&out)
             }
-            HASH_LOAD => {                                                    // M3：fn + blocking
-                tokio::task::spawn_blocking(move || {                         // decode 必须在闭包里
-                    let path: PathBuf = Default::decode(&payload)?;
-                    me.load(path)
-                }).await?
+            HASH_FAST => {                                            // fn：就地跑完，不换线程
+                let data: Vec<u8> = Default::decode(&payload)?;
+                let out = <S as Calc>::fast_hash(&*me, data)?;         // 同步 `fn` 直接出 Result
+                Default::encode(&out)
             }
-            _ => Err(RpcError::Remote(RemoteError::new(3))),                  // UnknownMethod：回包侧构造，合法
+            HASH_LOAD => {                                            // fn + #[photon(blocking)]
+                let me = Arc::clone(&me);
+                tokio::task::spawn_blocking(move || {                  // decode 必须在闭包里
+                    let path: PathBuf = Default::decode(&payload)?;
+                    let out = <S as Calc>::load(&*me, path)?;
+                    Default::encode(&out)
+                })
+                .await
+                .map_err(|join| RpcError::Internal(format!("blocking handler 未正常结束: {join}")))?  // JoinError → 错误体
+            }
+            _ => Err(RpcError::Remote(RemoteError::new(3))),           // UnknownMethod：回包侧构造，合法
         }
     })
+}
+
+// 同一个 impl 里还要交出「这个方法占哪类额度」，L3 靠它在进 handler 之前扣额度
+fn schedule(&self, method: u64) -> Schedule {
+    match method {
+        HASH_LOAD => Schedule::Blocking,
+        _ => Schedule::Async,      // 没有 blocking 方法时，这个方法干脆不生成
+    }
 }
 ```
 
@@ -153,6 +171,8 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
 2. **`fn` 分支不换线程**，就在 poll 它的 worker 上就地跑完。微秒级无所谓，毫秒级就是 worker 被占住——所以需要第 7 节的 debug 告警。
 3. **`spawn_blocking` 的 `JoinHandle` 必须 await**，`JoinError` 映射成 `code = 0`；`tokio::spawn` 的句柄同理（在 L3 await）。丢掉句柄 = handler panic 无声，客户端只等到超时。
 4. **未知 method 返回 `Remote{code:3}`，不是 `Protocol`**——帧格式没错，是方法没注册。这个 `Remote` 由**回包侧**（正在回 `Response` 的一方）构造，因而是**合法**的；`RemoteError::new(code)` 是这条路径上允许的构造入口（`2` / `3` / `7` 三个码，见 `02-l2-protocol.md` 7.3）；L3 内部回 `2` / `7` 走的是 `send_error`，不必绕成 `RpcError`。**注意这条在 v0.9 被误标成「服务端伪造远端错误」——那是把「发起侧不许造 `Remote`」错当成了「谁都不许造」**；正确的规则是方向相关：发起侧只能从错误体得到 `Remote`，回包侧可以主动构造。
+
+**`schedule` 为什么必须由生成代码给出（v0.19）**：配额检查发生在「reader 解析完头、准备 spawn」这一刻，此时手上只有 `service_id + method`；实现内部走哪个分支要等 `call` 被 poll 才知道，而那时额度已经扣过了。让 L3 猜不了，也不该让 handler 自己扣（那等于把会话层的资源契约下放到业务代码）。代价只是一次 `match` 比较链，且只有存在 blocking 方法时才生成。
 
 参数解码位置：**`async fn` / `fn` 分支在 `call` 开头** `let (a, b) = Default::decode::<(i64, i64)>(&payload)?;`；**`#[photon(blocking)]` 分支必须在 `spawn_blocking` 的闭包里 decode**（v0.10 修）——v0.9 把它写在闭包外，等于只在调用线程上解析、闭包里只剩执行，一次线程切换只干了一件事；更糟的是 decode 出错时闭包外的 `?` 会让 `payload` 在闭包捕获前就被借用，写出来的代码通常编译不过或被迫多一次 clone。解码失败一律 `code = 4`。`Vec<u8>` 等容器类型直接走 serde，不需要特殊处理。
 
@@ -167,6 +187,8 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
 | 客户端出站配额 | 客户端 | 一组，只用 `max_async_in_flight` | 客户端不跑 handler |
 
 **必须拆成两个**：共用一组额度会出现「一批慢的 blocking 请求把额度占满，此时异步请求明明跑得动却也收到 `Overloaded`」——两类资源混进一个计数器，过载信号就失去意义了。
+
+**占哪一类由 `Service::schedule(method)` 决定**（v0.19）：`try_acquire(Slot::Async | Slot::Blocking)` 在同一次持锁里完成检查与计数，`InboundGuard` 记住 slot、drop 时归还对应那一个。抢不到时回的 `Overloaded` 消息也分开（`"overloaded"` / `"blocking pool overloaded"`）——只报「过载」而不说是哪类资源满了，排障时等于没信息。
 
 ---
 
@@ -219,7 +241,9 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
 | 检查 | 时机 | 报错要求 |
 |---|---|---|
 | `id` 缺失 / 不是 `u16` 字面量 | 展开 | 指出「必须写 `id = N`」，并给一行正确写法 |
-| 方法不是 `async fn`（M2）/ 服务带 `blocking` 参数（M2） | 展开 | 直接说「留到 M3」，并指明该写什么；**不许降级成同步 stub**（v0.17 起由 `tests/compile-fail/` 冻结文本） |
+| `async fn` + `#[photon(blocking)]` | 展开 | 「`blocking` 只能标在同步 `fn` 上」；v0.19 起由 `tests/compile-fail/blocking_on_async.rs` 冻结文本 |
+| `#[photon(zero_copy)]` / 未知方法级属性 | 展开 | 「尚未实现 / 只接受 `blocking`」；v0.19 由 `unknown_method_attr.rs` 冻结 |
+| 服务带 `blocking` 参数 | 展开 | 直接说「`BlockingClient` 还没做」，并指引用方法级 `#[photon(blocking)]`；**不许降级成同步 stub** |
 | 接收者不是 `&self`、返回不是 `Result`、参数是模式解构 | 展开 | 定位到具体方法，说明展开需要「简单标识符参数 + `Result` 返回」 |
 | 方法名重复或哈希相撞 | 展开 | 常量断言式检查；报出两个方法名 |
 | `async fn` + `blocking` | 展开 | 「同步方法才需要 `blocking`」 |
@@ -227,7 +251,7 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
 | 注册撞号 | 运行期（注册时） | `Err`，**不覆盖**已有服务 |
 | 改方法签名 | 编译期 | 在用户侧编译失败，错误信息必须定位到具体方法 |
 
-测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。v0.17 已落地三条：同步 `fn`、缺 `id`、`blocking` 参数；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。
+测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。v0.19 共四条：`blocking_on_async`、`unknown_method_attr`（`zero_copy`）、`missing_id`、`blocking_service`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。v0.17 的 `sync_method` 已删除：同步 `fn` 在 v0.19 起是合法声明。
 
 ---
 

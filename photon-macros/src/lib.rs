@@ -3,12 +3,12 @@
 //! 展开产物（同一模块内）：
 //!
 //! - `mod __photon_<svc>`：`SERVICE_ID`、`METHOD_NAMES`、每个方法一个 `HASH_<METHOD>`
-//! - `struct <Svc>Client<T>`：持有 `SessionHandle`，方法全是 `async fn`
-//! - `impl<S: <Svc>> Service for S`：按 `method` 分流的 dispatch
+//! - `struct <Svc>Client<S, K>`：持有 `SessionHandle`，方法全是 `async fn`
+//! - `struct <Svc>Service<S>`：包一层 `Arc<S>` 并实现 `Service`，按 `method` 分流
 //! - `fn register_<svc>(registry, svc)`：用同一个 `service_id` 占号
 //!
-//! M2 只支持 `async fn` 形态：`fn` 与 `#[photon(blocking)]` 留到 M3，遇到就直接
-//! 报编译错误，不做静默降级。
+//! 三档声明形态（`async fn` / `fn` / `#[photon(blocking)] fn`）都支持：调度策略在
+//! 展开期写死进各自的 dispatch 分支，运行期不做二次判断。
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -71,10 +71,21 @@ fn method_hash(name: &str) -> u64 {
     xxhash_rust::xxh3::xxh3_64(name.as_bytes())
 }
 
+/// handler 的执行形态，决定 dispatch 分支怎么包。
+enum MethodKind {
+    /// `async fn`：本处 await 即可，不换线程。
+    Async,
+    /// `fn`：包成 async 块，首 poll 就执行完——不换线程、不加调度。
+    Sync,
+    /// `#[photon(blocking)] fn`：唯一会换线程的分支。
+    Blocking,
+}
+
 /// 一个 handler 方法的展开素材。
 struct Method {
     name: syn::Ident,
     hash: u64,
+    kind: MethodKind,
     /// 参数名（dispatch 里要按名字传给用户方法）与类型（decode 的目标）。
     args: Vec<(syn::Ident, Type)>,
     /// `Result<T, RpcError>` 里的 `T`。
@@ -92,8 +103,9 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     if args.blocking {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
-            "`blocking` 参数要生成的同步客户端属于 M3：它需要自建 runtime + \
-             内外两层超时，现在生成出来只是一段没人验证过的代码",
+            "`blocking` 参数要生成的同步客户端（`BlockingClient`）还没做：它需要自建 \
+             runtime + 内外两层超时，生成一半只会是一段没人验证过的代码。\
+             同步 handler 不靠它，方法级写 `#[photon(blocking)]` 即可",
         )
         .to_compile_error()
         .into();
@@ -103,6 +115,10 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(methods) => methods,
         Err(err) => return err.to_compile_error().into(),
     };
+
+    // 方法级 `#[photon(...)]` 只在展开期有意义。留着它，rustc 会去解析一个
+    // 不存在的 `#[photon]` 属性并直接报错——信息已经收进 `MethodKind` 了。
+    strip_method_attrs(&mut service);
 
     let svc = &service.ident;
     let client = format_ident!("{}Client", svc);
@@ -184,14 +200,62 @@ fn expand(
                     <::photon::codec::Default as ::photon::Codec>::decode(&payload)?;
             }
         };
-        quote! {
-            #helper::#hash => {
+        let call = quote! { <S as #svc>::#name(&*me, #(#arg_names),*) };
+        let body = match m.kind {
+            MethodKind::Async => quote! {
                 #decode
-                let out = <S as #svc>::#name(&*me, #(#arg_names),*).await?;
+                let out = #call.await?;
                 <::photon::codec::Default as ::photon::Codec>::encode(&out)
-            }
+            },
+            // 同步 `fn` 就地执行：它承诺的是「服务端同步完成」，所以包成 async 块
+            // 之后首 poll 就跑完，不换线程、也不产生额外的调度点。
+            MethodKind::Sync => quote! {
+                #decode
+                let out = #call?;
+                <::photon::codec::Default as ::photon::Codec>::encode(&out)
+            },
+            // 唯一换线程的分支。decode 也搬进闭包：它同样是 CPU 工作，放在 worker 上
+            // 等于把省下来的阻塞又还回去。
+            MethodKind::Blocking => quote! {
+                let me = ::std::sync::Arc::clone(&me);
+                ::tokio::task::spawn_blocking(move || {
+                    #decode
+                    let out = #call?;
+                    <::photon::codec::Default as ::photon::Codec>::encode(&out)
+                })
+                .await
+                .map_err(|join| {
+                    ::photon::RpcError::Internal(format!("blocking handler 未正常结束: {join}"))
+                })?
+            },
+        };
+        quote! {
+            #helper::#hash => { #body }
         }
     });
+
+    // 无 blocking 方法时干脆不生成 `schedule`，让 trait 的默认实现接管：省掉一个
+    // 永远返回同一个值的 match。
+    let blocking_hashes = methods
+        .iter()
+        .filter(|m| matches!(m.kind, MethodKind::Blocking))
+        .map(|m| {
+            let hash = hash_ident(&m.name);
+            quote! { #helper::#hash }
+        })
+        .collect::<Vec<_>>();
+    let schedule_impl = if blocking_hashes.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn schedule(&self, method: u64) -> ::photon::Schedule {
+                match method {
+                    #(#blocking_hashes)|* => ::photon::Schedule::Blocking,
+                    _ => ::photon::Schedule::Async,
+                }
+            }
+        }
+    };
 
     quote! {
         #[doc(hidden)]
@@ -293,6 +357,8 @@ fn expand(
                     }
                 })
             }
+
+            #schedule_impl
         }
 
         /// 用本服务的 `service_id` 占号。撞号返回 `Err`，不覆盖已有服务。
@@ -310,6 +376,15 @@ fn expand(
     }
 }
 
+/// 摘掉方法级 `#[photon(...)]`：它的语义已经落进 `MethodKind`。
+fn strip_method_attrs(service: &mut syn::ItemTrait) {
+    for item in &mut service.items {
+        if let TraitItem::Fn(item_fn) = item {
+            item_fn.attrs.retain(|attr| !attr.path().is_ident("photon"));
+        }
+    }
+}
+
 /// 把 `async fn x(&self) -> R` 改写成
 /// `fn x(&self) -> impl Future<Output = R> + Send + '_`。
 fn rewrite_sigs(service: &mut ItemTrait) {
@@ -318,6 +393,10 @@ fn rewrite_sigs(service: &mut ItemTrait) {
             continue;
         };
         let sig = &mut item_fn.sig;
+        // 同步 `fn` 保持原样：它本来就没有 future 可改写，dispatch 直接就地调用。
+        if sig.asyncness.is_none() {
+            continue;
+        }
         let ReturnType::Type(_, ok_ty) = &sig.output else {
             continue;
         };
@@ -340,22 +419,49 @@ fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
             ));
         };
 
+        // 方法级属性只认 `blocking`；`zero_copy` 属于后续阶段，写出来要报错而不是
+        // 静默忽略——静默忽略等于让用户以为它生效了。
+        let mut blocking = false;
+        let mut zero_copy = None;
         for attr in &item_fn.attrs {
-            if attr.path().is_ident("photon") {
-                return Err(syn::Error::new_spanned(
-                    attr,
-                    "方法级 `#[photon(...)]`（`blocking` / `zero_copy`）属于 M3；M2 只支持 `async fn`",
-                ));
+            if !attr.path().is_ident("photon") {
+                continue;
             }
+            let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+            for meta in metas {
+                match &meta {
+                    Meta::Path(path) if path.is_ident("blocking") => blocking = true,
+                    Meta::Path(path) if path.is_ident("zero_copy") => zero_copy = Some(meta),
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "方法级 `#[photon(...)]` 只接受 `blocking`",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(meta) = zero_copy {
+            return Err(syn::Error::new_spanned(
+                meta,
+                "`zero_copy` 尚未实现：它要等 `PayloadMode` 与 shm 一起落地，\
+                 现在写出来不会生效",
+            ));
         }
 
         let sig = &item_fn.sig;
-        if sig.asyncness.is_none() {
-            return Err(syn::Error::new_spanned(
-                sig,
-                "M2 只支持 `async fn` 形态；同步 `fn` 与 `#[photon(blocking)]` 留到 M3",
-            ));
-        }
+        let kind = match (sig.asyncness.is_some(), blocking) {
+            (true, false) => MethodKind::Async,
+            (true, true) => {
+                return Err(syn::Error::new_spanned(
+                    sig,
+                    "`#[photon(blocking)]` 只能标在同步 `fn` 上：`async fn` 本身就是非阻塞的，\
+                     挪进 blocking 线程池只会白白占一个线程",
+                ));
+            }
+            (false, false) => MethodKind::Sync,
+            (false, true) => MethodKind::Blocking,
+        };
 
         let mut inputs = sig.inputs.iter();
         match inputs.next() {
@@ -399,6 +505,7 @@ fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
         methods.push(Method {
             name: sig.ident.clone(),
             hash,
+            kind,
             args,
             ok_ty,
         });
@@ -407,7 +514,7 @@ fn collect_methods(service: &ItemTrait) -> syn::Result<Vec<Method>> {
     if methods.is_empty() {
         return Err(syn::Error::new_spanned(
             service,
-            "服务 trait 至少需要一个 `async fn` handler，否则注册进去也没有可调用的方法",
+            "服务 trait 至少需要一个 handler，否则注册进去也没有可调用的方法",
         ));
     }
 

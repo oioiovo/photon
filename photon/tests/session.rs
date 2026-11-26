@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use photon::session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
 use photon::transport::{Endpoint, LocalAddr, MessageSink, MessageSource, TransportOptions};
-use photon::{BoxFuture, RpcError, Service};
+use photon::{BoxFuture, RpcError, Schedule, Service};
 
 #[cfg(feature = "local")]
 use photon::transport::Transport;
@@ -122,6 +122,31 @@ impl Service for Ack {
         _payload: Bytes,
     ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
         Box::pin(async { Ok(Bytes::from_static(b"ok")) })
+    }
+}
+
+/// 声明成 `#[photon(blocking)]` 的方法在会话层的形状：占 blocking 额度，
+/// 真的在另一条线程上睡。
+struct BlockingEcho;
+
+impl Service for BlockingEcho {
+    fn call(
+        self: Arc<Self>,
+        _method: u64,
+        payload: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, RpcError>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(payload)
+            })
+            .await
+            .map_err(|_| RpcError::RuntimeDropped)?
+        })
+    }
+
+    fn schedule(&self, _method: u64) -> Schedule {
+        Schedule::Blocking
     }
 }
 
@@ -383,6 +408,53 @@ async fn peer_declared_limit_governs_sending<H: Harness>() {
     server.close().await.expect("关闭");
 }
 
+/// 两类入站额度互不挤占：阻塞池打满时，异步请求必须照样跑得动。
+async fn blocking_quota_is_separate<H: Harness>() {
+    let mut registry = ServiceRegistry::empty();
+    registry
+        .insert(7, Arc::new(BlockingEcho) as Arc<dyn Service>)
+        .expect("注册阻塞服务");
+    registry
+        .insert(8, Arc::new(Ack) as Arc<dyn Service>)
+        .expect("注册 ack 服务");
+
+    // 只给 1 个阻塞额度：三次并发阻塞请求里必然有两个当场被拒。
+    let server_opts = SessionOptions {
+        max_blocking_in_flight: 1,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) =
+        boot::<H>(Arc::new(registry), server_opts, SessionOptions::default()).await;
+
+    // 配额检查在 reader 的 dispatch 里同步做，三次请求不可能同时通过。
+    let (b1, b2, b3, a) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            ch.call(7, 1, Bytes::new(), CALL_DEADLINE),
+            ch.call(7, 1, Bytes::new(), CALL_DEADLINE),
+            ch.call(7, 1, Bytes::new(), CALL_DEADLINE),
+            ch.call(8, 1, Bytes::new(), CALL_DEADLINE),
+        )
+    })
+    .await
+    .expect("额度判断不该让请求挂住");
+
+    let mut served = 0;
+    let mut overloaded = 0;
+    for reply in [b1, b2, b3] {
+        match reply {
+            Ok(_) => served += 1,
+            Err(RpcError::Remote(remote)) if remote.code == 1 && remote.retryable => {
+                overloaded += 1
+            }
+            other => panic!("阻塞请求只该有「成功」和「过载」两种结果：{other:?}"),
+        }
+    }
+    assert_eq!((served, overloaded), (1, 2), "阻塞额度只有 1 个");
+
+    a.expect("阻塞池打满不该连带拒绝异步请求");
+    server.close().await.expect("关闭");
+}
+
 /// 把同一组用例挂到每个实现上。这里只有签名，用例体一行不改。
 macro_rules! suite {
     ($name:ident, $H:ty) => {
@@ -427,6 +499,11 @@ macro_rules! suite {
             #[tokio::test]
             async fn peer_declared_limit_governs_sending() {
                 super::peer_declared_limit_governs_sending::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn blocking_quota_is_separate() {
+                super::blocking_quota_is_separate::<$H>().await
             }
         }
     };

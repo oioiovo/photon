@@ -4,6 +4,7 @@ use photon::RpcError;
 
 #[photon::service(id = 7)]
 trait Calc {
+    #[photon(zero_copy)]
     fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
 }
 

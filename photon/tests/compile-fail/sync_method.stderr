@@ -1,5 +1,0 @@
-error: M2 只支持 `async fn` 形态；同步 `fn` 与 `#[photon(blocking)]` 留到 M3
- --> tests/compile-fail/sync_method.rs:7:5
-  |
-7 |     fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

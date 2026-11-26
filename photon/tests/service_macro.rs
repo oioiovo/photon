@@ -134,3 +134,100 @@ fn register_twice_is_rejected() {
     // 覆盖会静默改掉路由目标，所以在注册期就拒绝。
     assert!(matches!(err, RpcError::InvalidInput(_)), "实际 {err:?}");
 }
+
+/// 三档声明混在同一个 trait 里：调度策略逐方法决定，互不影响。
+#[photon::service(id = 8)]
+trait Mixed {
+    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
+    /// 同步、纯计算：就地跑完，不换线程。
+    fn double(&self, x: i64) -> Result<i64, RpcError>;
+    /// 同步但会阻塞：唯一换线程的分支。
+    #[photon(blocking)]
+    fn slow_double(&self, x: i64) -> Result<i64, RpcError>;
+    /// 在 blocking 线程里 panic：JoinError 必须变成错误体，而不是挂住请求。
+    #[photon(blocking)]
+    fn boom(&self) -> Result<(), RpcError>;
+}
+
+struct MixedImpl;
+
+impl Mixed for MixedImpl {
+    async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError> {
+        Ok(a + b)
+    }
+
+    fn double(&self, x: i64) -> Result<i64, RpcError> {
+        Ok(x * 2)
+    }
+
+    fn slow_double(&self, x: i64) -> Result<i64, RpcError> {
+        // 故意睡一下：调用方能拿到结果，说明它确实落在另一个线程上跑完了。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Ok(x * 2)
+    }
+
+    fn boom(&self) -> Result<(), RpcError> {
+        panic!("blocking handler 炸了")
+    }
+}
+
+#[tokio::test]
+async fn sync_method_runs_inline() {
+    let service = Arc::new(MixedService::new(Arc::new(MixedImpl)));
+    let payload = photon::codec::Default::encode(&(21i64,)).expect("编码参数");
+
+    let reply = Service::call(service, __photon_mixed::HASH_DOUBLE, payload)
+        .await
+        .expect("同步 handler 也要走同一个 dispatch");
+
+    let doubled: i64 = photon::codec::Default::decode(&reply).expect("解码返回值");
+    assert_eq!(doubled, 42);
+}
+
+#[tokio::test]
+async fn blocking_method_runs_on_blocking_pool() {
+    let service = Arc::new(MixedService::new(Arc::new(MixedImpl)));
+    let payload = photon::codec::Default::encode(&(4i64,)).expect("编码参数");
+
+    let reply = Service::call(service, __photon_mixed::HASH_SLOW_DOUBLE, payload)
+        .await
+        .expect("blocking handler 应当正常返回");
+
+    let doubled: i64 = photon::codec::Default::decode(&reply).expect("解码返回值");
+    assert_eq!(doubled, 8);
+}
+
+#[tokio::test]
+async fn blocking_panic_becomes_error_not_hang() {
+    let service = Arc::new(MixedService::new(Arc::new(MixedImpl)));
+
+    // 10s 兜底：真挂住必须变红，而不是把整个测试二进制拖死。
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Service::call(service, __photon_mixed::HASH_BOOM, Bytes::new()),
+    )
+    .await
+    .expect("blocking handler panic 不该让请求永久挂起")
+    .expect_err("panic 必须变成错误");
+
+    assert!(matches!(outcome, RpcError::Internal(_)), "实际 {outcome:?}");
+}
+
+#[tokio::test]
+async fn schedule_reflects_method_annotation() {
+    let service = Arc::new(MixedService::new(Arc::new(MixedImpl)));
+
+    // 额度在「进 handler」之前就要扣，所以这张表必须由生成代码给出。
+    assert_eq!(
+        Service::schedule(&*service, __photon_mixed::HASH_ADD),
+        photon::Schedule::Async
+    );
+    assert_eq!(
+        Service::schedule(&*service, __photon_mixed::HASH_DOUBLE),
+        photon::Schedule::Async
+    );
+    assert_eq!(
+        Service::schedule(&*service, __photon_mixed::HASH_SLOW_DOUBLE),
+        photon::Schedule::Blocking
+    );
+}

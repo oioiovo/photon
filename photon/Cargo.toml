@@ -8,6 +8,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 bytes = "1.10.1"
 thiserror = "2"
 parking_lot = "0.12"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = "1"
 postcard = { version = "1", features = ["alloc"] }

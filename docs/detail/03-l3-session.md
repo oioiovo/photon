@@ -186,7 +186,7 @@ loop {
      - `Draining` → **不 dispatch**，直接回 `Remote { code: 7 }`（`Request` 才回，`Notification` 静默丢弃）；
      - `Open` → 查 `registry[service_id]`：查不到 → 回 `Remote { code: 2 }`（回包侧构造：`send_error(req_id, 2, false, "unknown service")`，见 `02` 7.3）；查得到再走 6.2。
 3. `Request` 的准入顺序（一步都不能挪）：
-   - **先**入站配额 `inbound.try_acquire(shape)`；抢不到 → 合成 `code = 1` 回包，结束（不 spawn、不登记 token）；
+   - **先**入站配额 `inbound.try_acquire(svc.schedule(method))`（`Slot::Async` / `Slot::Blocking` 两张表分别计，v0.19）；抢不到 → 合成 `code = 1` 回包，结束（不 spawn、不登记 token）；
    - **再** `cancels.lock().insert(id, token)`；
    - **再** `tokio::spawn(...)`，把 `Bytes` move 进去；`handlers += 1`；
    - handler 结束时由 guard 移除 token、`handlers -= 1`、归还入站配额。
@@ -259,13 +259,15 @@ loop {
 ### 6.2 dispatch 内部（服务端）
 
 1. `let svc = registry.get(service_id)` → 无 → `send_error(id, 2, false, "unknown service")`（回包侧构造，见 `02` 7.3）；
-2. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RpcError::Remote(RemoteError::new(3))`（这里必须交出一个 `RpcError`，所以走构造器而不是 `send_error`）；
-3. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
-4. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<(u32, bool, String)>`**（`02-l2-protocol.md` 7.3 的白名单）：
+2. 扣额度：`svc.schedule(method)` 给出 `Slot::Async | Slot::Blocking` → `inbound.try_acquire(slot, opts)`。**必须在 spawn 之前**：等 `call` 被 poll 才知道走哪个分支，那时额度已经扣过了。抢不到 → `send_error(id, 1, true, "overloaded" | "blocking pool overloaded")`，不登记 cancel token（v0.19）；
+3. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RpcError::Remote(RemoteError::new(3))`（这里必须交出一个 `RpcError`，所以走构造器而不是 `send_error`）；
+4. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
+5. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<(u32, bool, String)>`**（`02-l2-protocol.md` 7.3 的白名单）：
    - `Ok(Ok(bytes))` → `Response`，flags bit0 = 0；
    - `Ok(Err(e))` → `to_wire(&e)`：`Some` → `Response` + bit0 = 1；`None`（`Io`/`Protocol`/`RuntimeDropped`）→ 按 `code = 0` 兜底，**不许静默丢帧**；
    - `Err(JoinError)`（panic）→ `Remote { code: 0 }` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
-5. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性目前由默认 panic hook 打到 stderr，收敛成结构化日志（`tracing`）留到 M3。
+6. `#[photon(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `RpcError::Internal`（`to_wire` 无对应码 → `code 0` 兜底），不会需要 L3 再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
+7. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性：v0.19 起 panic 走 `tracing::error!(service_id, method, request_id, %text)`，不再只有默认 panic hook 的 stderr 一行。
 
 > **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `to_wire` 一张表：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
 
@@ -277,6 +279,7 @@ loop {
 | 协议 `deadline_ms` | 客户端按「**发送时刻起还剩多少**」填剩余预算；服务端从**解析完 24B 头**开始计时，因此实际可用 = 头部值 + 传输延迟 | **尽力**（能停就停，停不下就跑完丢结果） |
 | `Cancel` 到达 | `async fn` handler：`select!` 到 `token.cancelled()` → 中止，回 `Remote{5}` | 有效 |
 | `Cancel` 到达 | `fn` / `#[photon(blocking)]` handler：标记已取消，**继续跑完、结果丢弃、不回 `Response`** | 只丢结果 |
+| 慢 handler 告警 | debug 构建下从 `call` 开始 poll 到结束计时，超过 100 µs 打 `tracing::warn`，提示该方法应加 `#[photon(blocking)]` | 诊断，非语义 |
 
 必须写进文档的三条：
 
