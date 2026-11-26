@@ -4,12 +4,16 @@
 //! 服务端尽力）、同步 handler、优雅关闭（等在飞清空再收尾）、同步客户端（自带
 //! 线程与 runtime，调用点不写 `await`）。一条命令：`cargo run --example local_calc`。
 
-#[path = "calc_service/mod.rs"]
+// 单进程示例同时扮演两端，所以接口与实现都引；两进程示例里客户端只引 `api.rs`。
+#[path = "calc_service/api.rs"]
 mod calc;
+#[path = "calc_service/imp.rs"]
+mod calc_imp;
 
 use std::sync::Arc;
 
-use calc::{CalcBlockingClient, CalcClient, Calculator, describe, register_calc};
+use calc::{CalcBlockingClient, CalcClient, describe, register_calc};
+use calc_imp::Calculator;
 use photon::{ServiceRegistry, Session, SessionOptions, transport::memory::Memory};
 
 #[tokio::main]

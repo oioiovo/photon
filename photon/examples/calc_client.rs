@@ -3,7 +3,8 @@
 //! 连接是**重试**的：服务端可能比客户端晚几百毫秒起，固定 `sleep` 在不同机器上
 //! 会飘（本地绿、CI 红）。最多等 2 s，超时才算失败。
 
-#[path = "calc_service/mod.rs"]
+// 客户端**只引接口半**：`Calculator` 的实现不该出现在客户端二进制里。
+#[path = "calc_service/api.rs"]
 mod calc;
 
 use std::net::SocketAddr;

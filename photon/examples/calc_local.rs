@@ -8,14 +8,19 @@
 //! 与 `calc_server` / `calc_client` 的业务代码逐行相同，只换了 `Endpoint` 与
 //! `Transport` 类型——这就是「换 transport 不改业务代码」的可执行证据。
 
-#[path = "calc_service/mod.rs"]
+// 同一个二进制既是服务端又是客户端，所以两半都引；分成两个 example 时
+// 客户端那一半只引 `api.rs`（见 `calc_client.rs`）。
+#[path = "calc_service/api.rs"]
 mod calc;
+#[path = "calc_service/imp.rs"]
+mod calc_imp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use calc::{CalcClient, Calculator, describe, register_calc};
+use calc::{CalcClient, describe, register_calc};
+use calc_imp::Calculator;
 use photon::{
     ConnectOptions, Endpoint, Server, SessionOptions, connect,
     transport::local::{LocalSink, LocalSource, LocalTransport},

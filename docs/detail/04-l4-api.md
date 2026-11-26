@@ -496,6 +496,10 @@ impl<S, K> SessionHandle<S, K> {
 | `local_calc`（补齐） | `memory` | M3 | 七种形态：`async fn` / `fn` / blocking / `Notification` / 超时 / `GoAway` / 错误体；v0.27 起多两行同步客户端（第二条会话，服务端在独立线程上） |
 | `calc_local` | `local`，两进程 | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收）；同一二进制 `server` / `client` 两角色 |
 
+**示例的接口与实现必须分文件（v0.28.1）**：`calc_service/api.rs` 只放 `Calc` trait 与打印/构造错误的小工具，`calc_service/imp.rs` 放 `Calculator` 与业务逻辑；`calc_client` 只 `#[path]` 引前者，`calc_server` / `calc_local` 两半都引，单进程的 `local_calc` 同时扮演两端、属例外（文件头写明理由）。
+
+判据不是「看着分开了」，而是客户端二进制里没有那个类型：`nm target/debug/examples/calc_client | grep -c Calculator` = 0。这件事在 RPC 项目里不是洁癖——宏产物只有 `Service::call` 的 `match` 分支体依赖实现类型，把实现编进客户端等于**把业务逻辑分发出去**。
+
 `local_calc` 的两条预期输出是验收硬指标（不能随手改文案）：
 
 - `[server] listening on memory (in-process pair, no endpoint)`
