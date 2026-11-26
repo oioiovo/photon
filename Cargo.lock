@@ -80,6 +80,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "photon-macros"
+version = "0.1.0"
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
