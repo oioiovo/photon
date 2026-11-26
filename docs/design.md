@@ -4,7 +4,7 @@
 >
 > 当前阶段：**M0 — 搭架构骨架，先实现 Rust ↔ Rust 的进程间通讯**。
 >
-> 版本：**v0.12**（只改样例的承载方式，不动线格式：七个黄金样例从 `.bin` 文件改为 `photon/tests/protocol.rs` 内联字节数组，`tests/fixtures/` 目录取消；同时 M0 落地 `PROTOCOL.md` §9 第 12 条的帧长上限 `MAX_MESSAGE_LEN = 64 KiB`。协议字节、字段与 17 条校验与 v0.11 完全一致）
+> 版本：**v0.13**（只把 `Transport::bind` 从同步改为异步，让「必须在 runtime 内」成为类型上的前置条件；线格式、字节布局与 17 条校验零改动）
 
 ## 变更记录
 
@@ -23,6 +23,7 @@
 | **v0.10** | **把「照文档写代码会做错」的六处接口逐个钉死，并与 PROTOCOL / detail 01–04 对齐**。① **4.6 关闭序列重写**：`close()` 只把 `egress` 置 `Draining`、`ingress` 保持 `Open` 继续 dispatch，`ingress` 只在「双方都宣告过关闭」或 5 s 兜底时才进 `Draining`（此后到达的 `Request` 回 `Remote{7}`）；「在飞」定义为「已进入 handler」；`GoAway` 第 1 步先入队再改状态；第 3 步不再 drop `tx`（`Arc` 里做不到），改为 `shutdown.cancel()` + writer 收到取消后 `try_recv` 排空再退；`reader`/`writer` 的句柄改 `Mutex<Option<JoinHandle>>` 以便 `take()`；删掉「与 gRPC `GOAWAY` 一致」的类比（v0.7 已删 `last_request_id`，没有水位就没有按 id 划边界的能力）。② **`max_message_len` 从 `TransportOptions` 迁入 `SessionOptions`**（握手与旋钮写入都在 L3，L1 拿不到也不需要；握手前恒 64 KiB），并给 `Source`/`Sink` 各加 `recv_limit()`/`send_limit()` 交出 `Arc<AtomicU32>`（v0.9 只写了「L3 去写旋钮」却没给通路）；补握手校验「`≥ 24`」与「shm 上 `≤ slot_size`」。③ **删 `Session<S,K,C>` 的 `C`**：`Service::call` 无 `C`、宏固定用 `codec::Default`，`C` 只贡献握手 `C::ID`，会导致「宣告 A、线上 B」的静默错线格式；`Session::new` 补 `registry` 参数。④ **出站/入站配额拆两张表**：`OutboundTable{pending,async_used}` + `InboundQuota{async_used,blocking_used}`，入站用 `try_acquire` + guard（原来一张表既挤占额度又没法在入站入口原子检查）。⑤ **错误边界定唯一出口 `to_wire(&RpcError) -> Option<ErrorBody>` 白名单**，规则改为方向相关两句话（回包侧可主动构造 `Remote`、发起侧只能由错误体得到），`UnknownService/UnknownMethod/ShuttingDown` 由回包侧经 `RemoteError::new(code)` 构造 `Remote`（只允许这三处调用，`Remote{3}` 是合法的而不是伪造），M2 的 `0x10001` 明确为示例 handler 自造用户码。⑥ **`deadline_ms` 口径统一**为「发送方填剩余预算、接收方从解析完头开始计时，实际可用 = 值 + 传输延迟」。**另**：2.5 的 `AnySource` 代价拆成「间接调用 / 每消息 alloc / 单态化体积」三项并量化到一个往返 4 个 box 点 80–160 ns，明确**基准测试禁止用门面**且门面只消除组合爆炸不消除泛型传染；8 节新增两条具名条目（`Arc` 里置空字段、假的 codec 泛型）并把「1–36 编号 + 新增用具名锚点」写成引用规则。**同步改动**：`docs/PROTOCOL.md`（§1 对齐断言收窄到 memory/shm、§2.2 `deadline_ms`、§9 补 5 条校验）、`docs/detail/01`（`advance(4)`、1 MiB 测试与旋钮）、`02`（无条件长度检查并改引 PROTOCOL §9、模块表 `error.rs`）、`03`（结构/配额/关闭/错误映射四节重写）、`04`（decode 移入闭包、宏命名空间、补服务端装配）、`00-index`（`INV-02`/`INV-10` 拆分、H3 补 `self: Arc<Self>`） |
 | **v0.11** | **工程约定定稿，线格式零改动**。① **模块文件统一 2024 风格**：`foo.rs` + `foo/`，禁 `foo/mod.rs`。两种写法 rustc 都合法（`foo.rs` 与 `foo/mod.rs` 不能并存），官方自 1.30 起鼓励新写法，本项目为「入口文件与子目录并列、一眼可见」而统一采用；1.3 目录树按此重画（`transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`）。② **`edition = "2024"` + `resolver = "3"`**，根 `Cargo.toml` 定为纯 virtual workspace（只有 `[workspace]`，不再同时挂 `[package]`，否则没有 target 会直接报 `no targets specified in the manifest`）。③ **成员名定死 `photon-macros`（复数）**，且它是 `proc-macro = true` 的 **lib** crate——proc-macro 不能是 bin，`src/main.rs` 的写法编译不过。④ **布局约束从四条变五条**，新增第 5 条即模块文件风格。**同步改动**：`docs/detail/01` §3 文件表、`docs/detail/02` §9 模块布局改为 `transport.rs` / `proto.rs` / `codec.rs`，并各加一段「为什么不是 `mod.rs`」。`PROTOCOL.md` 只更新版本指向，字节布局与 17 条校验一字未动。 |
 | **v0.12** | **样例承载方式改为源码内联，线格式零改动**。① 七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 里的内联字节数组（`assert_golden` 的 `expected` 参数），删除 `tests/fixtures/` 目录与 `include_bytes!` 这层路径管理。理由：`.bin` 在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果完全等价。② 布局约束第 4 条随之重写（原「`tests/fixtures/` 从 M0 就存在」→「样例内联在 `tests/protocol.rs`」），1.3 目录树删掉 fixtures 子目录。③ **`PROTOCOL.md` §9 第 12 条（帧长上限）在 M0 落地**：新增 `proto::MAX_MESSAGE_LEN = 64 KiB`，`parse` 在解码与切片之前先查长度（`check_len`），恰好等于上限放行、多 1 字节拒绝，两个用例都只差长度、字段全合法。④ 同步 `PROTOCOL.md` §8.8 表头与 §11 生成/冻结流程、`detail/02` §10 与测试矩阵。 |
+| **v0.13** | **`Transport::bind` 改为异步，线格式零改动**。① 原同步签名与实现的真实前置条件不符：tokio 的 `TcpListener::from_std` 必须把 fd 注册进当前 runtime 的 driver，取不到 `Handle` 时 `Handle::current()` 直接 panic（`there is no reactor running`），而签名返回 `io::Result` 又让调用方以为失败一定可处理——错误类型错位。② 改为返回 `impl Future<Output = io::Result<Self>> + Send`：实现可直接用 `tokio::net::TcpListener::bind().await`，不再需要 `std::net::TcpListener::bind` + `set_nonblocking` + `from_std` 三步，也不需要运行时的 `try_current` 补丁——「必须被某个 executor poll」成为类型上的前置条件，漏掉是编译错误而不是构造期 panic。③ 三个发起动作（`bind` / `connect` / `accept`）由此统一在 async 世界，`detail/01` 的 `L1-C4` 改为「三者皆异步」。④ 门面代价口径修正：`AnyTransport::bind` 现在同样要一次 `Box::pin`，但一个进程只调一次，不在热路径。**同步改动**：`design.md` 2 节 trait 片段与 2.5 门面代价段、`detail/01` `L1-C4` / 模块表 / §6.1 / §7.2、`detail/04` `Server::bind` 签名与装配清单、`detail/00` 版本指向、`PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 
 ---
 
@@ -258,10 +259,13 @@ pub trait Transport: Sized {
     type Sink: MessageSink;
 
     /// 服务端：占住地址、准备接受连接。listen 端必须走它，而不是 accept 自己猜。
-    /// 必须是同步签名：tokio 的 `TcpListener::bind` 是 async，实现里用
-    /// `std::net::TcpListener::bind` + `TcpListener::from_std`（后者要求 runtime 上下文），
-    /// 这样 trait 才能在同步/async 混合的门面（AnyTransport）上不付一次 Box。
-    fn bind(ep: &Endpoint, opts: &TransportOptions) -> io::Result<Self>;
+    /// 异步不是因为它需要等待——绑定本身没有等待——而是因为实现要把 fd 注册进
+    /// 当前 runtime 的 driver。这个前置条件只能由 `async` 在类型上表达：写成同步
+    /// 签名时，漏了 runtime 的调用方会在构造期 panic，而不是拿到一个 `Err`。
+    fn bind(
+        ep: &Endpoint,
+        opts: &TransportOptions,
+    ) -> impl Future<Output = io::Result<Self>> + Send;
 
     fn connect(ep: &Endpoint, opts: &TransportOptions)
         -> impl Future<Output = io::Result<(Self::Source, Self::Sink)>> + Send;
@@ -374,7 +378,7 @@ pub enum AnySource {
 
 > 各变体按 feature 条件编译：关掉某个 feature 就少一个变体，`Endpoint` 同理。所以 `AnySource` 的 `match` 完备性也会随 feature 变化——写代码时不要假设四个变体永远都在。
 
-**门面的代价只来自「返回 `impl Future`」这一件事，和「类型擦除」本身无关。** 同步动作（`bind`、建段、校验段头、注册服务）在门面上不必 `box`，`match` 各变体各调一次就行；只有 `recv` / `send` / `connect` / `accept` 这些返回 future 的，才必须付一次 `Box::pin`。所以接口设计上「同步动作与异步动作分开」本身就是省钱的做法——`bind` 必须是同步签名，不是随手一写。
+**门面的代价只来自「返回 `impl Future`」这一件事，和「类型擦除」本身无关。** 凡是返回 future 的方法（`recv` / `send` / `connect` / `accept` / `bind`）在门面上都要付一次 `Box::pin`；不返回 future 的纯本地动作（建段、校验段头、注册服务）不必 box，`match` 各变体各调一次即可。`bind` 之所以也在异步侧（v0.13），是因为它要把 fd 注册进当前 runtime——这个前置条件只能由 `async` 在类型上表达，用同步签名就得靠注释和运行时检查补，漏了会在构造期 panic。它一个进程只调用一次，这次 box 不在热路径上。
 
 用途：运行时才知道用哪种 transport 的场景（配置驱动、测试矩阵），避免 `Session<T>` 的泛型在调用方层层传染。
 

@@ -1,6 +1,6 @@
 # photon 分层详细设计 —— 索引与全局约束
 
-> 本组文档是 `docs/design.md`（**v0.12**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。v0.11 只动模块布局：入口文件改为 `transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`（2024 风格，不用 `*/mod.rs`）。v0.12 改样例承载方式：七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 内联字节数组，目录与 `include_bytes!` 一并取消；线格式与接口签名均未变化。
+> 本组文档是 `docs/design.md`（**v0.13**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。v0.11 只动模块布局：入口文件改为 `transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`（2024 风格，不用 `*/mod.rs`）。v0.12 改样例承载方式：七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 内联字节数组，目录与 `include_bytes!` 一并取消；线格式与接口签名均未变化。v0.13 把 `Transport::bind` 改为异步（`L1-C4` 随之从「bind 同步」改为「三者皆异步」），`Server::bind` 因此变成 `async fn`，`detail/04` 的 `pub fn bind` 与装配清单同步加上 `.await`；线格式零改动。
 >
 > 三类文档的优先级从高到低：**`docs/PROTOCOL.md`（线格式唯一权威）> `docs/design.md`（架构与决策）> `docs/detail/*.md`（实现细节）**。任何冲突以高优先级为准；本组文档若与 `design.md` 打架，是本文档的 bug，不是 `design.md` 的。
 

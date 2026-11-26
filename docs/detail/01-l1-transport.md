@@ -36,7 +36,8 @@ pub trait Transport: Sized {
     type Source: MessageSource;
     type Sink: MessageSink;
 
-    fn bind(ep: &Endpoint, opts: &TransportOptions) -> io::Result<Self>;
+    fn bind(ep: &Endpoint, opts: &TransportOptions)
+        -> impl Future<Output = io::Result<Self>> + Send;
     fn connect(ep: &Endpoint, opts: &TransportOptions)
         -> impl Future<Output = io::Result<(Self::Source, Self::Sink)>> + Send;
     fn accept(&self, opts: &TransportOptions)
@@ -53,7 +54,7 @@ pub trait Transport: Sized {
 | `L1-C1` | `recv` 只返回**完整**消息，绝不返回半条 | L2 会解析到半截头，整条连接只能废弃 |
 | `L1-C2` | 返回的 `Bytes` 必须 `Send + 'static` | L3 无法 `spawn` 去 decode，多路复用退化成串行 |
 | `L1-C3` | `recv` / `send` 只允许**终态取消**（连接关闭、调用方放弃整条连接）被打断，不允许单次超时 | `send` 被打断会在流里留半帧 → 对端长度前缀永远读不满 |
-| `L1-C4` | `bind` 同步、`connect` / `accept` 异步；`opts` 是参数不是成员 | 门面层要为同步动作白付一次 `Box::pin` |
+| `L1-C4` | `bind` / `connect` / `accept` **三者皆异步**；`opts` 是参数不是成员 | 同步 `bind` 会把「必须在 runtime 内」藏进注释，漏了的调用方在构造期 panic 而不是拿到 `Err` |
 | `L1-C5` | 两个上限旋钮必须能从 `recv_limit()` / `send_limit()` 取到，且**同一份 `Arc` 贯穿半身生命周期** | L3 拿不到旋钮 → 协商形同虚设（`INV-19`） |
 
 ### 2.2 drop 契约（**验收项，不是说明**）
@@ -87,7 +88,7 @@ pub trait Transport: Sized {
 src/transport.rs          trait 定义、Endpoint、TransportOptions、错误构造 helper
 src/transport/
   framing.rs    FramedSource<S> / FramedSink<S>：长度前缀、读满、双向上限旋钮
-  tcp.rs        TcpTransport（std::net bind + from_std + into_split）
+  tcp.rs        TcpTransport（tokio bind + nodelay + into_split）
   local.rs      LocalTransport（interprocess，tokio feature）
   memory.rs     MemoryTransport + Memory::pair(opts) -> ((Source, Sink), (Source, Sink))
   any.rs        AnySource / AnySink / AnyTransport（枚举门面，按 feature 裁剪变体）
@@ -100,10 +101,10 @@ src/transport/
 |---|---|
 | `transport.rs` | 只放契约与数据结构；不放任何平台 `cfg` 分支的具体实现 |
 | `framing.rs` | 唯一持有 `Arc<AtomicU32>` 上限旋钮的地方（两个方向各一个），并通过 `recv_limit()` / `send_limit()` 交出 |
-| `tcp.rs` | **必须用 `std::net::TcpListener::bind` + `TcpListener::from_std`**：tokio 的 `bind` 是 async，与 `L1-C4` 的同步签名冲突；`from_std` 要求 runtime 上下文，所以 `bind` 必须在 runtime 内调用（文档化这条前置条件，别在 M0 现场纠结） |
+| `tcp.rs` | 直接用 **`tokio::net::TcpListener::bind(addr).await`**：它是 `async fn`，内部完成 fd 注册，与 `L1-C4` 的异步签名天然一致。**不要**回头用 `std::net::TcpListener::bind` + `from_std`——那条路径要求调用线程恰好处在 runtime 上下文里，而同步签名无法在类型上表达这件事 |
 | `local.rs` | 全平台走 framing；不要按「消息式」设计背压与上限 |
 | `memory.rs` | 唯一的「零 syscall」实现，是 L1 抽象的压力测试器 |
-| `any.rs` | 只有返回 future 的四个方法需要 `Box::pin`；`bind` 不 box |
+| `any.rs` | 返回 future 的五个方法（`recv` / `send` / `bind` / `connect` / `accept`）各需一次 `Box::pin`；`recv_limit` / `send_limit` 与建段类动作不 box |
 
 ---
 
@@ -206,7 +207,7 @@ src/transport/
 
 ### 6.1 `tcp`（M0 主力）
 
-- `bind`：`std::net::TcpListener::bind` → `set_nonblocking(true)` → `TcpListener::from_std`（要求 runtime 上下文）。
+- `bind`：`tokio::net::TcpListener::bind(addr).await`，一步到位（内部已设非阻塞并把 fd 注册进当前 runtime）。**不要**改走 `std::net` + `from_std`。
 - `connect`：`TcpStream::connect` + `connect_timeout`；成功即 `set_nodelay(true)`（loopback 上 Nagle 会平白加延迟）。
 - 分半：`into_split()` 得 `OwnedReadHalf` / `OwnedWriteHalf`，两半各自包 `FramedSource` / `FramedSink`。
 - `accept`：`listener.accept()` 循环由 L3 调用，L1 每次只产出一对半身。
@@ -295,7 +296,7 @@ pub enum AnySource { Tcp(TcpSource), Local(LocalSource), Memory(MemorySource), S
 规则：
 
 - 变体按 feature 裁剪：关掉某个 feature 就少一个变体，`match` 完备性随之变化——**代码里不许假设四个变体永远都在**。
-- 只有返回 future 的方法需要 `Box::pin`：`recv` / `send` / `connect` / `accept`。同步动作（`bind`、建段、校验段头、注册服务）**不 box**，`match` 各调一次即可。
+- 返回 future 的方法一律要 `Box::pin`：`recv` / `send` / `bind` / `connect` / `accept`。不返回 future 的纯本地动作（建段、校验段头、注册服务）**不 box**，`match` 各调一次即可。
 - `recv_limit()` / `send_limit()` 在门面上同样是同步 `match`：直接返回内部 `Arc` 克隆，**不 box**。
 - `AnyTransport` 只用于「配置驱动」与测试矩阵；生产热路径用泛型。
 

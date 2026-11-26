@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod proto;
+pub mod transport;
 
 pub use error::{RemoteError, RpcError};
 

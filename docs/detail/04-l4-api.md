@@ -226,8 +226,8 @@ pub struct Server<T: Transport> {
 }
 
 impl<T: Transport> Server<T> {
-    pub fn bind(ep: &Endpoint, transport_opts: TransportOptions,
-                session_opts: SessionOptions) -> io::Result<Self>;
+    pub async fn bind(ep: &Endpoint, transport_opts: TransportOptions,
+                      session_opts: SessionOptions) -> io::Result<Self>;
     pub fn register<S: Service>(&mut self, id: u16, svc: Arc<S>) -> Result<(), RegistryError>;
     pub async fn serve(self) -> io::Result<()>;                 // accept 循环，永不返回（除错误）
     pub async fn serve_with(self, mut on_conn: impl FnMut(Arc<Session<T::Source, T::Sink>>)) -> io::Result<()>;
@@ -236,7 +236,7 @@ impl<T: Transport> Server<T> {
 
 规则：
 
-- **`bind` 是同步的**（`L1-C4`）：内部 `std::net` + `from_std`，因此**必须在 runtime 上下文里调用**（`from_std` 需要 reactor）。这是已知前置条件，不要在示例里写 `let server = Server::bind(...)` 于 `main` 的同步段——放进 `#[tokio::main]` 里就没问题。
+- **`bind` 是异步的**（`L1-C4`，v0.13 起）：底层的 `tokio::net::TcpListener::bind().await` 会把 fd 注册进当前 runtime，这一步只能在 executor 里做。做成异步后这个前置条件由类型承担，调用方漏了 runtime 是编译不过的，而不是拿到一个「看起来像绑定失败」的构造期 panic。用法就是 `Server::bind(ep, transport_opts, session_opts).await?`，天然落在 `#[tokio::main]` 的异步段里。
 - `register` 就是宏生成的 `register_calc(registry, svc)` 的薄包装：**注册发生在 `bind` 之后、`serve` 之前**，撞号返回 `Err`、**不覆盖**已有服务（`INV-14`）。
 - 三个配置各归各位，不许合并成一个 `Options`：`TransportOptions` 给 L1（`connect_timeout` / `spin_hint`），`SessionOptions` 给 L3（`max_message_len` / 配额 / `payload_mode` / 超时）。`design.md` 2.7 已经因为「塞在一起」返工过一次。
 
@@ -287,7 +287,7 @@ impl CalcClient<AnyTransport> {
 
 | 步骤 | 服务端 | 客户端 |
 |---|---|---|
-| 1 | `Server::bind(ep, transport_opts, session_opts)?` | — |
+| 1 | `Server::bind(ep, transport_opts, session_opts).await?` | — |
 | 2 | `server.register::<Calc>(7, Arc::new(CalcImpl))?`（或 `register_calc(&mut registry, svc)`） | — |
 | 3 | — | `CalcClient::connect(ep, opts).await?` |
 | 4 | `server.serve().await?` | 调方法 |
