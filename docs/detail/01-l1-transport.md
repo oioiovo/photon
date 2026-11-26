@@ -84,8 +84,8 @@ pub trait Transport: Sized {
 ## 3. 模块与文件职责
 
 ```
+src/transport.rs          trait 定义、Endpoint、TransportOptions、错误构造 helper
 src/transport/
-  mod.rs        trait 定义、Endpoint、TransportOptions、错误构造helper
   framing.rs    FramedSource<S> / FramedSink<S>：长度前缀、读满、双向上限旋钮
   tcp.rs        TcpTransport（std::net bind + from_std + into_split）
   local.rs      LocalTransport（interprocess，tokio feature）
@@ -94,9 +94,11 @@ src/transport/
   shm.rs        （M5）段管理、SPSC 环、块池、心跳；内部真拆子模块时须回填 1.3 的树
 ```
 
+> **模块文件风格（2024 风格）**：入口是 `transport.rs`，不是 `transport/mod.rs`。子模块文件放在同名目录 `transport/` 里，`transport.rs` 用 `pub mod framing;` 声明它们。两种写法 rustc 都接受，但 `foo.rs` 与 `foo/mod.rs` 不能并存；本项目统一用前者（见 `design.md` 1.3 第 5 条布局约束）。
+
 | 文件 | 关键点 |
 |---|---|
-| `mod.rs` | 只放契约与数据结构；不放任何平台 `cfg` 分支的具体实现 |
+| `transport.rs` | 只放契约与数据结构；不放任何平台 `cfg` 分支的具体实现 |
 | `framing.rs` | 唯一持有 `Arc<AtomicU32>` 上限旋钮的地方（两个方向各一个），并通过 `recv_limit()` / `send_limit()` 交出 |
 | `tcp.rs` | **必须用 `std::net::TcpListener::bind` + `TcpListener::from_std`**：tokio 的 `bind` 是 async，与 `L1-C4` 的同步签名冲突；`from_std` 要求 runtime 上下文，所以 `bind` 必须在 runtime 内调用（文档化这条前置条件，别在 M0 现场纠结） |
 | `local.rs` | 全平台走 framing；不要按「消息式」设计背压与上限 |

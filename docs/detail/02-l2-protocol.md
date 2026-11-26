@@ -92,9 +92,9 @@
 
 ### 3.3 校验顺序（一次遍历，不许来回扫）
 
-**校验清单以 `PROTOCOL.md` §9 为准，逐条实现，不要在这里另写一份更短的。** 本文件 v0.9 的清单少了五条（`Response.request_id == 0`、`Request/Notification.method == 0`、`Handshake` payload ≠ 12、Err payload < 8、`max_message_len < 24`），而少一条就意味着少一个反例 fixture。实现时按 §9 的编号顺序做，顺序本身有依赖：先长度、再 kind、再 flags、再逐 kind 字段，最后才是 payload 级检查。
+**校验清单以 `PROTOCOL.md` §9 为准，逐条实现，不要在这里另写一份更短的。** 本文件 v0.9 的清单少了五条（`Response.request_id == 0`、`Request/Notification.method == 0`、`Handshake` payload ≠ 12、Err payload < 8、`max_message_len < 24`），而少一条就意味着少一个反例用例。实现时按 §9 的编号顺序做，顺序本身有依赖：先长度、再 kind、再 flags、再逐 kind 字段，最后才是 payload 级检查。
 
-1. **长度 ≥ 24 → 否则 `Protocol`。无条件检查，不是 `debug_assert`（v0.10 修）。** L1 只承诺「一条完整消息」，并不承诺「消息体内含合法 24B 头」：`memory` / `shm` 这些 L1 根本不解析头的 transport，完全可能把一条 10 字节的 `Bytes` 交上来（应用层自己塞的、或对端实现有 bug）。`debug_assert` 在 release 下被编译掉，随后读 `&msg[0..24]` 就越界 panic（甚至读到垃圾字段继续往下跑）。这一条必须 `if msg.len() < 24 { return Err(Protocol) }`。
+1. **长度 `≥ 24` 且 `≤ 本端 max_message_len` → 否则 `Protocol`。** 下限无条件检查，不是 `debug_assert`（v0.10 修）：L1 只承诺「一条完整消息」，并不承诺「消息体内含合法 24B 头」——`memory` / `shm` 这些 L1 根本不解析头的 transport，完全可能把一条 10 字节的 `Bytes` 交上来（应用层自己塞的、或对端实现有 bug）。`debug_assert` 在 release 下被编译掉，随后读 `&msg[0..24]` 就越界 panic（甚至读到垃圾字段继续往下跑）。这一条必须 `if msg.len() < 24 { return Err(Protocol) }`。上限即 §9 第 12 条，**必须在解码与切片之前判定**——否则一条 4 MiB 的异常帧会一路进逐字段校验，白付一次全量遍历。M0 用常量 `MAX_MESSAGE_LEN = 64 KiB` 兜住（握手前恒 64 KiB），M1 换成握手声明的值、M3 之后来自 `SessionOptions`；**恰好等于上限放行**，多 1 字节即拒。
 2. `kind` 属于 0–6 → 否则 `Protocol` + 断连。
 3. `flags` 保留位（bit1、bit3–7）为 0 → 否则 `Protocol` + 断连；bit2 仅允许出现在 `GoAway`。
 4. 按 3.2 的表检查该 kind 的「必须为 0」字段，外加 `PROTOCOL.md` §9 第 8/13/14 条（`request_id = 0` 的三个变体、`Response.request_id = 0`、`Request/Notification.method = 0`）。
@@ -138,7 +138,7 @@ L2 只负责「头 + 裸 payload 的边界」。`codec.decode` 发生在 L3 spaw
 
 ### 5.3 golden 向量
 
-必须有一条：`"add"` → 一个固定的 u64 字面量。位置在 **`photon-macros` 的单元测试**（或 `tests/fixtures/method_ids.txt` 纯文本），**不要混进 `tests/fixtures/*.bin`**——那里放的是线格式帧，而这是哈希常量，不是帧。
+必须有一条：`"add"` → 一个固定的 u64 字面量。位置在 **`photon-macros` 的单元测试**（或纯文本常量），**不要混进 `photon/tests/protocol.rs` 的 §8 帧样例**——那里放的是线格式帧，而这是哈希常量，不是帧。
 
 用途：一旦有人「优化」哈希实现（换 xxh3 版本、改 `Hasher::write` 的字节布局），测试立刻红。没有它，某次 `xxhash-rust` 升级就会静默改掉全部线上 method id，而且没有任何现象能提示你。
 
@@ -258,31 +258,33 @@ v0.7 的 `GoAway{last_request_id}` 已删：对称会话下它没有良定义—
 ## 9. 模块布局
 
 ```
+src/proto.rs      HEADER_LEN / MAX_MESSAGE_LEN、kind / flags 常量、Kind / Header / Decoded、`parse()` 入口（帧长检查 + 编排，不写校验分支）
 src/proto/
-  mod.rs        kind / flags 常量、Header 视图与存取器、校验入口（`validate()`）
   header.rs     24B encode / decode + 逐 kind 校验（M0 就做，否则端到端无法验证）
   error_body.rs code 表、8B 前缀编解码、RemoteError ↔ 错误体、`to_wire()` 白名单
   control.rs    Handshake / GoAway / Cancel 的手写编解码（12B / 0B / 0B）
+  codec.rs      Codec trait + `codec::Default` 别名（由 feature 决定）
   codec/
-    mod.rs      Codec trait + `codec::Default` 别名（由 feature 决定）
     postcard.rs postcard 实现（默认，ID = 0）
     rkyv.rs     M5，ID = 1，独立 feature
 src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 ```
 
-**`RpcError` 不在 `codec/mod.rs` 里（v0.10 修）**：v0.9 的模块表把它塞在 codec 下，与 `design.md` 1.3 的目录树（`src/error.rs`）不一致。错误类型是 L2/L3/L4 共用的公共类型，挂在 codec 下会让「关掉 codec feature 就没有错误类型」这种荒唐依赖出现。
+**模块文件是 `proto.rs` 而不是 `proto/mod.rs`（2024 风格）**：入口文件与子目录同名并列，`proto.rs` 里用 `pub mod header;` 声明子模块。`codec.rs` 与 `codec/` 同理。
+
+**`RpcError` 不在 `codec.rs` 里（v0.10 修）**：v0.9 的模块表把它塞在 codec 下，与 `design.md` 1.3 的目录树（`src/error.rs`）不一致。错误类型是 L2/L3/L4 共用的公共类型，挂在 codec 下会让「关掉 codec feature 就没有错误类型」这种荒唐依赖出现。
 
 红线：`proto` 目录里不许出现 `TcpStream`、`tokio::spawn`、`Service`。
 
 ---
 
-## 10. `PROTOCOL.md` 与 fixtures
+## 10. `PROTOCOL.md` 与逐字节样例
 
-- `PROTOCOL.md` 是本项目**线格式唯一权威**；`design.md` 3.3.1 只是设计视角速查表，与它同源。任何字段改动先改 `PROTOCOL.md`，再同步速查表与黄金样例。真正要照着写解析器时，看它第 2 节（头）、第 4 节（逐 kind 语义）、第 6 节（错误体）、第 7 节（控制帧）、第 9 节（校验清单）。
+- `PROTOCOL.md` 是本项目**线格式唯一权威**；`design.md` 3.3.1 只是设计视角速查表，与它同源。任何字段改动先改 `PROTOCOL.md`，再同步速查表与逐字节样例。真正要照着写解析器时，看它第 2 节（头）、第 4 节（逐 kind 语义）、第 6 节（错误体）、第 7 节（控制帧）、第 9 节（校验清单）。
 - `PROTOCOL.md` 最小结构：头字段表（含偏移与宽度）、逐 kind 语义、flags、错误体、控制帧、每条 kind 一段 hex 样例与字段解读。
-- `tests/fixtures/*.bin` 七种：`Request`、`Response Ok`、`Response Err`、`Notification`、`Cancel`、`GoAway`、`Handshake`。
-- 生成顺序（写死）：**先用实现生成 → 人工对照 `PROTOCOL.md` 逐字节审 → 冻结进仓库 → 测试只做 decode/encode 比对，运行时绝不重新生成**。运行时重生成等于把当前实现的 bug 固化进 fixture。
-- 反例 fixtures（同等重要，没有它们硬约束就没有测试）：`Cancel.service_id != 0`、`Notification.request_id == 0`、`Handshake.reserved != 0`、`flags` bit3 置位、`kind = 7`，每条都断言「必须报 `Protocol`」。
+- 七个样例（`Request`、`Response Ok`、`Response Err`、`Notification`、`Cancel`、`GoAway`、`Handshake`）全部**内联在 `photon/tests/protocol.rs`**，由 `assert_golden(name, header, payload, expected)` 逐个断言。**没有 `.bin` 文件、没有 `tests/fixtures/` 目录、不用 `include_bytes!`**（v0.12）：二进制在 diff 里不可见，而内联字面量逐行可审、可逐段注释字段与宽度，冻结效果等价。
+- 生成顺序（写死）：**先用实现生成 → 人工对照 `PROTOCOL.md` 逐字节审 → 把审过的字节内联冻结 → 测试只做 decode/encode 比对，运行时绝不重新生成**。运行时重生成等于把当前实现的 bug 固化进样例。
+- 反例用例（同等重要，没有它们硬约束就没有测试）：`Cancel.service_id != 0`、`Notification.request_id == 0`、`Handshake.reserved != 0`、`flags` bit3 置位、`kind = 7`，每条都断言「必须报 `Protocol`」。
 
 ---
 
@@ -290,8 +292,9 @@ src/error.rs    RpcError / RemoteError 定义（`#[non_exhaustive]`）
 
 | 项 | 判据 | 阶段 |
 |---|---|---|
-| 头往返 | 任意字段组合 encode → decode 字段一致；fixtures 双向比对 | M0 |
-| 逐 kind 校验 | 反例 fixtures 全部被拒，且**不误伤合法帧** | M0 |
+| 头往返 | 任意字段组合 encode → decode 字段一致；七个样例双向比对 | M0 |
+| 逐 kind 校验 | 反例用例全部被拒，且**不误伤合法帧** | M0 |
+| 帧长上限 | 恰好 `MAX_MESSAGE_LEN` 放行、多 1 字节拒绝（`§9` 第 12 条） | M0 |
 | 错误体 | `code 0..7` 编解码；`message` 非 UTF-8 时 lossy 且 code 不变 | M2 |
 | 未知 kind / 保留位 | 断连且不产生 `Response` | M2 |
 | method id | golden 向量稳定；同名不同服务不冲突 | M2 |

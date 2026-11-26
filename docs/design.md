@@ -4,7 +4,7 @@
 >
 > 当前阶段：**M0 — 搭架构骨架，先实现 Rust ↔ Rust 的进程间通讯**。
 >
-> 版本：**v0.10**（把六处「照文档写代码会做错」的接口钉死：4.6 关闭序列（`ingress` 延迟 Draining、writer 排空退出、句柄 `Mutex<Option<_>>`）、`max_message_len` 迁入 `SessionOptions` 并给出 `recv_limit()`/`send_limit()` 通路、删 `Session` 的 codec 泛型参数、出站/入站配额拆表、错误边界唯一出口 `to_wire`、`deadline_ms` 口径统一；并把 `AnySource` 的三项代价量化，明确基准测试禁用门面）
+> 版本：**v0.12**（只改样例的承载方式，不动线格式：七个黄金样例从 `.bin` 文件改为 `photon/tests/protocol.rs` 内联字节数组，`tests/fixtures/` 目录取消；同时 M0 落地 `PROTOCOL.md` §9 第 12 条的帧长上限 `MAX_MESSAGE_LEN = 64 KiB`。协议字节、字段与 17 条校验与 v0.11 完全一致）
 
 ## 变更记录
 
@@ -21,6 +21,8 @@
 | **v0.8** | **收口五项「写进代码就改不动」的设计**。① `MessageSource::close` 删掉——`recv(&mut self)` 独占借用期间没人拿得到 `&self`，而 4.1 的 `select!` + 取消 token 已经解决了唤醒，`close` 是第二套重复机制；改为「取消 token 唤醒 → break → drop source 即关闭」，writer 侧同样 select。② **codec 改为构建期选择**：`Codec` 的方法是泛型的、不是 dyn-safe，因此「握手协商 codec 位图」根本无法实现——握手只带 `codec_id` 做 fail-fast，位图留给将来引入 `AnyCodec` 门面时再说。③ 协商项补通路：`max_message_len` 通过 `Arc<AtomicU32>` 旋钮由 L3 在握手后调整（L1 不看语义，不破铁律②）；`ring_capacity` 从 Handshake 移入 shm 段头，由创建方写入、attach 方校验（原来它要走这条环才能协商容量，是鸡生蛋）。④ 错误码定死 `1..7` 保留段，并引入 `RpcError::Remote` 与本地变体**永不合并**，解决「服务端过载/未知服务/未知方法无码可发」；`ShuttingDown` 也进保留段。⑤ 性能口径拆开：B.2 的 100–600 ns 是**裸传输 ping-pong**（不含 codec/session/dispatch），端到端目标另给 1–3 µs——原先把两者混成一个数，按每请求 `Box::pin + spawn + oneshot + 两次 mpsc` 的固定成本算，300 ns 端到端结构上不可能。**其余**：`TransportOptions` 补 `bind`/`connect` 入口并拆出 `SessionOptions`；`PayloadMode::Copy` 明确为非借用 transport 的 no-op、`ZeroCopy` v1 只对 `fn` handler 开放；`service_id` 的宏语法定为 `#[photon::service(id = 7)]`、方法哈希只对方法名；`next_id` 从 1 起；全文统一小端；M2 提前落地错误体；`flush` 从 trait 删除；黄金样例补 `Cancel`/`Notification`；`full` 的 CI 启用时点改到 M3；补 Closing 状态表与 `Session` 持 `JoinHandle` |
 | **v0.9** | **修 v0.8 新文本里的四个真 bug + 闭合两处删除的后果**。① **4.6 的关闭序列与「一条 tx 跑请求与响应」冲突**：v0.8 用「`tx = None`」表达「不再准入」，结果在途 `Response` 与 `Remote{7}` 全发不出去（若 clone 了 `Sender` 又永远等不到 `None`）。改为——`tx` 是普通可 clone 的 `Sender`，准入由 `state`（两个方向各一个）判断，关队列靠「最后一个 sender 消失」自然发生。② **`max_message_len` 取小写错了方向**：A 声明收 1 MiB、B 声明 64 KiB，取小会让 A 拒收 B 合法发来的 500 KiB。改为**两个方向各用各的**：reader 上限 = 本端声明，writer 上限 = 对端声明（新增 writer 侧检查，超了本地 `InvalidInput`）。③ **GoAway 语义与步骤方向相反**：v0.8 说「不表示我不再发 Request」，下一步却把出站置 Draining。统一为「连接级开始收尾：双向都停止发起、双向都继续收尾」，收到 `GoAway` 的一侧出站也进 Draining。④ **drop 契约没写、且不是所有 transport 都能半关闭**：补「drop `Sink` 必须尽力半关写方向、drop `Source` 关读方向，做不到就降级为整连接关闭」，并在 2.6 写明 Windows named pipe 没有半关闭；`send` 与 `recv` 一样只允许终态取消（打断 `send` 会在流里留半帧）。**另修**：`payload_mode` 从 `Handshake` 移除（纯本端策略，两边不一致时原本无定义）；配额检查与插入并入同一把锁（`try_reserve`），并写明客户端只有一组出站配额；shm 段头补 `generation` / `state` / `peer_heartbeat`，并定死「一个段 = 一条单向环、双向用两个段」；M5 的 3 µs 补齐测量条件；`Codec` 加 `const ID` 供握手填 `codec_id`；`Memory::pair` 改为返回两份半身 + 新增 `Session::new`；`bind` 同步签名的实现备注（`std::net` + `from_std`）。**小问题**：10.3 形态 2 的 `Service` 变体残留改成 `Remote{code≥0x10000}`、四处 `#[photon::service(blocking)]` 补 `id`、3.2 的「v0.1 是 20 字节」纠正（v0.1 就是 24）、13.1 的字节序口径改为「以 3.2 正文为准」、`tests/protocol.rs` 的 M0 范围缩到头 + 长度前缀、method 哈希 golden 向量从 `.bin` 挪到单元测试、`PROTOCOL.md` 定为唯一权威（3.3.1 降为速查表）、fixtures 定「先实现生成→人工审→冻结，测试不重生成」并补反例断言、8 节新增条目改用具名锚点、4.6 的 Draining 触发点改为**不对称**（收到 `GoAway` 只动 `egress`，`ingress` 保持 `Open`，否则在飞请求会被本地打成 `Remote{7}`） |
 | **v0.10** | **把「照文档写代码会做错」的六处接口逐个钉死，并与 PROTOCOL / detail 01–04 对齐**。① **4.6 关闭序列重写**：`close()` 只把 `egress` 置 `Draining`、`ingress` 保持 `Open` 继续 dispatch，`ingress` 只在「双方都宣告过关闭」或 5 s 兜底时才进 `Draining`（此后到达的 `Request` 回 `Remote{7}`）；「在飞」定义为「已进入 handler」；`GoAway` 第 1 步先入队再改状态；第 3 步不再 drop `tx`（`Arc` 里做不到），改为 `shutdown.cancel()` + writer 收到取消后 `try_recv` 排空再退；`reader`/`writer` 的句柄改 `Mutex<Option<JoinHandle>>` 以便 `take()`；删掉「与 gRPC `GOAWAY` 一致」的类比（v0.7 已删 `last_request_id`，没有水位就没有按 id 划边界的能力）。② **`max_message_len` 从 `TransportOptions` 迁入 `SessionOptions`**（握手与旋钮写入都在 L3，L1 拿不到也不需要；握手前恒 64 KiB），并给 `Source`/`Sink` 各加 `recv_limit()`/`send_limit()` 交出 `Arc<AtomicU32>`（v0.9 只写了「L3 去写旋钮」却没给通路）；补握手校验「`≥ 24`」与「shm 上 `≤ slot_size`」。③ **删 `Session<S,K,C>` 的 `C`**：`Service::call` 无 `C`、宏固定用 `codec::Default`，`C` 只贡献握手 `C::ID`，会导致「宣告 A、线上 B」的静默错线格式；`Session::new` 补 `registry` 参数。④ **出站/入站配额拆两张表**：`OutboundTable{pending,async_used}` + `InboundQuota{async_used,blocking_used}`，入站用 `try_acquire` + guard（原来一张表既挤占额度又没法在入站入口原子检查）。⑤ **错误边界定唯一出口 `to_wire(&RpcError) -> Option<ErrorBody>` 白名单**，规则改为方向相关两句话（回包侧可主动构造 `Remote`、发起侧只能由错误体得到），`UnknownService/UnknownMethod/ShuttingDown` 由回包侧经 `RemoteError::new(code)` 构造 `Remote`（只允许这三处调用，`Remote{3}` 是合法的而不是伪造），M2 的 `0x10001` 明确为示例 handler 自造用户码。⑥ **`deadline_ms` 口径统一**为「发送方填剩余预算、接收方从解析完头开始计时，实际可用 = 值 + 传输延迟」。**另**：2.5 的 `AnySource` 代价拆成「间接调用 / 每消息 alloc / 单态化体积」三项并量化到一个往返 4 个 box 点 80–160 ns，明确**基准测试禁止用门面**且门面只消除组合爆炸不消除泛型传染；8 节新增两条具名条目（`Arc` 里置空字段、假的 codec 泛型）并把「1–36 编号 + 新增用具名锚点」写成引用规则。**同步改动**：`docs/PROTOCOL.md`（§1 对齐断言收窄到 memory/shm、§2.2 `deadline_ms`、§9 补 5 条校验）、`docs/detail/01`（`advance(4)`、1 MiB 测试与旋钮）、`02`（无条件长度检查并改引 PROTOCOL §9、模块表 `error.rs`）、`03`（结构/配额/关闭/错误映射四节重写）、`04`（decode 移入闭包、宏命名空间、补服务端装配）、`00-index`（`INV-02`/`INV-10` 拆分、H3 补 `self: Arc<Self>`） |
+| **v0.11** | **工程约定定稿，线格式零改动**。① **模块文件统一 2024 风格**：`foo.rs` + `foo/`，禁 `foo/mod.rs`。两种写法 rustc 都合法（`foo.rs` 与 `foo/mod.rs` 不能并存），官方自 1.30 起鼓励新写法，本项目为「入口文件与子目录并列、一眼可见」而统一采用；1.3 目录树按此重画（`transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`）。② **`edition = "2024"` + `resolver = "3"`**，根 `Cargo.toml` 定为纯 virtual workspace（只有 `[workspace]`，不再同时挂 `[package]`，否则没有 target 会直接报 `no targets specified in the manifest`）。③ **成员名定死 `photon-macros`（复数）**，且它是 `proc-macro = true` 的 **lib** crate——proc-macro 不能是 bin，`src/main.rs` 的写法编译不过。④ **布局约束从四条变五条**，新增第 5 条即模块文件风格。**同步改动**：`docs/detail/01` §3 文件表、`docs/detail/02` §9 模块布局改为 `transport.rs` / `proto.rs` / `codec.rs`，并各加一段「为什么不是 `mod.rs`」。`PROTOCOL.md` 只更新版本指向，字节布局与 17 条校验一字未动。 |
+| **v0.12** | **样例承载方式改为源码内联，线格式零改动**。① 七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 里的内联字节数组（`assert_golden` 的 `expected` 参数），删除 `tests/fixtures/` 目录与 `include_bytes!` 这层路径管理。理由：`.bin` 在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果完全等价。② 布局约束第 4 条随之重写（原「`tests/fixtures/` 从 M0 就存在」→「样例内联在 `tests/protocol.rs`」），1.3 目录树删掉 fixtures 子目录。③ **`PROTOCOL.md` §9 第 12 条（帧长上限）在 M0 落地**：新增 `proto::MAX_MESSAGE_LEN = 64 KiB`，`parse` 在解码与切片之前先查长度（`check_len`），恰好等于上限放行、多 1 字节拒绝，两个用例都只差长度、字段全合法。④ 同步 `PROTOCOL.md` §8.8 表头与 §11 生成/冻结流程、`detail/02` §10 与测试矩阵。 |
 
 ---
 
@@ -126,7 +128,7 @@ v0.2 的这节原本写着「先不拆 workspace，单 crate + module 分层」�
 
 ```
 photon/                          # workspace 根
-├── Cargo.toml                   # [workspace] members = ["photon", "photon-macros"]
+├── Cargo.toml                   # [workspace] members = ["photon", "photon-macros"]，resolver = "3"
 ├── docs/
 │   ├── design.md
 │   ├── PROTOCOL.md              # 线格式权威定义 + hex fixture 说明（见 13 节）
@@ -141,25 +143,25 @@ photon/                          # workspace 根
 │   ├── src/
 │   │   ├── lib.rs               # 门面：re-export 公共 API
 │   │   ├── error.rs             # RpcError 统一错误类型（含 Remote，见 3.8）
-│   │   ├── transport/           # L1
-│   │   │   ├── mod.rs           # MessageSource / MessageSink / Transport
+│   │   ├── transport.rs         # L1 入口：MessageSource / MessageSink / Transport
+│   │   ├── transport/
 │   │   │   ├── framing.rs       # 流式 transport 的长度前缀拼装（L1 内部）
 │   │   │   ├── tcp.rs           # feature = "tcp"（默认）
 │   │   │   ├── local.rs         # feature = "local"
 │   │   │   ├── memory.rs        # feature = "memory"（默认，接口验收用）
 │   │   │   ├── shm.rs           # feature = "shm"（M5，附录 B）
 │   │   │   └── any.rs           # AnySource / AnySink 类型擦除门面
-│   │   ├── proto/               # L2
-│   │   │   ├── mod.rs           # kind / flags 常量、Header 视图与校验入口
+│   │   ├── proto.rs             # L2 入口：kind / flags 常量、Header 视图与校验入口
+│   │   ├── proto/
 │   │   │   ├── header.rs        # 24 字节语义头 + 手工编解码
 │   │   │   ├── error_body.rs    # 错误体 8B 前缀 + code 表（见 3.8）
 │   │   │   ├── control.rs       # Handshake / GoAway / Cancel 手写定长编解码
+│   │   │   ├── codec.rs         # Codec trait（含 const ID）+ codec::Default 别名
 │   │   │   └── codec/
-│   │   │       ├── mod.rs       # Codec trait（含 const ID）
 │   │   │       ├── postcard.rs  # 默认实现，ID = 0
 │   │   │       └── rkyv.rs      # feature = "codec-rkyv"，M5，ID = 1
-│   │   ├── session/             # L3
-│   │   │   ├── mod.rs           # Session：pending map + 读写任务 + Closing 状态
+│   │   ├── session.rs           # L3 入口：Session（pending map + 读写任务 + Closing 状态）
+│   │   ├── session/
 │   │   │   ├── client.rs        # 异步客户端
 │   │   │   ├── blocking.rs      # feature = "blocking"：同步客户端（见 5.5）
 │   │   │   ├── server.rs
@@ -173,18 +175,10 @@ photon/                          # workspace 根
 │   │   └── calc_local.rs        # M3：两进程本地 IPC（架构验收）
 │   ├── tests/                   # 跨 transport 的一致性测试
 │   │   ├── transport.rs         # M0：不依赖 Session，直接测 L1 收发与帧边界
-│   │   ├── protocol.rs          # M0 只覆盖「头 + 长度前缀」；错误体/控制帧用例随 M2 增补
+│   │   ├── protocol.rs          # M0：24B 头 + 逐 kind 校验 + 帧长上限 + §8 逐字节样例
 │   │   ├── roundtrip.rs         # M1+
 │   │   ├── concurrency.rs       # M1+
-│   │   ├── shutdown.rs          # M3：两个方向的 GoAway、JoinHandle 必须结束
-│   │   └── fixtures/            # 黄金样例二进制，见 13.2
-│   │       ├── request.bin
-│   │       ├── response_ok.bin
-│   │       ├── response_err.bin
-│   │       ├── cancel.bin
-│   │       ├── notification.bin
-│   │       ├── handshake.bin
-│   │       └── goaway.bin
+│   │   └── shutdown.rs          # M3：两个方向的 GoAway、JoinHandle 必须结束
 │   └── benches/                 # M4
 │       └── latency.rs
 └── photon-macros/               # L4 代码生成，独立 package
@@ -193,16 +187,17 @@ photon/                          # workspace 根
         └── lib.rs               # #[photon::service(id = N)] 展开
 ```
 
-四条布局约束：
+五条布局约束：
 
 1. **`examples/` 从 M0 就存在**，不是"以后再补"。没有能跑的示例，抽象就没有被验证过（见第 10 节）。
 2. **`tests/` 按"跨 transport 一致性"组织**，不按"按模块"组织。同一个测试要在 `tcp` / `memory` / `local` / `shm` 上全绿——这是 transport 抽象成立的唯一客观证据。
 3. **`benches/` 留到 M4**，提前建空目录只会变成噪音。
-4. **`tests/fixtures/` 从 M0 就存在**。线格式是唯一不能靠「代码写得一致」保证的东西——它需要一组二进制黄金样例来锁死（见 13.2）。放进 `tests/` 而不是 `docs/`，是因为它要被测试直接 `include_bytes!` 读进来，而不是给人看的。
+4. **黄金样例内联在 `tests/protocol.rs`，不设 `tests/fixtures/` 目录**（v0.12）。线格式是唯一不能靠「代码写得一致」保证的东西——它需要一组逐字节冻结的样例来锁死（见 13.2）。但这些样例以**源码内联的字节数组**形式存在，而不是 `.bin` 文件：二进制在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可见、可逐段注释字段名与宽度，冻结效果完全等价（两者都是「运行时不再重新生成」）。代价只是测试文件长一些，比多一层文件路径管理划算。
+5. **模块文件用 2024 风格：`foo.rs` + `foo/`，不用 `foo/mod.rs`**（v0.11）。两种写法在 rustc 里都合法，但官方从 1.30 起鼓励新写法（「more consistent, and avoids having many files named `mod.rs`」）。同一仓库只允许一种：`foo.rs` 与 `foo/mod.rs` 并存会直接报错（`foo` 的模块文件被定义两次），且混用会让「模块入口在哪」变成靠猜。`Cargo.toml` 的 `edition = "2024"` 与 `resolver = "3"` 也在同一轮定死。
 
 > **`docs/detail/` 的分工**：本文件只保留「决策 + 论证 + 线格式速查」；逐层的实现细则（模块职责、数据结构、算法步骤、错误映射、测试矩阵）在 `docs/detail/` 里展开。那里的内容不构成新决策，与本文冲突时以本文为准；反过来，若实现过程中发现本文缺一条必须定死的约定，先改本文、再同步 detail。
 >
-> **版本对齐（v0.10）**：detail 五份（`00-index.md` + `01-l1-transport.md` / `02-l2-protocol.md` / `03-l3-session.md` / `04-l4-api.md`）与本文 v0.10 同步修订，行数为 112 / 342 / 309 / 415 / 323；`INV-01…19` 编号以 `00-index.md` 为准（`INV-05`、`INV-10` 已拆为 a/b/c），引用时写全编号，别只写 `INV-10`。
+> **版本对齐（v0.12）**：detail 五份（`00-index.md` + `01-l1-transport.md` / `02-l2-protocol.md` / `03-l3-session.md` / `04-l4-api.md`）与本文 v0.12 同步修订，行数为 112 / 344 / 312 / 415 / 323；`INV-01…19` 编号以 `00-index.md` 为准（`INV-05`、`INV-10` 已拆为 a/b/c），引用时写全编号，别只写 `INV-10`。
 
 ### 1.3.1 Feature 划分
 
@@ -557,7 +552,7 @@ endpoint 必须携带足够的寻址信息，让 L3 完全无感——L3 拿到 
 - 用 u64 而非 u32：碰撞概率 2⁻⁶⁴，省掉运行时碰撞检查表。多出的 4 字节在多路复用下可忽略
 - 改名即协议变更，这个语义是正确的，写死在文档里
 - **宏顺手生成一张方法名表**：`const METHOD_NAMES: &[(u64, &'static str)]`（或 `fn method_name(u64) -> Option<&'static str>`）。请求 span、`UnknownMethod` 日志、panic 报告全靠它，成本是零——都是编译期字符串字面量。只有 `request_id` 的 span 在排障时基本没用
-- **必须有一条 golden 向量**：`method_name = "add"` → 固定的 u64 字面量，放在 **`photon-macros` 的单元测试**里（或 `tests/fixtures/method_ids.txt` 这种纯文本），**不要混进 `tests/fixtures/*.bin`**——那里放的是线格式帧，而这条是哈希常量，不是帧。哈希实现（xxh3 版本、`Hasher::write` 的字节布局）一旦被人「优化」，这条测试立刻红；没有它，某次升级 `xxhash-rust` 就会静默改掉全部线上 method id
+- **必须有一条 golden 向量**：`method_name = "add"` → 固定的 u64 字面量，放在 **`photon-macros` 的单元测试**里（或纯文本常量），**不要混进 `photon/tests/protocol.rs` 的 §8 帧样例**——那里放的是线格式帧，而这条是哈希常量，不是帧。哈希实现（xxh3 版本、`Hasher::write` 的字节布局）一旦被人「优化」，这条测试立刻红；没有它，某次升级 `xxhash-rust` 就会静默改掉全部线上 method id
 
 > dispatch 的键是 **`(service_id, method)`**，不是单独的 `method`。`service_id` 由 `ServiceRegistry` 查表得到 `Arc<dyn Service>`，`method` 再在该服务内部 `match`——两层都不需要哈希表。
 >
@@ -1545,7 +1540,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 
 ### 13.1 `docs/PROTOCOL.md`
 
-**它是线格式的唯一权威（v0.9 定），3.3、3.8、6 节的所有表格都是「设计视角的同源速查」，冲突时以 `PROTOCOL.md` 为准。** 反过来的流程是硬规则：**任何字段增删必须先在 `PROTOCOL.md` 改，再同步 3.x 的速查表和 `tests/fixtures/*.bin`**。不要反过来从设计文档摘录——设计文档要能自由改理由，它天然不适合当规范。
+**它是线格式的唯一权威（v0.9 定），3.3、3.8、6 节的所有表格都是「设计视角的同源速查」，冲突时以 `PROTOCOL.md` 为准。** 反过来的流程是硬规则：**任何字段增删必须先在 `PROTOCOL.md` 改，再同步 3.x 的速查表和 `photon/tests/protocol.rs` 里的逐字节样例**。不要反过来从设计文档摘录——设计文档要能自由改理由，它天然不适合当规范。
 
 **只写结论，不写权衡论证**（理由留在本文档里；每条结论最多允许一句必要背景，超过一句就该搬回设计文档）：
 
@@ -1557,22 +1552,22 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 - 每种 kind 的**一段 hex 示例 + 逐字段解读**（见 13.2）
 - **parser 校验清单**：哪些必须拒绝并断连、哪些**不得**断连（后者是「合法竞态」的清单，比前者更容易写错）
 - **版本与扩展规则**：什么变更必须升 `protocol_version`，什么变更不升
-- `tests/fixtures/*.bin` 的清单、字节数与生成冻结规则（与 13.2 对齐）
+- `photon/tests/protocol.rs` 里逐字节样例的清单、字节数与冻结规则（与 13.2 对齐）
 
 字节序统一写死为**小端**，覆盖全部线格式：24 字节头、错误体（3.8）、控制帧（6 节），不做字节序协商。3.2 的正文是设计视角的来源，线格式层面以 `PROTOCOL.md` 的字段表为准。
 
-### 13.2 黄金样例（golden fixtures）
+### 13.2 黄金样例（golden samples）
 
-在 `tests/fixtures/` 下放 `.bin` 文件，**七种 kind 各一个**：`Request`、`Response(Ok)`、`Response(Err)`、`Notification`、`Cancel`、`GoAway`、`Handshake`。
+在 `photon/tests/protocol.rs` 里以**源码内联的字节数组**给出，**七种 kind 各一个**：`Request`、`Response(Ok)`、`Response(Err)`、`Notification`、`Cancel`、`GoAway`、`Handshake`。v0.12 把承载方式从 `tests/fixtures/*.bin` 改为内联：`.bin` 在 diff 里不可见、改坏无人察觉，内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果等价。**目录里没有 `tests/fixtures/`，也不使用 `include_bytes!`。**
 
 v0.7 只列了五种（漏 `Cancel` 和 `Notification`），等于把「最容易被实现成『反正没人用』的两个帧」留在了无保护状态——`Cancel` 恰恰是有竞态的那个，`Notification` 恰恰是不带响应、最容易把字段填错的那个。
 
-**生成顺序是硬规则（v0.9）：先用实现生成一遍 → 人工逐字段对照 `PROTOCOL.md` 审一遍 → 冻结进仓库 → 测试里只 decode/encode 比对，绝不在测试运行时重新生成。** 测试时重新生成，等于把「当前实现的 bug」固化进 fixture，然后宣称它通过了黄金测试。
+**生成顺序是硬规则（v0.9）：先用实现生成一遍 → 人工逐字段对照 `PROTOCOL.md` 审一遍 → 把审过的字节内联冻结进测试 → 测试里只 decode/encode 比对，绝不在测试运行时重新生成。** 测试时重新生成，等于把「当前实现的 bug」固化进样例，然后宣称它通过了黄金测试。
 
 测试做三件事：
 
-1. `decode(fixture)` 得到预期结构
-2. `encode(结构)` 与 fixture 逐字节相等
+1. `decode(样例)` 得到预期结构
+2. `encode(结构)` 与样例逐字节相等
 3. **反例断言**：`Cancel.service_id != 0`、`Notification.request_id == 0`、`Handshake` 的 `reserved != 0` 这类「必须为 0 / 非 0」的硬约束，必须各有一条「填错就被拒」的用例。只测正例，等于硬约束没人守
 
 **这类测试的价值在于防「善意的重构」**：某天有人把 `request_id` 改成 u32 以省 4 字节，功能测试全绿，只有黄金样例会红。协议测试不该依赖「记得同步改文档」。

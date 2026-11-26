@@ -1,6 +1,6 @@
 # photon 分层详细设计 —— 索引与全局约束
 
-> 本组文档是 `docs/design.md`（**v0.10**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。
+> 本组文档是 `docs/design.md`（**v0.12**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。v0.11 只动模块布局：入口文件改为 `transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`（2024 风格，不用 `*/mod.rs`）。v0.12 改样例承载方式：七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 内联字节数组，目录与 `include_bytes!` 一并取消；线格式与接口签名均未变化。
 >
 > 三类文档的优先级从高到低：**`docs/PROTOCOL.md`（线格式唯一权威）> `docs/design.md`（架构与决策）> `docs/detail/*.md`（实现细节）**。任何冲突以高优先级为准；本组文档若与 `design.md` 打架，是本文档的 bug，不是 `design.md` 的。
 
@@ -46,7 +46,7 @@
 |---|---|---|
 | `INV-01` | 协议头恰好 24 字节，字段偏移固定，全文小端 | 黄金样例 decode/encode 双向比对 |
 | `INV-02` | 消息内 payload 起始偏移恒为 24；**绝对地址 8 字节对齐只对 `memory` / `shm` 成立**（流式 transport 从第二帧起基址任意） | `memory`/`shm` 路径的 `debug_assert`；`tcp`/`local` 路径禁止开 rkyv 原地读（M5 的单测必须按 transport 分别断言） |
-| `INV-03` | `Request` / `Notification` / `Cancel` 的 `request_id != 0`；`Request` / `Notification` 的 `method != 0`；`Response` 的 `request_id != 0`；`Response` / `Cancel` / `GoAway` / `Handshake` 的 `service_id` / `method` / `deadline_ms` 必须为 0 | 反例 fixtures（字段填错必须被拒）；清单以 `PROTOCOL.md` §9 为准 |
+| `INV-03` | `Request` / `Notification` / `Cancel` 的 `request_id != 0`；`Request` / `Notification` 的 `method != 0`；`Response` 的 `request_id != 0`；`Response` / `Cancel` / `GoAway` / `Handshake` 的 `service_id` / `method` / `deadline_ms` 必须为 0 | 反例用例（字段填错必须被拒）；清单以 `PROTOCOL.md` §9 为准 |
 | `INV-04` | `request_id` 由发起方分配、只在本端 pending 表内唯一；`Response` / `Cancel` 里的 id 按连接方向解释 | 双向并发测试（两侧各自从 1 开始仍不串包） |
 | `INV-05a` | `max_message_len` 双向独立：reader 上限 = 本端声明，writer 上限 = 对端声明；握手前两侧固定 64 KiB | 协商测试：A 声明 1 MiB / B 声明 64 KiB，B 发 500 KiB 必须被 A 接受、A 发 500 KiB 必须被本地拒 |
 | `INV-05b` | `max_message_len >= 24`；`shm` 上 `<= slot_size` | 建会话前的拒绝测试（两个越界值各一条） |

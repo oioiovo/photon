@@ -2,7 +2,7 @@
 
 > **本文件是 photon 线格式的唯一权威。** `docs/design.md` 3.3.1 的逐 kind 表是设计视角速查表，与本文同源；两者不一致时以本文为准，且必须立刻修正速查表。
 >
-> 当前对应 `design.md` **v0.10**，`protocol_version = 1`。v0.10 只改了口径与校验清单（对齐断言收窄到 `memory` / `shm`、`deadline_ms` 两侧起点、§9 补 5 条校验），**字节布局零改动**。
+> 当前对应 `design.md` **v0.12**，`protocol_version = 1`。v0.12 只改样例的承载方式（黄金样例从 `.bin` 文件改为源码内联字节数组，`tests/fixtures/` 目录不再存在），**字节布局、字段语义与 17 条校验一字未动**；v0.11 只改工程约定（模块文件改 2024 风格、edition/resolver、workspace 成员名），同样零字节改动；v0.10 改的是口径与校验清单（对齐断言收窄到 `memory` / `shm`、`deadline_ms` 两侧起点、§9 补 5 条校验），同样零字节改动。
 
 ---
 
@@ -221,7 +221,7 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 
 ## 8. 黄金样例
 
-**样例中 `request_id` / `method` 均取占位常量，不代表线上真实值**——`method` 的真实值由宏在编译期对方法名做 xxh3-64 得到，它的 golden 向量放在 `photon-macros` 的单元测试里（**不放进本文件，也不放进 `tests/fixtures/method_ids.txt` 之外的任何 `.bin`**）。本节的样例只锁「头 + 边界 + 逐 kind 语义」。
+**样例中 `request_id` / `method` 均取占位常量，不代表线上真实值**——`method` 的真实值由宏在编译期对方法名做 xxh3-64 得到，它的 golden 向量放在 `photon-macros` 的单元测试里（**不放进本文件，也不与 §8 的线格式样例混在一起**）。本节的样例只锁「头 + 边界 + 逐 kind 语义」。
 
 样例里的 payload 用少量占位字节（`AA BB` / `CC` / `DD`），因为它们的内容归 codec，不属于线格式。
 
@@ -340,17 +340,21 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 | 32–33 | `00 00` | `codec_id` | 0 = postcard |
 | 34–35 | `00 00` | `reserved` | 必须 0 |
 
-### 8.8 样例与 fixture 文件对应
+### 8.8 样例与测试位置对应
 
-| 样例 | 文件 | 字节数 | 断言重点 |
+| 样例 | 测试中的样例名 | 字节数 | 断言重点 |
 |---|---|---|---|
-| 8.1 | `tests/fixtures/request.bin` | 26 | 四字段均非 0；payload 起点 24 |
-| 8.2 | `tests/fixtures/response_ok.bin` | 25 | `service_id`/`method`/`deadline_ms` 全 0；bit0=0 |
-| 8.3 | `tests/fixtures/response_err.bin` | 40 | 错误体 8B 前缀 + 变长 message；bit0=1 |
-| 8.4 | `tests/fixtures/notification.bin` | 25 | 无 `Response` 承诺；id 非 0 |
-| 8.5 | `tests/fixtures/cancel.bin` | 24 | payload 空；`service_id` = 0 |
-| 8.6 | `tests/fixtures/goaway.bin` | 24 | 全零头；急停变体只差 flags |
-| 8.7 | `tests/fixtures/handshake.bin` | 36 | 12 字节 payload；`reserved` = 0 |
+| 8.1 | `"Request"` | 26 | 四字段均非 0；payload 起点 24 |
+| 8.2 | `"Response Ok"` | 25 | `service_id`/`method`/`deadline_ms` 全 0；bit0=0 |
+| 8.3 | `"Response Err"` | 40 | 错误体 8B 前缀 + 变长 message；bit0=1 |
+| 8.4 | `"Notification"` | 25 | 无 `Response` 承诺；id 非 0 |
+| 8.5 | `"Cancel"` | 24 | payload 空；`service_id` = 0 |
+| 8.6 | `"GoAway"` / `"GoAway 急停"` | 24 | 全零头；急停变体只差 flags |
+| 8.7 | `"Handshake"` | 36 | 12 字节 payload；`reserved` = 0 |
+
+七个样例全部内联在 `photon/tests/protocol.rs` 的 `golden_samples_match_protocol_section_8` 里，
+由 `assert_golden(name, header, payload, expected)` 断言「encode 出的字节与冻结字面量逐字节一致」。
+**没有 `.bin` 文件，也没有 `include_bytes!`**：理由见 §11 第 5 条。
 
 ---
 
@@ -408,11 +412,12 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 
 ## 11. 生成、冻结与验证
 
-1. **生成**：先用实现编码出这七种帧（不是手敲 hex），导出为 `.bin`。
+1. **生成**：先用实现编码出这七种帧（不是手敲 hex），把结果打印成字节数组。
 2. **人工审**：对照本文件第 2–8 节逐字节核对一遍（偏移、宽度、小端、必须为 0 的字段）。
-3. **冻结**：`.bin` 提交进仓库，从此不再重新生成。
-4. **验证**：测试只做「decode 冻结样例 → 字段断言」与「encode → 与冻结样例逐字节比对」，**绝不在测试运行时重新生成**——那样 fixture 只是把当前实现的 bug 固化下来。
-5. **反例**：另外维护一组「必须被拒」的样例（可直接内联在测试里，不必进 `.bin`）：
+3. **冻结**：把核对过的字节数组**内联**进 `photon/tests/protocol.rs`（作为 `assert_golden` 的 `expected` 参数），从此不再重新生成。
+4. **验证**：测试只做「decode 冻结样例 → 字段断言」与「encode → 与冻结字节逐字节比对」，**绝不在测试运行时重新生成**——那样样例只是把当前实现的 bug 固化下来。
+5. **为什么内联而不是 `.bin` + `include_bytes!`**：二进制产物在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可见、可以逐段写注释（标明字段名与宽度），冻结效果完全等价——两者都是「运行时不再重新生成」。代价只是测试文件长一些，这个代价不值得用一层文件路径管理去交换。
+6. **反例**：另外维护一组「必须被拒」的用例（同样内联在 `photon/tests/protocol.rs`，形式是「合法头 + 单字段破坏」）：
    - `Cancel.service_id != 0`
    - `Notification.request_id == 0`
    - `Handshake.reserved != 0`
