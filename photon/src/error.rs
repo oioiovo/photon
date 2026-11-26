@@ -27,11 +27,13 @@ pub struct RemoteError {
 }
 
 impl RemoteError {
-    /// 回包侧主动构造 `Remote` 的唯一入口，只给三个码用：`2` UnknownService、
+    /// 回包侧构造 `Remote` 的入口，只给三个码用：`2` UnknownService、
     /// `3` UnknownMethod、`7` ShuttingDown。
     ///
-    /// 发起侧不许用它——那边只能从错误体解出 `Remote`，自己造等于凭空伪造
-    /// 对端状态。
+    /// L3 内部回包走的是 `send_error`（直接写错误体，不必绕成 `RpcError`），
+    /// 这个构造器只给「手上必须交出一个 `RpcError`」的地方用——目前是宏生成的
+    /// unknown-method 分支。发起侧不许碰它：那边只能从错误体解出 `Remote`，
+    /// 自己造等于凭空伪造对端状态。
     pub fn new(code: u32) -> Self {
         Self {
             code,

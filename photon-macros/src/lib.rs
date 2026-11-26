@@ -203,29 +203,33 @@ fn expand(
         }
 
         /// 该服务的异步客户端。线上永远异步，与 handler 声明形态无关。
-        pub struct #client<T>
+        ///
+        /// 只泛型化到「传输半身」而不是 `Transport`：进程内配对（`Memory::pair`）
+        /// 不实现 `Transport`，绑在它上面会让同一条链路的两端用不上同一份 stub。
+        /// 传输相关的入口是 `photon::connect::<T>()`，拿到句柄再 `new` 进来。
+        pub struct #client<S, K>
         where
-            T: ::photon::transport::Transport,
-            T::Source: 'static,
-            T::Sink: 'static,
+            S: ::photon::transport::MessageSource,
+            K: ::photon::transport::MessageSink,
+            S: 'static,
+            K: 'static,
         {
-            handle: ::photon::session::SessionHandle<T::Source, T::Sink>,
+            handle: ::photon::session::SessionHandle<S, K>,
         }
 
-        impl<T> #client<T>
+        impl<S, K> #client<S, K>
         where
-            T: ::photon::transport::Transport,
-            T::Source: 'static,
-            T::Sink: 'static,
+            S: ::photon::transport::MessageSource + 'static,
+            K: ::photon::transport::MessageSink + 'static,
         {
             /// 与 `register_*` 用的是同一个 `service_id`：一处写、两处用。
             pub const SERVICE_ID: u16 = #helper::SERVICE_ID;
 
-            pub fn new(handle: ::photon::session::SessionHandle<T::Source, T::Sink>) -> Self {
+            pub fn new(handle: ::photon::session::SessionHandle<S, K>) -> Self {
                 Self { handle }
             }
 
-            pub fn handle(&self) -> &::photon::session::SessionHandle<T::Source, T::Sink> {
+            pub fn handle(&self) -> &::photon::session::SessionHandle<S, K> {
                 &self.handle
             }
 

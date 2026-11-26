@@ -86,7 +86,7 @@ pub trait Service: Send + Sync + 'static {
 
 | 产物 | 形状 | 说明 |
 |---|---|---|
-| `CalcClient<T>` | 持 `SessionHandle<T::Source, T::Sink>`，方法全是 `async fn` | 线上永远异步，与声明形态无关 |
+| `CalcClient<S, K>` | 持 `SessionHandle<S, K>`，方法全是 `async fn` | 只泛型化到半身，见 v0.18 说明；线上永远异步，与声明形态无关 |
 | `CalcService<S>` | 包一层 `Arc<S>`，`impl Service`，内部 `match method` | 见下方「为什么是包装类型而不是 blanket impl」，v0.17 修 |
 | `register_calc(registry, svc)` | 用 `Calc` 上的 `id` 占号，内部 `CalcService::new(svc)` | 与 stub 共用同一个 `id` 字面量，一处写两处用 |
 | `CalcClient::SERVICE_ID` / `mod __photon_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
@@ -152,7 +152,7 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
 1. **`tokio::spawn` 只在 L3 发生一次**（`tokio::spawn(svc.call(method, payload))`）。这里的三个分支只回答「这次执行落在哪个线程池」，不是「各自再 spawn 一次」。
 2. **`fn` 分支不换线程**，就在 poll 它的 worker 上就地跑完。微秒级无所谓，毫秒级就是 worker 被占住——所以需要第 7 节的 debug 告警。
 3. **`spawn_blocking` 的 `JoinHandle` 必须 await**，`JoinError` 映射成 `code = 0`；`tokio::spawn` 的句柄同理（在 L3 await）。丢掉句柄 = handler panic 无声，客户端只等到超时。
-4. **未知 method 返回 `Remote{code:3}`，不是 `Protocol`**——帧格式没错，是方法没注册。这个 `Remote` 由**回包侧**（正在回 `Response` 的一方）构造，因而是**合法**的；`RemoteError::new(code)` 是唯一允许的构造入口，全项目只允许三处用它（`2` / `3` / `7`，见 `02-l2-protocol.md` 7.3）。**注意这条在 v0.9 被误标成「服务端伪造远端错误」——那是把「发起侧不许造 `Remote`」错当成了「谁都不许造」**；正确的规则是方向相关：发起侧只能从错误体得到 `Remote`，回包侧可以主动构造。
+4. **未知 method 返回 `Remote{code:3}`，不是 `Protocol`**——帧格式没错，是方法没注册。这个 `Remote` 由**回包侧**（正在回 `Response` 的一方）构造，因而是**合法**的；`RemoteError::new(code)` 是这条路径上允许的构造入口（`2` / `3` / `7` 三个码，见 `02-l2-protocol.md` 7.3）；L3 内部回 `2` / `7` 走的是 `send_error`，不必绕成 `RpcError`。**注意这条在 v0.9 被误标成「服务端伪造远端错误」——那是把「发起侧不许造 `Remote`」错当成了「谁都不许造」**；正确的规则是方向相关：发起侧只能从错误体得到 `Remote`，回包侧可以主动构造。
 
 参数解码位置：**`async fn` / `fn` 分支在 `call` 开头** `let (a, b) = Default::decode::<(i64, i64)>(&payload)?;`；**`#[photon(blocking)]` 分支必须在 `spawn_blocking` 的闭包里 decode**（v0.10 修）——v0.9 把它写在闭包外，等于只在调用线程上解析、闭包里只剩执行，一次线程切换只干了一件事；更糟的是 decode 出错时闭包外的 `?` 会让 `payload` 在闭包捕获前就被借用，写出来的代码通常编译不过或被迫多一次 clone。解码失败一律 `code = 4`。`Vec<u8>` 等容器类型直接走 serde，不需要特殊处理。
 
@@ -239,65 +239,85 @@ v0.9 的四份文档把「宏产出什么」写得很细，却**没有一处说�
 
 ```rust
 pub struct Server<T: Transport> {
-    transport: T,                 // bind 的产物（可 clone 的 listener 包装，不是每连接状态）
-    registry: Arc<ServiceRegistry>,
+    transport: T,                 // bind 的产物（listener，不持有每连接状态）
+    registry: ServiceRegistry,    // 按值持有，`serve` 时才包 Arc（v0.18 修）
     transport_opts: TransportOptions,
     session_opts: SessionOptions, // 含 max_message_len（v0.10 从 TransportOptions 迁来）
 }
 
-impl<T: Transport> Server<T> {
+impl<T: Transport + 'static> Server<T> {
     pub async fn bind(ep: &Endpoint, transport_opts: TransportOptions,
                       session_opts: SessionOptions) -> io::Result<Self>;
-    pub fn register<S: Service>(&mut self, id: u16, svc: Arc<S>) -> Result<(), RegistryError>;
+    pub fn registry(&mut self) -> &mut ServiceRegistry;         // 给宏生成的 register_xxx 用
+    pub fn transport(&self) -> &T;                               // 端口写 0 时靠它拿真地址
+    pub fn register(&mut self, id: u16, svc: Arc<dyn Service>) -> Result<(), RpcError>;
     pub async fn serve(self) -> io::Result<()>;                 // accept 循环，永不返回（除错误）
-    pub async fn serve_with(self, mut on_conn: impl FnMut(Arc<Session<T::Source, T::Sink>>)) -> io::Result<()>;
+    pub async fn serve_with<F: FnMut(Arc<Session<T::Source, T::Sink>>)>(self, on_conn: F) -> io::Result<()>;
 }
 ```
+
+注册表**按值**持有而不是 `Arc<ServiceRegistry>` 一开始就共享：注册只该发生在 `bind` 之后、`serve` 之前，把 `Arc` 提前交出去等于允许「运行中改路由」，那要么加锁、要么出现「一半连接用旧表」。`serve` 内部再 `Arc::new`，每连接 `clone` 一次——一个进程一次的事，不在热路径上。
 
 规则：
 
 - **`bind` 是异步的**（`L1-C4`，v0.13 起）：底层的 `tokio::net::TcpListener::bind().await` 会把 fd 注册进当前 runtime，这一步只能在 executor 里做。做成异步后这个前置条件由类型承担，调用方漏了 runtime 是编译不过的，而不是拿到一个「看起来像绑定失败」的构造期 panic。用法就是 `Server::bind(ep, transport_opts, session_opts).await?`，天然落在 `#[tokio::main]` 的异步段里。
-- `register` 就是宏生成的 `register_calc(registry, svc)` 的薄包装：**注册发生在 `bind` 之后、`serve` 之前**，撞号返回 `Err`、**不覆盖**已有服务（`INV-14`）。
+- `register` 与宏生成的 `register_calc(registry, svc)` 是同一件事的两个入口：前者收已装箱的 `Arc<dyn Service>`，后者收具体类型并在内部包一层 `CalcService<S>`。**注册发生在 `bind` 之后、`serve` 之前**，撞号返回 `Err`、**不覆盖**已有服务（`INV-14`），这也是 `registry()` 只给 `&mut` 的理由——`serve` 一调用就再没有可变入口了。
 - 三个配置各归各位，不许合并成一个 `Options`：`TransportOptions` 给 L1（`connect_timeout` / `spin_hint`），`SessionOptions` 给 L3（`max_message_len` / 配额 / `payload_mode` / 超时）。`design.md` 2.7 已经因为「塞在一起」返工过一次。
 
 ### 10.2 accept 循环与每连接的会话
 
 ```rust
-while let Ok((source, sink)) = transport.accept(&transport_opts).await {
-    let registry = registry.clone();               // Arc 共享，不是每连接一份
-    let opts = session_opts.clone();
+let registry = Arc::new(self.registry);
+loop {
+    let (source, sink) = match self.transport.accept(&self.transport_opts).await {
+        Ok(pair) => pair,
+        Err(err) if is_per_connection(&err) => { continue; }   // 这个连接坏了，listener 还好
+        Err(err) => return Err(err),                           // listener 级失败
+    };
+
+    let (session, _handle) = Session::new(source, sink, Arc::clone(&registry),
+                                          self.session_opts.clone())?;
     tokio::spawn(async move {
-        let (session, _handle) = Session::new(source, sink, registry, opts);
-        // 这是骨架：持有 Arc<Session> 直到本条连接结束（对端 EOF / 双方宣告关闭），
-        // 结束时按 `03-l3-session.md` 7.3 的六步调 `session.close().await`。
+        session.wait_closed().await;      // 唯一的「连接结束」信号（v0.18 新增）
+        let _ = session.close().await;    // 已 Closed 时返回 Err(Closed)，忽略即可
     });
 }
 ```
 
-- **`ServiceRegistry` 是 `Arc` 共享给所有连接的**：每连接复制一份注册表会让「热更新服务」变成不可能，而且白白多 N 份 map。`Server` 持一份，`accept` 时 `clone` 给每个 `Session`。
+- **`ServiceRegistry` 是 `Arc` 共享给所有连接的**：每连接复制一份注册表会让「同一进程内路由不一致」变成可能，而且白白多 N 份 map。`serve` 里包一次 `Arc`，每连接 `clone` 给 `Session`。
 - **每连接一个 `Session`，两个 task（reader/writer）**；`serve` 本身只做 accept，不参与收发。这样 N 条连接 = N×2 个 task，与「每连接两个半身」的结构一致。
 - `SessionHandle`（发起端）在纯服务端场景用不上，但**不能随手丢掉**：定死 `SessionHandle::drop` **不关连接**（它只是个请求入口），真正关闭由 `Arc<Session>::close()` 或 drop 最后一个 `Arc<Session>` 决定。这一条不写，示例里 `let (session, _handle) = ...` 会被人当成「丢了就会关」。
-- 服务端驱动的收尾入口**只有一个**：`Session::close(&self)`（`03` 7.3 六步）。「等对端 `GoAway` / EOF 再收尾」的等待逻辑属于 `Session` 内部，不要在示例代码里再拼一套状态机。
+- 服务端驱动的收尾入口**只有一个**：`Session::close(&self)`（`03` 7.3 六步）。「等对端 `GoAway` / EOF 再收尾」的等待逻辑属于 `Session` 内部，不要在示例代码里再拼一套状态机。**「连接结束了没有」也只有一个观测点**：`Session::wait_closed()`（监听 `closed: Arc<Notify>`）；别用 `is_closed()` 轮询，那会在每条连接上留一个 1 ms 定时器。
 - accept 循环的错误分两类：**单连接 `accept` 失败**（对端提前断开）记 `debug` 后继续；**listener 级别失败**（`EMFILE`、listener 被关）直接返回 `Err`。不要用 `while let Ok(..)` 把 listener 错误静默吞成「永远 accept 不到新连接」。
 
 ### 10.3 客户端：泛型还是 `AnyTransport`
 
 | 场景 | 用什么 | 理由 |
 |---|---|---|
-| 生产 / 基准 | `CalcClient<TcpTransport>`（或 `Local`） | 泛型单态化，零门面开销；`INV-18` 禁止基准用门面 |
-| 示例的 `--transport` 开关 / 测试矩阵 | `CalcClient<AnyTransport>` | 运行时选择，接受一次 box |
+| 生产 / 基准 | `connect::<TcpTransport>`（或 `Local`） | 泛型单态化，零门面开销；`INV-18` 禁止基准用门面 |
+| 示例的 `--transport` 开关 / 测试矩阵 | `connect_any` + `AnyTransport` | 运行时选择，接受一次 box |
+| 进程内自测 | `Memory::pair` + `CalcClient::new` | 没有端点、没有 `Transport`，仍走同一条 L2/L3 代码 |
 
-**`CalcClient` 的类型参数来自 transport，而不是 codec**（v0.10）：`C` 已从 `Session` 删掉，客户端自然也不该有。签名形状：
+**`CalcClient` 的类型参数是传输半身，不是 transport（v0.18 修）**。v0.10 起写的是 `CalcClient<T: Transport>`，看起来最自然，实际是错的：`Memory::pair` 明确不实现 `Transport`（它没有 `bind`/`connect`/`accept` 可对应），于是 `local_calc` 这条最重要的「一条命令跑通」路径反而用不上生成的 stub。改成两个类型参数之后，stub 只依赖 `SessionHandle<S, K>`，与「连接是怎么建立的」完全解耦：
 
 ```rust
-impl<T: Transport> CalcClient<T> {
-    pub async fn connect(ep: &Endpoint, opts: ConnectOptions) -> io::Result<Self>;
-    // ConnectOptions 把 TransportOptions 与 SessionOptions 打包，避免 connect 出现两套参数顺序
+pub struct CalcClient<S, K>
+where S: MessageSource + 'static, K: MessageSink + 'static
+{ handle: SessionHandle<S, K> }
+
+impl<S, K> CalcClient<S, K> {
+    pub fn new(handle: SessionHandle<S, K>) -> Self;
+    // 业务方法：encode → call → decode，全部 async
 }
 
-impl CalcClient<AnyTransport> {
-    pub async fn connect_any(ep: &Endpoint, opts: ConnectOptions) -> io::Result<Self>;
-}
+// 连接是独立的一步，按传输类型单态化
+pub async fn connect<T: Transport>(ep: &Endpoint, opts: ConnectOptions)
+    -> Result<SessionHandle<T::Source, T::Sink>, RpcError>;
+```
+
+于是「换传输」只换 `connect::<T>` 这一处，`CalcClient` 与业务代码一行不动；`ConnectOptions` 把 `TransportOptions` 与 `SessionOptions` 打包，避免 connect 出现两套参数顺序。`connect` 还会等握手到 `Ready`：`codec_id` / 版本不符在这里就变成 `Err`，不留到第一次业务调用超时。
+
+**这条改判的代价**：用户多写一行 `CalcClient::new(connect::<T>(ep, opts).await?)`。换来的是「进程内配对、UDS、TCP、shm 共用同一份客户端代码」，这也是 `tests/concurrency.rs` 能在两条传输上跑同一套断言的前提。
 ```
 
 - `connect` 内部顺序固定：`transport.connect(ep, &transport_opts)` → `Session::new(source, sink, empty_registry, session_opts)` → 取 `SessionHandle` 包进客户端。

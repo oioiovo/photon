@@ -17,7 +17,11 @@ pub use bytes::Bytes;
 pub use codec::Codec;
 pub use error::{RemoteError, RpcError};
 pub use photon_macros::service;
-pub use session::{ServiceRegistry, Session, SessionHandle, SessionOptions};
+pub use session::{
+    ConnectOptions, Server, ServiceRegistry, Session, SessionHandle, SessionOptions,
+    client::connect,
+};
+pub use transport::{Endpoint, MessageSink, MessageSource, Transport, TransportOptions};
 
 use std::future::Future;
 use std::pin::Pin;

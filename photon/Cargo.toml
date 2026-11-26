@@ -32,3 +32,17 @@ codec-postcard = []
 [[example]]
 name = "echo"
 required-features = ["tcp"]
+
+# 单进程示例：只需要 memory 与 codec。
+[[example]]
+name = "local_calc"
+required-features = ["memory", "codec-postcard"]
+
+# 跨进程最小集：TCP。
+[[example]]
+name = "calc_server"
+required-features = ["tcp", "codec-postcard"]
+
+[[example]]
+name = "calc_client"
+required-features = ["tcp", "codec-postcard"]

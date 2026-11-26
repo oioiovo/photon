@@ -232,7 +232,7 @@ pub fn to_wire(e: &RpcError) -> Option<(u32, bool, String)>
 | `Closed` | `7`（回包侧声明「本端正在关闭」是准确陈述，`7` 就是为这句话留的） |
 | `Io` / `Protocol` / `RuntimeDropped` | `None`（框架自身出问题，编成任何业务码都是误导；按 `0` 兜底，**不静默丢帧**） |
 
-**`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**：由**回包侧**用 `RemoteError::new(code)` 造 `Remote`，再经 `to_wire` 透传（`Remote` 走原码直通）。只允许三处调用：查不到 `service_id`、查不到 `method`、`ingress == Draining`。这条同时堵住两个已经写歪的地方：`04-l4-api.md` 的未知方法分支曾自己 `RemoteError::new(3)` 却没说明「这是回包侧允许的行为」，`03-l3-session.md` 曾把 `Timeout → 6`、`Overloaded → 1` 写成散装映射、绕过白名单。
+**`UnknownService`（2）/ `UnknownMethod`（3）/ `ShuttingDown`（7）没有对应的 `RpcError` 变体**：由**回包侧**构造，且只有两个入口——`Session::send_error(code, retryable, message)`（L3 内部直接写错误体，不需要绕成 `RpcError`）与 `RemoteError::new(code)`（手上必须交出一个 `RpcError` 时，目前只有宏的 unknown-method 分支）。只允许编码这三个码：查不到 `service_id`、查不到 `method`、`ingress == Draining`。这条同时堵住两个已经写歪的地方：`04-l4-api.md` 的未知方法分支曾自己 `RemoteError::new(3)` 却没说明「这是回包侧允许的行为」，`03-l3-session.md` 曾把 `Timeout → 6`、`Overloaded → 1` 写成散装映射、绕过白名单。
 
 `RpcError` 必须 `#[non_exhaustive]`：公开枚举不加这个标记，每加一个变体都是 semver 破坏。
 

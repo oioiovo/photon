@@ -22,19 +22,23 @@
 pub struct Session<S, K>
 where S: MessageSource, K: MessageSink
 {
-    next_id:  AtomicU64,                              // 从 1 起；0 保留
-    outbound: Arc<parking_lot::Mutex<OutboundTable>>, // pending + async_used（出站配额）
-    inbound:  Arc<parking_lot::Mutex<InboundQuota>>,  // async_used + blocking_used（入站配额）
-    handlers: AtomicUsize,                            // 已 dispatch、未回包的 handler 数（契约计数）
-    cancels:  parking_lot::Mutex<HashMap<u64, CancellationToken>>, // 服务端专用
-    registry: Option<Arc<ServiceRegistry>>,           // 服务端 Some，客户端 None
-    shutdown: CancellationToken,                      // 覆盖 reader 与 writer 两个 task
-    tx:       mpsc::Sender<Bytes>,                    // bounded(1024)，可 clone
-    state:    ClosingState,                           // 见 7.1（两方向 + 两个宣告位）
-    limits:   (Arc<AtomicU32>, Arc<AtomicU32>),       // (recv_limit, send_limit)，握手后写
-    reader:   parking_lot::Mutex<Option<JoinHandle<()>>>,
-    writer:   parking_lot::Mutex<Option<JoinHandle<()>>>,
-    opts:     SessionOptions,
+    next_id:     AtomicU64,                              // 从 1 起；0 保留
+    outbound:    Arc<parking_lot::Mutex<OutboundTable>>,  // pending + async_used（出站配额）
+    inbound:     Arc<parking_lot::Mutex<InboundQuota>>,   // async_used（入站配额）
+    handlers:    Arc<AtomicUsize>,                        // 已 dispatch、未回包的 handler 数
+    cancels:     Arc<parking_lot::Mutex<HashMap<u64, CancellationToken>>>,
+    registry:    Arc<ServiceRegistry>,                    // 客户端传 empty()，不是 Option（v0.18）
+    shutdown:    CancellationToken,                       // 覆盖 reader 与 writer 两个 task
+    tx:          mpsc::Sender<Bytes>,                     // bounded(1024)，可 clone
+    phase:       AtomicU8,                                // 协商 / Ready / Closed（见 7.1）
+    egress_open: AtomicBool,                              // 还能不能发起新请求
+    peer_goaway: AtomicBool,                              // 对端宣告过关闭
+    closing:     AtomicBool,                               // `close()` 只走一次
+    closed:      Arc<Notify>,                              // `wait_closed()` 的通知源（v0.18）
+    limits:      (Arc<AtomicU32>, Arc<AtomicU32>),        // (recv_limit, send_limit)，握手后写
+    reader:      parking_lot::Mutex<Option<JoinHandle<()>>>,
+    writer:      parking_lot::Mutex<Option<JoinHandle<()>>>,
+    opts:        SessionOptions,
 }
 ```
 
@@ -46,9 +50,14 @@ where S: MessageSource, K: MessageSink
 | `cancels` | reader 在 spawn **之前**登记 | 紧跟 `Request` 到达的 `Cancel` 扑空，取消静默丢失 |
 | `shutdown` | 必须同时被 reader 与 writer 的 `select!` 监听 | 只取消 reader 时，卡在 `sink.send().await` 的 writer 关不掉 |
 | `tx` | 普通 `Sender`，**不是 `Option`** | 置 `None` 会让在途 `Response` 与 `Remote{7}` 都发不出去 |
-| `state` | 两个方向各一个 + 两个「已宣告关闭」位 | 用单一枚举表达整条会话状态，必然出现「已 Draining 但仍需回包」无法表达 |
+| `phase` + `egress_open` + `peer_goaway` + `closing` | 用一个 `AtomicU8` 表达「整条会话走到哪一步」，三个 bool 各管一件正交的事 | 用单一枚举表达全部状态，必然出现「已 Draining 但仍需回包」无法表达 |
 | `limits` | **在 move 半身进 task 之前**取好 | move 之后 `&self` 再也拿不到 `Arc` |
 | `reader` / `writer` | `Mutex<Option<JoinHandle>>` | 普通字段无法从 `&self` 里 `take()` 出来 await |
+| `closed` | 进 `Closed` 的唯一写点（`set_closed`）都 `notify_waiters` | 漏一处就打不开 `wait_closed`，`serve` 循环会永远按着那条连接 |
+
+**`wait_closed()` 是「连接结束」的唯一观测点（v0.18）**。reader / writer 都是内部 spawn 的，外部拿不到它们的句柄；`serve` 循环又不能靠轮询 `is_closed()`（每条连接一个 1 ms 定时器，1024 条连接就是 1024 个空转）。所以加一个 `Arc<Notify>`，进 `Closed` 的两个写点（`close()` 正常收尾、`fail()` 断连）都通知一次。
+
+实现细节：`wait_closed()` 里**先建 `notified()` 再看 `phase`**。反过来写（先看状态再 await）会丢掉「检查完到 await 之间」那次通知——`notify_waiters` 只唤醒当时已经存在的 waiter，于是这个等待永远醒不过来。
 
 `Session` 用 `AnySource` / `AnySink` 时退化为枚举门面（代价见 L1 文档第 8 节；**基准测试禁用门面**，`INV-18`）。
 
@@ -175,7 +184,7 @@ loop {
    - `GoAway`：`state.egress = Draining`（本端不再发新请求）＋ **`state.peer_goaway = true`**；若 `state.self_goaway` 也已为真（双方都宣告过），则 `state.ingress = Draining`（此后到达的 `Request` 回 `Remote{7}`）。bit2 急停则直接走急停分支（见 6.4）。**注意 `GoAway` 本身不改 `ingress`**，除非满足「双方都已宣告」。
    - `Request` / `Notification`：先看 `state.ingress`：
      - `Draining` → **不 dispatch**，直接回 `Remote { code: 7 }`（`Request` 才回，`Notification` 静默丢弃）；
-     - `Open` → 查 `registry[service_id]`：查不到 → 回 `Remote { code: 2 }`（回包侧构造：`RemoteError::new(2)`，经 `to_wire` 透传，见 `02` 7.3）；查得到再走 6.2。
+     - `Open` → 查 `registry[service_id]`：查不到 → 回 `Remote { code: 2 }`（回包侧构造：`send_error(req_id, 2, false, "unknown service")`，见 `02` 7.3）；查得到再走 6.2。
 3. `Request` 的准入顺序（一步都不能挪）：
    - **先**入站配额 `inbound.try_acquire(shape)`；抢不到 → 合成 `code = 1` 回包，结束（不 spawn、不登记 token）；
    - **再** `cancels.lock().insert(id, token)`；
@@ -249,8 +258,8 @@ loop {
 
 ### 6.2 dispatch 内部（服务端）
 
-1. `let svc = registry.get(service_id)` → 无 → `RemoteError::new(2)`（回包侧构造，见 `02` 7.3）；
-2. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RemoteError::new(3)`；
+1. `let svc = registry.get(service_id)` → 无 → `send_error(id, 2, false, "unknown service")`（回包侧构造，见 `02` 7.3）；
+2. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `RpcError::Remote(RemoteError::new(3))`（这里必须交出一个 `RpcError`，所以走构造器而不是 `send_error`）；
 3. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
 4. 结果映射：**唯一出口是 `to_wire(&RpcError) -> Option<(u32, bool, String)>`**（`02-l2-protocol.md` 7.3 的白名单）：
    - `Ok(Ok(bytes))` → `Response`，flags bit0 = 0；
@@ -326,6 +335,7 @@ struct ClosingState {
 4. 两个 task 各自退出：writer **先排空 `rx` 再退**、退出即 drop `sink`；reader 退出即 drop `source`。**不需要 `flush`**——最后一次 `send().await` 返回 `Ok` 即数据已交给内核缓冲。注意 drop `sink` 只是**加速路径**：能让对端尽早读到 EOF，但不是关闭契约的一部分（L1 2.2）。无半关闭的实现上这一步等价于空操作，收尾照样靠第 1 步的 `GoAway` 和第 6 步的超时。
 5. `close()` 里从 `Mutex<Option<JoinHandle>>` 里 `take()` 出两个句柄并 await；`JoinError` 必须当场处理并归为断连，不能 `let _ =`。
 6. 兜底：`opts.close_timeout`（默认 5 s）未走完 → 强制 `shutdown.cancel()` + `abort` 两个 task，所有 pending 与 handler guard 置 `Closed`。
+7. 最后一步 `set_closed()`：`phase = Closed` + `closed.notify_waiters()`。**这一处和 `fail()` 是仅有的两个写点**，其他任何地方都不许直接改 `phase`——漏掉通知会让 `serve` 循环永远认为连接还活着。
 
 > **第 3 步之后还有没有人能写？** 第 2 步已经保证 pending 与 handler 双零，此后没有合法的 `tx.send()` 来源。剩下的竞争只有两种：某个 handler 恰好在第 2 步读到零的瞬间完成（它的 `Response` 已经在队列里或正在 `send`，writer 排空照样写出去），以及应用层在 `close()` 之后硬塞请求（被 `egress = Draining` 挡掉，返回 `Closed`）。排空循环之后的极少数迟到帧会拿到 `send` 错误——那是「队列已关」，不是数据丢失。
 
@@ -369,12 +379,12 @@ struct ClosingState {
 | blocking client 的 runtime 已 drop | `RpcError::RuntimeDropped` | 否（仅同步客户端路径） | 本地构造 |
 | 对端 handler panic | `Remote { code: 0 }` | 否 | 回包侧 `to_wire(Internal)` |
 | 对端入站配额满 | `Remote { code: 1 }` | 否 | 回包侧 `to_wire(Overloaded)` |
-| 服务未注册 | `Remote { code: 2 }` | 否 | 回包侧 `RemoteError::new(2)` → `to_wire` |
-| 方法未注册 | `Remote { code: 3 }` | 否 | 回包侧 `RemoteError::new(3)` → `to_wire` |
+| 服务未注册 | `Remote { code: 2 }` | 否 | 回包侧 `send_error(.., 2, ..)` |
+| 方法未注册 | `Remote { code: 3 }` | 否 | 回包侧 `RemoteError::new(3)`（宏生成的分支） |
 | payload 解码失败 / 参数不合法 | `Remote { code: 4 }` | 否 | 回包侧 `to_wire(InvalidInput)` |
 | 对端按 `Cancel` 中止 | `Remote { code: 5 }` | 否 | 回包侧 `to_wire(Cancelled)` |
 | 对端自己判 deadline | `Remote { code: 6 }` | 否 | 回包侧 `to_wire(Timeout)` |
-| 双方宣告关闭后仍有 `Request` / 对端在优雅关闭 | `Remote { code: 7 }` | 否 | 回包侧 `RemoteError::new(7)` → `to_wire` |
+| 双方宣告关闭后仍有 `Request` / 对端在优雅关闭 | `Remote { code: 7 }` | 否 | 回包侧 `send_error(.., 7, ..)` |
 
 铁律：**发起侧的本地变体永不因为「对端说了什么」而被构造**；`Remote{code:1}` 也不许在客户端被翻译成 `Overloaded`。回包侧把本地变体编成错误体是**允许的**（否则服务端根本没法表达「我忙」），这条方向区别见 `02-l2-protocol.md` 7.3。
 

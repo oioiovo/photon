@@ -13,9 +13,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+pub mod client;
+pub mod server;
+
+pub use client::ConnectOptions;
+pub use server::Server;
+
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
@@ -176,6 +182,8 @@ where
     egress_open: AtomicBool,
     peer_goaway: AtomicBool,
     closing: AtomicBool,
+    /// 进 `Closed` 的唯一通知点：`serve` 循环靠它知道这条连接该收尾了。
+    closed: Arc<Notify>,
     limits: (Arc<AtomicU32>, Arc<AtomicU32>),
     reader: Mutex<Option<JoinHandle<()>>>,
     writer: Mutex<Option<JoinHandle<()>>>,
@@ -229,6 +237,7 @@ where
             egress_open: AtomicBool::new(true),
             peer_goaway: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            closed: Arc::new(Notify::new()),
             limits,
             reader: Mutex::new(None),
             writer: Mutex::new(None),
@@ -275,6 +284,28 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.phase.load(Ordering::Acquire) == PHASE_CLOSED
+    }
+
+    /// 等这条连接彻底结束（本端关闭或对端消失都算）。
+    ///
+    /// `serve` 循环需要它：会话的 reader / writer 是内部 spawn 的，外面没有别的
+    /// 信号能说明「这条连接已经不用再持有」。
+    pub async fn wait_closed(&self) {
+        loop {
+            // 先建 waiter 再看状态：反过来的话，检查完到 await 之间发生的
+            // `notify_waiters` 会丢，留下一个永远等不到的通知。
+            let notified = self.closed.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 进 `Closed` 的唯一写点，顺带唤醒所有 `wait_closed`。
+    fn set_closed(&self) {
+        self.phase.store(PHASE_CLOSED, Ordering::Release);
+        self.closed.notify_waiters();
     }
 
     pub fn options(&self) -> &SessionOptions {
@@ -375,7 +406,7 @@ where
         };
         drop(leftovers);
 
-        self.phase.store(PHASE_CLOSED, Ordering::Release);
+        self.set_closed();
         Ok(())
     }
 
@@ -398,9 +429,12 @@ where
 
     /// 出错即断连：连接状态已经不可信，继续读只会放大问题。
     fn fail(&self) {
+        // swap 而不是「先读后写」：并发 reader / 意外路径同时 fail 时，
+        // 只有一方去 drain pending，否则同一条 entry 会被两个线程摘两次。
         if self.phase.swap(PHASE_CLOSED, Ordering::AcqRel) == PHASE_CLOSED {
             return;
         }
+        self.closed.notify_waiters();
         self.egress_open.store(false, Ordering::Release);
         self.shutdown.cancel();
 
