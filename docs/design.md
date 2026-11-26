@@ -2,11 +2,13 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商验收**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc` 一条命令跑通，`calc_server` + `calc_client` 跨进程跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落四块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的两个方向各有证据、三种「谈不拢」在建连期断连。剩下 `BlockingClient` / `calc_local` / `Interceptor` / 业务错误映射 / `PayloadMode` 仍在 M3。
+> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory）、`calc_server`+`calc_client`（TCP）、`calc_local`（UDS，两进程）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落五块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS。剩下 `BlockingClient` / `Interceptor` / 业务错误映射 / `PayloadMode` / 示例七形态仍在 M3。
 >
-> 版本：**v0.22**（M3 第四步：握手协商补验收。`max_message_len` 的机制 v0.16 已落（`Ready` 时 `limits.0 = 本端声明`、`limits.1 = 对端声明`），但此前只有「对端声明决定发送」这一条证据；本版补上「本端声明决定接收」（客户端声明 1 MiB 收下服务端 200 KiB 的回包）与三种建连期拒绝（codec / 版本 / `max_message_len < 24`）。代码零改动，只加用例与文档）
+> 版本：**v0.23**（M3 第五步：`examples/calc_local.rs` —— 同一个二进制 `server` / `client` 两个角色，UDS 上跨进程跑通。业务代码与 `calc_client` 逐行同构，只换 `Endpoint::Local` 与 `LocalTransport`，是「换 transport 不改业务代码」的第一份可执行证据；同时验证了「上次进程崩溃留下的 socket 文件会被 bind 清掉、活着的监听者会被拒绝覆盖」这条本地 IPC 最容易踩的边角。）
 
-> 上一版（v0.21）：M3 第三步：`close()` 按 4.6 走「宣告 → 等在飞双零 → 停 task」，收到对端 `GoAway` 后自己起一个「排空即收尾」的后台任务（不等 EOF，named pipe / shm 上也能收敛）；`ingress` 只在**双方都宣告过**之后才进 Draining，此后的 `Request` 回 `Remote{7}`；新增 `Session::abort()` 发 bit2 急停，writer 看到 `abrupt` 就不排空、丢弃帧数进 `tracing::debug!`。线格式、字节布局与 17 条校验零改动）
+> 上一版（v0.22）：M3 第四步：握手协商补验收。`max_message_len` 的机制 v0.16 已落（`Ready` 时 `limits.0 = 本端声明`、`limits.1 = 对端声明`），但此前只有「对端声明决定发送」这一条证据；本版补上「本端声明决定接收」（客户端声明 1 MiB 收下服务端 200 KiB 的回包）与三种建连期拒绝（codec / 版本 / `max_message_len < 24`）。代码零改动，只加用例与文档）
+
+> 更早（v0.21）：M3 第三步：`close()` 按 4.6 走「宣告 → 等在飞双零 → 停 task」，收到对端 `GoAway` 后自己起一个「排空即收尾」的后台任务（不等 EOF，named pipe / shm 上也能收敛）；`ingress` 只在**双方都宣告过**之后才进 Draining，此后的 `Request` 回 `Remote{7}`；新增 `Session::abort()` 发 bit2 急停，writer 看到 `abrupt` 就不排空、丢弃帧数进 `tracing::debug!`。线格式、字节布局与 17 条校验零改动）
 
 > 更早（v0.20）：M3 第二步：客户端放弃（超时或 future 被 drop）时 `CallGuard` 摘表、归还配额，并由 `PendingEntry::drop` 发 `Cancel`（`try_send`，不因背压卡住放弃路径）；`Notification` 与 `Request` 共用 `dispatch`，只差「不回包」，未注册服务与额度不足只记日志；`SessionHandle::notify` 补齐。线格式、字节布局与 17 条校验零改动）
 
@@ -43,6 +45,7 @@
 
 | **v0.18** | **M2 收尾：服务端装配、客户端连接、示例与并发验收，线格式零改动**。① **`Server<T>`**：`bind(ep, transport_opts, session_opts)` → `register`（撞号 `Err` 不覆盖）→ `serve` / `serve_with`。注册表**按值**持有、`serve` 时才包 `Arc`：把「运行中改注册表」从类型上排除，比事后加锁便宜；`registry()` 交出 `&mut ServiceRegistry` 让宏生成的 `register_calc(server.registry(), svc)` 直接可用，`transport()` 交出 listener（端口写 `0` 的测试靠它拿真地址）。accept 循环里连接级错误（`ConnectionAborted` / `ConnectionReset` / `Interrupted` / `WouldBlock`）记一行继续，listener 级错误才返回 `Err`——`while let Ok(..)` 会把 listener 死亡静默吞掉。② **`Session::wait_closed()`**：`closed: Arc<Notify>` + 进 `Closed` 的唯一写点；`serve` 循环靠它知道「这条连接不用再持有」。**先建 waiter 再看状态**，反序会丢通知并留下永久等待。③ **客户端拆成两步**：`connect::<T>(ep, ConnectOptions)` 拿 `SessionHandle`，`CalcClient::new(handle)` 包一层。原因是 `CalcClient` 只泛型化到半身 `CalcClient<S, K>`——`Memory::pair` 不实现 `Transport`，若 stub 绑在 `Transport` 上，`local_calc` 根本用不了同一份 stub；`connect` 本身还要等握手到 `Ready`（`codec_id`/版本不符在 connect 上就报错，而不是第一次业务调用超时）。④ **示例**：`examples/calc_service/mod.rs`（共用 `Calc` 服务，两个 example `#[path]` 各引一次）、`local_calc`（memory pair，四条输出与 10.5 逐字一致）、`calc_server`/`calc_client`（TCP，客户端 50 ms 间隔重试、2 s 预算）。⑤ **`tests/concurrency.rs`**：32 并发 + 100 乱序，同一套断言在 `memory` 与 `tcp` 上各跑一遍，比对「每个请求拿到的是不是自己的值」，整体套 10 s 超时（卡住必须变失败）。变异验证：把 dispatch 的已注册分支改成不可达 → 两条用例同时红。⑥ 全量 39 + 1 + 2 + 9 + 8 + 16 + 21 + 3 全绿。**同步改动**：`detail/03`（`wait_closed` / `set_closed` 的写法与原因）、`detail/04`（§4 stub 改为半身泛型、§10 三小节按实现重写）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
 | **v0.19** | **M3 第一步：三档声明形态与调度分流，线格式零改动**。① **宏**：`async fn` / `fn` / `#[photon(blocking)] fn` 三档都接受，形态判定在展开期写死（`MethodKind::{Async, Sync, Blocking}`），`rewrite_sigs` 只改 `async fn`（同步 `fn` 本来就没有 future 可改写）；方法级 `#[photon(...)]` 展开后从 trait 上摘掉——留着 rustc 会去解析一个不存在的属性并报错。② **dispatch 三分支**：`async` 分支 await；`fn` 分支包进 async 块首 poll 就地跑完（不换线程）；`blocking` 分支 `spawn_blocking`，**decode 搬进闭包**（它也是 CPU 工作），`JoinError` 映射 `Internal`（线上按 `0` 兜底）。③ **`Service::schedule(method) -> Schedule`**：额度必须在「进 handler」之前扣，那时只有 `service_id + method`，还看不到实现内部分支——所以调度类别由生成代码交出来（默认 `Async`，只有 `blocking` 方法生成 `Blocking`；没有 blocking 方法时干脆不生成，用 trait 默认实现）。④ **入站配额拆两张**：`InboundQuota{async_used, blocking_used}` + `try_acquire(Slot)` 一次持锁完成「检查 + 计数」，`InboundGuard` 按 slot 归还；阻塞池满时异步请求照跑。⑤ **debug 慢 handler 告警**：超过 100 µs 打 `tracing::warn` 提示加 `#[photon(blocking)]`；顺手把 handler panic 也改成 `tracing::error!`（原来只回包不记日志，服务端看起来「什么都没发生」）。⑥ **验收**：`tests/service_macro.rs` 12 条（同步就地执行、blocking 走线程池、blocking panic 不挂住、`schedule` 逐方法正确）、`tests/session.rs` 18 条（新增「阻塞额度只有 1 个 → 一次成功两次过载、异步不受影响」，`memory`/`local` 各一遍）、`tests/compile-fail/` 换成 `blocking_on_async` / `unknown_method_attr`（`sync_method` 已合法，删除）。变异验证：把 `Schedule::Blocking` 也映射到 `Slot::Async` → 两条配额用例同时红。全量 39 + 1 + 2 + 9 + 12 + 18 + 21 + 3 全绿。**同步改动**：`detail/04`（§3 属性表标未实现、§4 产物补 `schedule`、§5 三分支与 `schedule`、§9 检查表与 trybuild 清单）、`detail/03`（§6.2 补 slot 选择与阻塞分支的 `JoinError`、§6.3 补慢 handler 告警）、`design.md` 5.1 / 5.3 片段、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
+| **v0.23** | **M3 第五步：`calc_local` 两进程 UDS**。① 一个二进制两个角色（`server` / `client`，默认 `/tmp/photon-calc.sock`），省掉第三个 example 文件；`Cargo.toml` 的 `[[example]]` 用 `required-features = ["local", "codec-postcard"]`，默认 feature 集不会试着编译它（Windows 上 `local` 本就是 `compile_error!`）。② 业务代码与 `calc_client` 同构：`connect::<LocalTransport>` + `CalcClient::new`，客户端侧三行输出一致——这就是「换 transport 不改业务代码」的证据，而不是一句口号。③ 顺带把本地 IPC 最容易踩的边角写进示例注释并在真机上验过：`bind` 遇到**上次崩溃留下的 socket 文件**会删掉重建（示例跑了两轮，第二轮正常起来）；遇到**还活着的监听者**会拒绝覆盖并给出「已有活跃监听者」——前面那次 `pkill` 只杀了 `cargo run` 包装进程、真正的二进制还在听，第二次 bind 正是被这条规则挡住的。这两句行为写在这里，是因为用户第一次撞上时看到的只会是一句 `EADDRINUSE` 级别的天书。④ 运行方式进 `10.4`，预期输出进 `10.5`，`10.1` 表标「v0.23 已落地」。**同步改动**：`detail/04` 示例表同标；线格式零改动。
 | **v0.22** | **M3 第四步：握手协商补验收（代码零改动）**。① 此前只有 `peer_declared_limit_governs_sending`（服务端声明 1 MiB → 客户端能发 200 KiB），证明的是「writer 用对端声明」；新增 `own_declared_limit_governs_recv`（客户端声明 1 MiB → 收得下服务端 200 KiB 回包），证明「reader 用本端声明」。两条合起来才是「两个方向各用各的」，缺一条都只证明了一半。② 新增 `handshake_rejects_bad_fields`：codec 不等 / 版本不等 / `max_message_len = 20` 三种都要在**建连期**断连（300 ms 内 `is_closed`），不能拖到第一次业务调用。第三条不能走 `Handshake::encode`——它对 `< 24` 有 `debug_assert`（本端的编程错误），对端的坏值只能用 `raw_handshake_frame` 手写字节造出来；这个区分本身也值得记下来：`debug_assert` 拦的是「我方发错」，不是「对方发错」。③ 变异验证：删掉 `limits.0` 的写入 → 接收方向用例双传输红；删掉 `check_against` → 拒绝用例双传输红。**同步改动**：`detail/03`（2.3 补「两条证据」与 `debug_assert` 的分工）、`detail/00`（`INV-23` 上限方向不混用）、`PROTOCOL.md` 版本指向；字节布局零改动。
 | **v0.21** | **M3 第三步：`GoAway` 双向收尾与急停落地**。① `close()` 顺序钉死：**先关 `egress` 再发帧**（反过来会留一个「发得出去但没人等」的窗口），发帧由 `goaway_sent` 去重，即便本端已收到对端宣告也照发——否则对端永远看不到「双方都宣告过」这个条件；随后按 `close_timeout` 等在飞双零（`pending` + `handlers`）。② **收到对端 `GoAway` 不再等 EOF**：起一个 `spawn_finish_when_drained` 后台任务，排空即 `shutdown.cancel()`，`close_timeout` 兜底。这条对没有半关闭的实现（named pipe / shm）是唯一收敛路径，socket 上的 EOF 只是加速。③ **`ingress` 只认「双方都宣告过」**：新增 `ingress_draining`，置位后新到 `Request` 回 `Remote{7}`（`send_error(...,7,true,...)`），此前一律照常 dispatch——早拒会把对端合法在飞请求打死。④ **`Session::abort()`** 发 bit2 急停：`try_send` 帧、取消所有 handler token、置 `abrupt` 后 `fail()`；writer 依 `abrupt` 决定排空还是丢弃，丢弃条数进日志。⑤ **验收** 4 条 × 2 实现（`session` 32 条）：「优雅关闭等在飞回完」、**「急停后 3 s 的 handler 也在 1 s 内结束」**、「双方宣告后迟到 `Request` 收到 `Remote{7}`」（手写假对端才能造出这段窗口）、**「收到 bit2 宣告时正在跑的 handler 必须被 drop」**（`pending()` + Drop 计数，优雅宣告下必然红）。变异验证三条全部双传输变红：去掉 `dispatch` 的 Draining 检查 / 去掉 `close()` 的等待 / 去掉急停分支的 token 取消 + `fail()`。**同步改动**：`detail/03`（`ingress_draining` 字段与 7.2/7.3/7.4 三处、6.4 急停实现口径）、`detail/04`（`Session::abort` 与「为什么不上句柄」）、`detail/00`（`INV-22` 急停必须真正丢活）、`PROTOCOL.md` 版本指向；字节布局零改动。
 | **v0.20** | **M3 第二步：超时 / 取消 / 通知，线格式零改动**。① **放弃即取消**：`Session::call` 里插入 pending 之后立刻挂一个 `CallGuard`，超时或 future 被 drop（`abort` / 上层 `select!` 抢先）时它摘表并归还配额；`PendingEntry::drop` 在「结果从未送达」时用 `try_send` 发 `Cancel`（`send` 会卡在背压上，为一条「别算了」阻塞放弃路径比不发更糟）。② **`Notification` 走完整 dispatch**：与 `Request` 共用一个 `dispatch(header, payload, want_reply)`，差别只有不回包；未注册服务、额度不足一律只记日志——给通知回 `Response` 是协议噪声（对端没有对应 pending）。③ **`SessionHandle::notify`** 补齐发起入口（不插 pending、不占出站配额、无超时）。④ **验收**：`tests/session.rs` 新增 4 条 × 2 实现——「超时准时暴露且会话仍可用」、**「丢 future 必须发 Cancel」**（刻意用 `deadline_ms = 0`，否则服务端自己会在同一时刻超时把 handler 丢掉，等于什么都没测）、「通知进 handler 且连发多条都到」、「通知指向未注册服务不断连」。变异验证两条：去掉 `Cancel` 的 `try_send` → 放弃用例红（2 s 后断言失败）；去掉 `CallGuard` → 同样红。⑤ 顺带记一句教训：最初那版「超时后 handler 被取消」用例是**假的**，它的断言被服务端同刻的 deadline 满足，与 `Cancel` 无关——已拆成两条并把隔离条件写进注释。全量 39 + 1 + 2 + 9 + 12 + 24 + 21 + 3 全绿。**同步改动**：`detail/03`（6.2 的 `want_reply`、6.3 的超时/放弃/Cancel 三行与分工说明、4.1 的通知语义）、`detail/04`（10.3 补 `SessionHandle` 三个入口与 `notify` 的代价）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
@@ -1418,7 +1421,7 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 - [ ] 业务错误映射（`#[photon(error = MyError)]` → `code ≥ 0x1_0000` 的 `Remote`）；错误体本身的 `code 0..7` 已在 M2 落地
 - [ ] `Interceptor` 链（或接 `tower`，走 `interceptor` feature）
 - [ ] `tracing` span 贯穿（span 带 `method_name`，见 3.5）
-- [ ] `examples/calc_local.rs`：两进程本地 IPC，验证「换 transport 不改业务代码」
+- [x] `examples/calc_local.rs`：两进程本地 IPC，验证「换 transport 不改业务代码」——v0.23 落地（同一二进制 `server` / `client` 两角色，默认 `/tmp/photon-calc.sock`）
 - [x] **`fn` 声明 + `#[photon(blocking)]` 两种展开**（见 5.2 / 5.3）——v0.19 落地（三分支 + `schedule`）
 - [ ] **`BlockingClient`**（`blocking` feature + `#[photon::service(id = N, blocking)]`）+ `recv_timeout`
 - [x] 双 `in_flight` 配额（`async` / `blocking` 分开计数）——v0.19 落地（`InboundQuota` 两张表 + `try_acquire(Slot)`）
@@ -1466,7 +1469,7 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 | `local_calc` | 1 | `memory` | M2 | **最小集**全链路（stub → session → dispatch → codec → 返回），第 1/2/5 三形态；**一条命令可跑** |
 | `calc_server` / `calc_client` | 2 | `tcp` | M2 | 真·跨进程 IPC，首次端到端（同样只验最小集） |
 | `local_calc`（补齐形态） | 1 | `memory` | M3 | 七种形态全跑（Notification / 超时 / GoAway / 同步 handler） |
-| `calc_local` | 2 | `local` | M3 | 换 transport 不改业务代码（架构验收） |
+| `calc_local` | 2 | `local` | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收） |
 
 ### 10.2 为什么必须有一个「单进程示例」
 
@@ -1500,11 +1503,18 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 cargo run --example local_calc
 ```
 
-两进程（两个终端）：
+两进程（两个终端，TCP）：
 
 ```
 cargo run --example calc_server -- --addr 127.0.0.1:7001
 cargo run --example calc_client -- --addr 127.0.0.1:7001
+```
+
+两进程（两个终端，本地 IPC；只在 Unix 上，`local` 不是默认 feature）：
+
+```
+cargo run --features local --example calc_local -- server /tmp/photon-calc.sock
+cargo run --features local --example calc_local -- client /tmp/photon-calc.sock
 ```
 
 裸字节往返（M0）：
@@ -1541,7 +1551,7 @@ M3（补齐全量形态，M2 那四条仍然要在）：
 [server] shutdown (in-flight drained)
 ```
 
-`calc_server` / `calc_client` 同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`。
+`calc_server` / `calc_client` 同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`；`calc_local` 换成 `local:///tmp/photon-calc.sock`，客户端侧三行与上面 `calc_client` 一致（`connected to local://…` 之后是 `add` / `div`）。
 
 > **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair()` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
 

@@ -382,7 +382,7 @@ impl<S, K> SessionHandle<S, K> {
 | `local_calc` | `memory`，单进程 | M2 | 最小集全链路：stub → session → dispatch → codec → 返回；一条命令可跑 |
 | `calc_server` / `calc_client` | `tcp`，两进程 | M2 | 真跨进程；同样只验最小集 |
 | `local_calc`（补齐） | `memory` | M3 | 七种形态：`async fn` / `fn` / blocking / `Notification` / 超时 / `GoAway` / 错误体 |
-| `calc_local` | `local`，两进程 | M3 | 换 transport 不改业务代码（架构验收） |
+| `calc_local` | `local`，两进程 | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收）；同一二进制 `server` / `client` 两角色 |
 
 `local_calc` 的两条预期输出是验收硬指标（不能随手改文案）：
 

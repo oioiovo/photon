@@ -47,3 +47,8 @@ required-features = ["tcp", "codec-postcard"]
 [[example]]
 name = "calc_client"
 required-features = ["tcp", "codec-postcard"]
+
+# 跨进程本地 IPC：Unix only（Windows 没有半关闭，`local` 在那里不开）。
+[[example]]
+name = "calc_local"
+required-features = ["local", "codec-postcard"]
