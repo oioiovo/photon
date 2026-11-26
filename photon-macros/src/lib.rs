@@ -4,6 +4,8 @@
 //!
 //! - `mod __photon_<svc>`：`SERVICE_ID`、`METHOD_NAMES`、每个方法一个 `HASH_<METHOD>`
 //! - `struct <Svc>Client<S, K>`：持有 `SessionHandle`，方法全是 `async fn`
+//! - `struct <Svc>BlockingClient<S, K>`：持有 `BlockingSession`，方法全是同步 `fn`
+//!   （只有服务级写了 `blocking` 才生成）
 //! - `struct <Svc>Service<S>`：包一层 `Arc<S>` 并实现 `Service`，按 `method` 分流
 //! - `fn register_<svc>(registry, svc)`：用同一个 `service_id` 占号
 //!
@@ -123,17 +125,6 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let mut service = parse_macro_input!(item as ItemTrait);
 
-    if args.blocking {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "`blocking` 参数要生成的同步客户端（`BlockingClient`）还没做：它需要自建 \
-             runtime + 内外两层超时，生成一半只会是一段没人验证过的代码。\
-             同步 handler 不靠它，方法级写 `#[photon(blocking)]` 即可",
-        )
-        .to_compile_error()
-        .into();
-    }
-
     let methods = match collect_methods(&service, args.error.as_ref()) {
         Ok(methods) => methods,
         Err(err) => return err.to_compile_error().into(),
@@ -223,6 +214,124 @@ fn expand(
             }
         }
     });
+
+    // 同步客户端：只有服务级写了 `blocking` 才生成。
+    //
+    // 它不做任何「把异步包一层」的伪装：`BlockingSession` 自带线程与 runtime，
+    // 这里生成的每个方法只是「encode → 阻塞 call → decode」。失败路径和异步 stub
+    // 一样是三处 `from_error`（encode / call / decode），否则业务错误会在半路变回
+    // 框架错误。
+    let blocking_client = if args.blocking {
+        let blocking_ident = format_ident!("{}BlockingClient", svc);
+        let blocking_methods = methods.iter().map(|m| {
+            let name = &m.name;
+            let params = m.args.iter().map(|(ident, ty)| quote! { #ident: #ty });
+            let arg_names: Vec<_> = m.args.iter().map(|(ident, _)| ident).collect();
+            let arg_types: Vec<_> = m.args.iter().map(|(_, ty)| ty).collect();
+            let hash = hash_ident(name);
+            let ok_ty = &m.ok_ty;
+            let unwrap = match &args.error {
+                Some(err_ty) => {
+                    quote! { .map_err(|e: ::photon::RpcError| <#err_ty as ::photon::ServiceError>::from_error(e)) }
+                }
+                None => quote! {},
+            };
+            let ret_err = match &args.error {
+                Some(err_ty) => quote! { #err_ty },
+                None => quote! { ::photon::RpcError },
+            };
+            let packed = if arg_types.is_empty() {
+                quote! { &() }
+            } else {
+                quote! { &(#(#arg_names),*) }
+            };
+            quote! {
+                /// 发一次请求并阻塞等回包；期限取同步客户端上的 `deadline_ms`。
+                pub fn #name(&self, #(#params),*)
+                    -> ::std::result::Result<#ok_ty, #ret_err>
+                {
+                    let payload =
+                        <::photon::codec::Default as ::photon::Codec>::encode(#packed) #unwrap?;
+                    let reply = self
+                        .session
+                        .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms)
+                        #unwrap?;
+                    <::photon::codec::Default as ::photon::Codec>::decode::<#ok_ty>(&reply) #unwrap
+                }
+            }
+        });
+
+        quote! {
+            /// 该服务的同步客户端：调用方不需要 runtime，也不需要写 `await`。
+            ///
+            /// 它持有一条 [`::photon::blocking::BlockingSession`]——会话与 runtime
+            /// 都在自己的线程上，所以「在 `main` 里调用」「在 `#[tokio::test]` 里
+            /// 调用」都不会 panic。代价是每个实例多三条线程。
+            pub struct #blocking_ident<S, K>
+            where
+                S: ::photon::transport::MessageSource,
+                K: ::photon::transport::MessageSink,
+                S: 'static,
+                K: 'static,
+            {
+                session: ::photon::blocking::BlockingSession<S, K>,
+                /// 这个客户端上所有请求的期限（毫秒，0 = 不设期限）。
+                deadline_ms: u32,
+            }
+
+            impl<S, K> #blocking_ident<S, K>
+            where
+                S: ::photon::transport::MessageSource + 'static,
+                K: ::photon::transport::MessageSink + 'static,
+            {
+                pub const SERVICE_ID: u16 = #helper::SERVICE_ID;
+
+                pub fn new(session: ::photon::blocking::BlockingSession<S, K>) -> Self {
+                    Self {
+                        session,
+                        deadline_ms: 0,
+                    }
+                }
+
+                /// 设协议头里的期限（服务端到点放弃执行），返回新的客户端。
+                pub fn with_deadline(self, deadline_ms: u32) -> Self {
+                    Self {
+                        deadline_ms,
+                        ..self
+                    }
+                }
+
+                /// 设**本地**等待上限：对端不回时保护调用方这一侧。
+                ///
+                /// 与 `with_deadline` 是两件事：期限进协议头、跨进程有效；这个只在
+                /// 本进程内计时，用来兜住僵死连接。两者可以同时设。
+                pub fn with_timeout(self, timeout: ::std::time::Duration) -> Self {
+                    Self {
+                        session: self.session.with_timeout(timeout),
+                        ..self
+                    }
+                }
+
+                /// 当前期限（毫秒，0 = 不设期限）。
+                pub fn deadline_ms(&self) -> u32 {
+                    self.deadline_ms
+                }
+
+                /// 当前本地等待上限（`None` = 无限等）。
+                pub fn timeout(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.session.timeout()
+                }
+
+                pub fn session(&self) -> &::photon::blocking::BlockingSession<S, K> {
+                    &self.session
+                }
+
+                #(#blocking_methods)*
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let dispatch_arms = methods.iter().map(|m| {
         let hash = hash_ident(&m.name);
@@ -389,6 +498,8 @@ fn expand(
 
             #(#client_methods)*
         }
+
+        #blocking_client
 
         /// 把一个实现类型的实例变成可注册的服务。
         ///

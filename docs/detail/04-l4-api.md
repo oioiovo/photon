@@ -52,7 +52,7 @@ pub trait Service: Send + Sync + 'static {
 | 参数 | 是否必填 | 类型 | 规则 |
 |---|---|---|---|
 | `id` | **必填** | `u16` | 显式分配，不自动编号；`0` 允许但建议避开 |
-| `blocking` | 可选 | 标志 | 生成 `BlockingXxxClient`；还需 crate 开 `blocking` feature。**尚未实现**（v0.19：宏遇到它直接报错，指引用方法级 `#[photon(blocking)]`） |
+| `blocking` | 可选 | 标志 | 生成同步客户端 `<Svc>BlockingClient`（v0.27 生效，不需要额外 feature）：每个方法都是同步 `fn`，底层是自带线程与 runtime 的 `BlockingSession`，见 §7 |
 
 `id` 必填的三条理由：宏否则无从填 `service_id`；自动编号会在「不同 crate 各自注册」时撞号；顺序一变线上 id 就变。
 
@@ -93,7 +93,7 @@ pub trait Service: Send + Sync + 'static {
 | `CalcClient::SERVICE_ID` / `mod __photon_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
 | `mod __photon_calc` 内的 `METHOD_NAMES` | `&[(u64, &'static str)]` | span / `UnknownMethod` 日志 / panic 报告 |
 | `mod __photon_calc` 内的 `HASH_<METHOD>` 常量 | `const u64` | 编译期哈希值，`match` 的键 |
-| `BlockingCalcClient` | 持自建或共享的 runtime + `SessionHandle`，方法全是 `fn` | 仅 `blocking` 参数 + feature 同时成立时生成。**尚未实现**（v0.19） |
+| `CalcBlockingClient<S, K>` | 持 `photon::blocking::BlockingSession<S, K>` + `deadline_ms`；方法与 `CalcClient` 一一对应但全是同步 `fn`（v0.27） | 仅服务级写了 `blocking` 时生成 |
 
 **为什么是包装类型 `CalcService<S>` 而不是 blanket impl（v0.17 修）**。v0.9–v0.16 一直写的是 `impl<S: Calc + Send + Sync + 'static> Service for S`，看着最省事（`Arc::new(my_calc)` 直接进注册表）。实际写出来在**用户 crate 里必然编译失败**：`Service` 来自 photon、`S` 是裸类型参数，展开代码属于下游 crate，孤儿规则不允许「外部 trait + 裸参数」（`E0210`）。只有两种出路：把 `Service` 改成 phantom 参数（等于让 L3 认不出服务），或者包一层本地类型。后者多一层指针解引用与一次 `Arc::clone`，代价可以忽略，收益是**同一实现类型可以同时实现多个服务 trait**——v0.9 里「一个类型只能属于一个服务」的限制不再存在。`register_calc(registry, svc)` 的签名保持不变，包装发生在宏内部。
 
@@ -119,7 +119,7 @@ mod __photon_calc {          // 模块名 = __photon_ + 服务名的小写 snake
 - `HASH_<METHOD>` 用方法名**大写**形式；若方法名本身含非法标识符字符（极少数），退回 `HASH_0`、`HASH_1` 并按声明顺序编号。
 - 不要用 `#[doc(hidden)]` 糊过去就完事——重名是编译错误，不是文档问题。
 
-**`blocking` 不能用 `#[cfg(feature = "blocking")]` 生成**：proc-macro 展开出的 `cfg` 检查的是**使用方 crate** 的 feature，不是 photon 的，按字面根本不成立。所以用属性参数显式要求；`blocking` feature 管的是**框架侧设施**（`session/blocking.rs`、打包 runtime 的代码）。两件事不要混。
+**`blocking` 不能用 `#[cfg(feature = "blocking")]` 生成**：proc-macro 展开出的 `cfg` 检查的是**使用方 crate** 的 feature，不是 photon 的，按字面根本不成立（用户开 `photon/blocking` 不会让这段 `cfg` 变真）。所以生成与否只由属性参数决定；框架侧也不设这个 feature（v0.27）——`src/blocking.rs` 复用已有 tokio、零新依赖，加一个永远为真的开关只会在文档与代码之间制造落差。
 
 ---
 
@@ -243,31 +243,53 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 
 ## 7. 同步客户端
 
-### 7.1 实现约束（逐条都是踩过的坑）
+### 7.1 形状：会话连同 runtime 搬到专属线程
 
-| 约束 | 原因 |
+| 层 | 谁 | 关键点 |
+|---|---|---|
+| 调用方 | `BlockingSession::{call, notify, close}` | 只做「写入命令通道 + `recv_timeout` 等回包」，不碰 future、不碰 runtime |
+| 命令通道 | `tokio::sync::mpsc::UnboundedSender<Command>` | 调用方线程非阻塞投递（`send` 是同步方法）；`Call` / `Notify` / `Close` 三种命令 |
+| 会话线程 | `std::thread` + 2 worker 的 `multi_thread` runtime | 建 runtime → `block_on(握手)` → `spawn(dispatcher)` → `block_on(done)` → `drop(rt)` |
+| dispatcher | 会话线程上的 task | 每条 `Call` 再 `tokio::spawn` 一个 task（多线程调用方不能被串行化）；通道关闭后 `close()` 再放行 runtime |
+
+**为什么不是「调用方线程 `block_on`」**：`Runtime::block_on` 在已有 runtime 上下文里 panic（`Cannot start a runtime from within a runtime`），在 `current_thread` 的 worker 上等于死锁（future 唯一的 poll 者正在等自己）。而「同步库被 async 代码调用」是最常见的用法，这个错误只会在线上第一次同步调用时出现。搬到独立线程后，这两种情形在结构上都不存在。
+
+**为什么不是「复用调用方 `Handle` + `spawn`」**：那样「同步客户端」就绑死了「调用方必须有 runtime」——`main`、`Drop`、C 回调里都没有。
+
+### 7.2 两条期限
+
+| 期限 | 入口 | 计时起点 | 到点后 |
+|---|---|---|---|
+| 协议期限 | `with_deadline(ms)` → header `deadline_ms` | 发起侧发帧 | 服务端回 `DeadlineExceeded`（`Remote{6}`），或发起侧计时器先响 → `Timeout` |
+| 本地期限 | `with_timeout(dur)` → `recv_timeout` + 会话线程上的 `tokio::time::timeout` | 调用方投递 | 两侧同刻到点 → `Timeout` |
+
+- 本地期限默认 `None`：没设就等于「等到有结果为止」，与异步客户端一致；默认塞一个数字等于框架替用户决定最多等多久。
+- 两个期限用**同一个值**（v0.27 改判 v0.7 的「外层 +50ms」）：会话线程上的 `timeout` 到点会 drop future，`CallGuard` 摘表并送 `Cancel`，所以调用方先返回不会漏收尾；多留 50 ms 只是让内层先说结论，而结论一样。
+- 错误映射：`recv_timeout` 的 `Disconnected` → `Closed`（会话线程没了），`Timeout` → `Timeout`。命令投递失败（通道关闭）同样 → `Closed`。
+
+### 7.3 生命周期
+
+- **构造必须等到握手结果**：`ready` 用 `sync_channel(1)`；握手失败或线程早死 → `Err`，绝不交出一个「看着能用、其实没握手」的客户端。
+- **`Clone` 共享会话**（`Arc<Inner>`）：同一会话可以包进多个服务的同步客户端；最后一个副本 drop → 命令通道关闭 → dispatcher 优雅 `close()`（`close_timeout` 兜底）→ 线程退出。
+- **`Drop` 不同步等待**：关闭最长 5 s，塞进调用方的 `Drop` 只会变成一次莫名卡顿；会话线程独立，收尾期间调用方可以继续干活。
+- **runtime 必须在非 async 上下文 drop**：`drop(rt)` 放在 `block_on` 返回之后、线程函数末尾。
+
+### 7.4 不检测 runtime 上下文
+
+v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：future 从不在调用方线程上跑，调用方在不在 runtime 里都不影响正确性。`current_thread` 的 worker 上调用照样拿到回包（`tests/blocking_client.rs::usable_inside_current_thread_runtime` 钉这条）。
+
+### 7.5 验收矩阵（`tests/blocking_client.rs`，8 条）
+
+| 用例 | 钉住什么 |
 |---|---|
-| **禁用 `Handle::block_on`** | `current_thread` runtime 里必死锁；multi_thread worker 上 panic（`Cannot block the current thread from within a runtime`） |
-| 用「投递 + 阻塞等待」：`handle.spawn(fut)` + `std::sync::mpsc::sync_channel(1)` + `recv_timeout` | 在当前线程**纯等待**，future 在 runtime 线程跑，不 panic 不死锁 |
-| **内外两层超时** | 内层 `tokio::time::timeout` 管 future；外层 `recv_timeout(timeout + 50ms)` 管「连 runtime 都没回话」。少了外层，runtime 线程池饿死时照样挂住 |
-| `Disconnected → RuntimeDropped`、`Timeout → Timeout` | 两个错误必须区分：前者是「runtime 没了」，后者是「太慢」 |
-| **自建 `Runtime` 必须被 client 结构体持有** | 只存 `Handle` 的话，`Runtime` 一 drop，所有 task 被取消，`recv_timeout` 立刻 `Disconnected` → 全部变成 `RuntimeDropped` |
-| 告警在**进入阻塞等待之前**打，且用 `AtomicBool` 只打一次 | 每次调用都 warn 会把日志刷废，等于没有告警 |
-
-### 7.2 runtime 从哪来
-
-| 构造 | 行为 |
-|---|---|
-| `BlockingCalcClient::connect(ep, opts)` | 自建一个 1 worker 的 multi_thread runtime（只跑 IO，1 线程足够）；`opts: ConnectOptions` 与服务端 `Server::bind` 的同名参数一致，**不能省**（v0.9 漏了 `opts`，导致 `max_message_len` / 配额 / 握手超时全部无法配置） |
-| `BlockingCalcClient::with_runtime(&shared, ep, opts)` | 多个 client 复用一个 runtime，避免 N 个 client 起 N 套线程 |
-
-### 7.3 `try_current()` 只告警，不硬拒绝
-
-- `spawn_blocking` 的线程**是有 runtime 上下文**的（否则它内部没法 `tokio::spawn`），所以 `Handle::try_current()` 返回 `Ok`——而在阻塞池里做同步等待恰恰是官方推荐写法。
-- 任何「检测到 runtime 上下文就拒绝」都会误杀这个合法用法。
-- 所以：不做硬拒绝、debug 下告警（附「若你确定在 `spawn_blocking` 内，可忽略」）、文档写清唯一真正危险场景（`current_thread` 的 worker 上做同步等待 → 必死锁）。
-
----
+| `roundtrip_without_runtime` | 普通 `#[test]`（没有 runtime）里也能往返 |
+| `timeout_cancels_handler` | 本地期限到点后 handler 的 future 被 drop（取消真的到了服务端） |
+| `timeout_keeps_session_usable` | 一次超时不污染会话（pending 表项被摘掉） |
+| `deadline_alone_bounds_the_call` | 只设 `deadline` 也有界（外层默认 `None` 不是漏洞） |
+| `notify_is_fire_and_forget` | 通知不占回包通道 |
+| `close_then_call_is_closed` | `close()` 之后的调用回 `Closed` |
+| `business_error_survives_sync_stub` | 业务错误经 `from_error` 三处映射后仍是用户码 |
+| `usable_inside_current_thread_runtime` | `current_thread` runtime 里同步调用不 panic、不死锁 |
 
 ## 8. 本地直连
 
@@ -293,14 +315,13 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 | `async fn` + `#[photon(blocking)]` | 展开 | 「`blocking` 只能标在同步 `fn` 上」；v0.19 起由 `tests/compile-fail/blocking_on_async.rs` 冻结文本 |
 | 未知方法级属性（如 `cache`） | 展开 | 「只接受 `blocking` 与 `zero_copy`」；由 `unknown_method_attr.rs` 冻结 |
 | `async fn` / `#[photon(blocking)] fn` + `zero_copy` | 展开 | 分别说明「跨 await 会攥住槽位」「池线程时长不可预期」；由 `zero_copy_on_async.rs` / `zero_copy_on_blocking.rs` 冻结 |
-| 服务带 `blocking` 参数 | 展开 | 直接说「`BlockingClient` 还没做」，并指引用方法级 `#[photon(blocking)]`；**不许降级成同步 stub** |
 | 接收者不是 `&self`、返回不是 `Result`、参数是模式解构 | 展开 | 定位到具体方法，说明展开需要「简单标识符参数 + `Result` 返回」 |
 | 方法名重复或哈希相撞 | 展开 | 常量断言式检查；报出两个方法名 |
 | `async fn` + `blocking` | 展开 | 「同步方法才需要 `blocking`」 |
 | 注册撞号 | 运行期（注册时） | `Err`，**不覆盖**已有服务 |
 | 改方法签名 | 编译期 | 在用户侧编译失败，错误信息必须定位到具体方法 |
 
-测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。截至 v0.26 共七条：`blocking_on_async`、`blocking_service`、`missing_id`、`unknown_method_attr`（`cache`）、`zero_copy_on_async`、`zero_copy_on_blocking`、`error_type_mismatch`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。v0.17 的 `sync_method` 已删除：同步 `fn` 在 v0.19 起是合法声明；`unknown_method_attr` 原先用 `zero_copy` 当「未知属性」，`zero_copy` 在 v0.26 转正后改用真正不存在的 `cache`。
+测试手段：`compile-fail` 用例（`trybuild` 作为 **dev-dependency**，不进默认依赖集）。截至 v0.27 共六条：`blocking_on_async`、`missing_id`、`unknown_method_attr`（`cache`）、`zero_copy_on_async`、`zero_copy_on_blocking`、`error_type_mismatch`；`.stderr` 快照一并提交，改文案就要同步改快照——报错文本本身是被测对象。已删除两条：v0.17 的 `sync_method`（同步 `fn` 从 v0.19 起合法）、v0.26 的 `blocking_service`（服务级 `blocking` 从 v0.27 起合法，改为 `tests/blocking_client.rs` 的正向验收）。`unknown_method_attr` 原先用 `zero_copy` 当「未知属性」，`zero_copy` 在 v0.26 转正后改用真正不存在的 `cache`。
 
 ---
 
@@ -442,7 +463,7 @@ impl<S, K> SessionHandle<S, K> {
 |---|---|---|---|
 | `local_calc` | `memory`，单进程 | M2 | 最小集全链路：stub → session → dispatch → codec → 返回；一条命令可跑 |
 | `calc_server` / `calc_client` | `tcp`，两进程 | M2 | 真跨进程；同样只验最小集 |
-| `local_calc`（补齐） | `memory` | M3 | 七种形态：`async fn` / `fn` / blocking / `Notification` / 超时 / `GoAway` / 错误体 |
+| `local_calc`（补齐） | `memory` | M3 | 七种形态：`async fn` / `fn` / blocking / `Notification` / 超时 / `GoAway` / 错误体；v0.27 起多两行同步客户端（第二条会话，服务端在独立线程上） |
 | `calc_local` | `local`，两进程 | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收）；同一二进制 `server` / `client` 两角色 |
 
 `local_calc` 的两条预期输出是验收硬指标（不能随手改文案）：
@@ -457,7 +478,7 @@ M2 的范围必须写清：**只支持 `async fn` 声明**，不含 `Notificatio
 ## 12. 明确不做
 
 - **不给 `fn` 声明自动生成 `fn` 客户端方法**：那会把「handler 形态」和「调用形态」重新绑死，正好绕回 5.2 想拆开的错误。要同步客户端必须是显式宏参数。
-- 不默认生成同步客户端：需要 feature + 宏参数两个开关都打开，代价是「多一套 runtime 生命周期 + 一个告警面」。
+- 不默认生成同步客户端：只由宏参数（`#[photon::service(id = N, blocking)]`）开启，代价是「每个会话多 3 条线程 + 一套 runtime 生命周期」；也不提供「多 client 复用一个 runtime」的入口（共享粒度是会话，见 §7.3）。
 - handler 内反向调用对端（需 `&ServiceContext` 首参）：会改动所有 handler 签名，M3 之后再说。
 - 协作式取消（handler 内轮询 `is_cancelled()`）：同上。
 - 用 `HashMap<u64, Box<dyn Fn>>` 代替 `match`：调度决策在运行期只剩一个函数指针，无法分流；且 method id 重复无法在编译期发现。

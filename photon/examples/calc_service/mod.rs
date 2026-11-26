@@ -1,7 +1,8 @@
 //! 示例共用：一个 `service_id = 7` 的 `Calc` 服务。
 //!
 //! 这里就是用户视角的全部——写一个 trait、实现它，剩下的 client stub、
-//! dispatch、注册函数都由宏产出。
+//! dispatch、注册函数都由宏产出。服务级 `blocking` 让宏额外出一个同步客户端
+//! `CalcBlockingClient`（`local_calc` 用它演示「调用点不需要 runtime」）。
 //!
 //! 本文件被两个 example 各自 `#[path]` 引入一次，每个 example 只用其中一部分，
 //! 因此对「本 example 没用到的项」统一放行 dead_code。
@@ -9,7 +10,7 @@
 
 use photon::{RemoteError, RpcError};
 
-#[photon::service(id = 7)]
+#[photon::service(id = 7, blocking)]
 pub trait Calc {
     async fn add(&self, a: i64, b: i64) -> Result<i64, RpcError>;
     async fn div(&self, a: i64, b: i64) -> Result<i64, RpcError>;

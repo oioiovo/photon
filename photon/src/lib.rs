@@ -4,9 +4,10 @@
 //! 每层只依赖下一层：L2 不认识 `Transport`，L3 不认识字节序。
 //!
 //! 当前 L1/L2/L3 可用（M1 完成），L4 的 `#[photon::service]` 已落地（M2 完成）。
-//! M3 进行中：三档声明形态（`async fn` / `fn` / `#[photon(blocking)] fn`）已支持，
-//! 同步客户端（`BlockingClient`）待做。
+//! M3 进行中：三档声明形态（`async fn` / `fn` / `#[photon(blocking)] fn`）与同步
+//! 客户端（`<Svc>BlockingClient`）都已支持。
 
+pub mod blocking;
 pub mod codec;
 pub mod error;
 pub mod proto;
@@ -14,6 +15,7 @@ pub mod session;
 pub mod transport;
 
 /// 宏展开里要用 `::photon::Bytes`，所以这里必须公开重导出。
+pub use blocking::BlockingSession;
 pub use bytes::Bytes;
 pub use codec::Codec;
 pub use error::{BUSINESS_CODE_MIN, RemoteError, RpcError};

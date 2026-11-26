@@ -1,15 +1,15 @@
 //! 单进程全链路：client stub → session → dispatch → codec → 回包。
 //!
-//! M2 的四种形态之外，M3 的四种形态也在这里同一个会话里跑一遍：
-//! 通知（无回包）、超时（客户端准、服务端尽力）、同步 handler、优雅关闭
-//! （等在飞清空再收尾）。一条命令：`cargo run --example local_calc`。
+//! M2 的四种形态之外，M3 的形态也在这里跑一遍：通知（无回包）、超时（客户端准、
+//! 服务端尽力）、同步 handler、优雅关闭（等在飞清空再收尾）、同步客户端（自带
+//! 线程与 runtime，调用点不写 `await`）。一条命令：`cargo run --example local_calc`。
 
 #[path = "calc_service/mod.rs"]
 mod calc;
 
 use std::sync::Arc;
 
-use calc::{CalcClient, Calculator, describe, register_calc};
+use calc::{CalcBlockingClient, CalcClient, Calculator, describe, register_calc};
 use photon::{ServiceRegistry, Session, SessionOptions, transport::memory::Memory};
 
 #[tokio::main]
@@ -85,6 +85,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 同步 handler：声明是 `fn`，stub 仍是 async（线上永远异步）。
     let hash = client.fast_hash(b"photon".to_vec()).await?;
     println!("[client] fast_hash(data) = {hash:#018x}   (sync handler, 未 await)");
+
+    // 同步客户端：底层是一条自带线程与 runtime 的会话，所以调用点既不需要 runtime
+    // 也不需要 `await`。这里另开一对半身，服务端跑在一条 std 线程上——这正好是
+    // 「同步库被 async 程序调用」的形状。
+    let ((sync_server_src, sync_server_sink), (sync_client_src, sync_client_sink)) = Memory::pair();
+    let mut sync_registry = ServiceRegistry::empty();
+    register_calc(&mut sync_registry, Arc::new(Calculator))?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let sync_server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("同步服务端 runtime");
+        rt.block_on(async move {
+            let (session, _handle) = Session::new(
+                sync_server_src,
+                sync_server_sink,
+                Arc::new(sync_registry),
+                SessionOptions::default(),
+            )
+            .expect("同步服务端会话");
+            session.wait_ready().await.expect("握手");
+            let _ = stop_rx.await;
+            let _ = session.close().await;
+        });
+    });
+
+    let blocking = CalcBlockingClient::new(photon::blocking::BlockingSession::from_parts(
+        sync_client_src,
+        sync_client_sink,
+        SessionOptions::default(),
+    )?);
+    let sum = blocking.add(20, 22)?;
+    println!("[blocking] add(20, 22) = {sum}   (no runtime, no await)");
+
+    // 外层期限：只保护调用方这一侧（对端不回时不会一直挂着）。
+    match blocking
+        .with_timeout(std::time::Duration::from_millis(30))
+        .slow_op(200)
+    {
+        Ok(ms) => println!("[blocking] slow_op -> Ok({ms})  (超时没生效？)"),
+        Err(photon::RpcError::Timeout) => {
+            println!("[blocking] slow_op -> Err(Timeout after 30ms, local)")
+        }
+        Err(err) => println!("[blocking] slow_op -> {}", describe(&err)),
+    }
+    let _ = stop_tx.send(());
+    sync_server.join().expect("同步服务端线程");
 
     // 优雅关闭：留一个在飞的请求，然后由服务端宣告关闭；
     // `close()` 不返回直到 handler 清空，回包也在这之前进了 writer。
