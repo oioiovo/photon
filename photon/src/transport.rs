@@ -8,6 +8,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -15,6 +16,14 @@ use std::time::Duration;
 use bytes::Bytes;
 
 pub mod framing;
+
+#[cfg(all(feature = "local", not(unix)))]
+compile_error!(
+    "`local` 传输目前只在 Unix 上实现。Windows 需要 named pipe 适配，     见 docs/detail/01-l1-transport.md §6.2；手搓之前先确认有 Windows 测试环境。"
+);
+
+#[cfg(all(feature = "local", unix))]
+pub mod local;
 
 #[cfg(feature = "memory")]
 pub mod memory;
@@ -106,8 +115,36 @@ pub trait Transport: Sized {
 pub enum Endpoint {
     /// 已解析的 socket 地址。
     Tcp(SocketAddr),
+    /// 本地 IPC：Unix 上是 socket 文件路径。
+    ///
+    /// 路径本身不裁剪 feature——它是纯数据；能不能 bind 取决于 `local` 实现是否存在。
+    Local(LocalAddr),
     /// 进程内传输。地址不参与查找，只用于日志与 `Debug`。
     Memory(MemoryAddr),
+}
+
+/// 本地 IPC 的地址。
+///
+/// Unix 上是 socket 文件路径；Windows 将来是 pipe 名，届时再扩载荷类型，
+/// 现在只表达「一个文件系统路径」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAddr(PathBuf);
+
+impl LocalAddr {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    /// 路径形态。日志、错误信息与「长度上限检查」都要用它。
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for LocalAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "local://{}", self.0.display())
+    }
 }
 
 /// 进程内传输的名字，仅用于日志：真正的配对由 `Memory::pair` 直接给出。

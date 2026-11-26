@@ -323,7 +323,7 @@ struct ClosingState {
 1. 把 `GoAway` **写进 `tx`**（先进队列，保证它前面的 `Response` 都能出去）；`egress = Draining`、`self_goaway = true`。**入站不动**，继续 dispatch 并回包（`INV-10a`）。
 2. 等两类在飞工作归零：`outbound.pending` 与本端 `handlers`。期间 `tx` 照常可用。
 3. 归零后**只做一件事：`shutdown.cancel()`**（同时通知 reader 与 writer）。**不要试图 drop `Session` 的 `tx`**——它在 `Arc` 里，`&self` 拿不到 `&mut`；通道收口交给 writer 的排空退出（见第 5 节）。
-4. 两个 task 各自退出：writer **先排空 `rx` 再退**、退出即 drop `sink`；reader 退出即 drop `source`。**不需要 `flush`**——最后一次 `send().await` 返回 `Ok` 即数据已交给内核缓冲。
+4. 两个 task 各自退出：writer **先排空 `rx` 再退**、退出即 drop `sink`；reader 退出即 drop `source`。**不需要 `flush`**——最后一次 `send().await` 返回 `Ok` 即数据已交给内核缓冲。注意 drop `sink` 只是**加速路径**：能让对端尽早读到 EOF，但不是关闭契约的一部分（L1 2.2）。无半关闭的实现上这一步等价于空操作，收尾照样靠第 1 步的 `GoAway` 和第 6 步的超时。
 5. `close()` 里从 `Mutex<Option<JoinHandle>>` 里 `take()` 出两个句柄并 await；`JoinError` 必须当场处理并归为断连，不能 `let _ =`。
 6. 兜底：`opts.close_timeout`（默认 5 s）未走完 → 强制 `shutdown.cancel()` + `abort` 两个 task，所有 pending 与 handler guard 置 `Closed`。
 
@@ -337,16 +337,22 @@ struct ClosingState {
 
 `GoAway` 的语义是**连接级开始收尾**（双向停发起、双向继续回包），不是「我只关入站」（v0.8 的写法，与它自己的第 1 步冲突，已废弃）。但**不要**把它类比成 gRPC `GOAWAY`：后者靠 `last_stream_id` 水位划边界，本协议 v0.7 已删掉该字段（对称会话下没有良定义），所以没有「按 id 判断哪些还算 in-flight」的能力，能承诺的只有「已进入 handler 的请求一定回包」。
 
-### 7.5 `local` / Windows 上的关闭差异
+### 7.5 无半关闭的实现上的关闭差异
 
-`local` 无法半关闭（L1 文档 2.2）。因此在这两个平台上：
+半关闭是**实现能力**，不是契约（L1 2.2）。因此这里的差异按能力位判定，不按 transport 名字判定——L3 不认识具体 transport，也不该认识。
 
-- `Draining → Closed` 在对端**不可见**，唯一信号就是 `GoAway`；
-- 第 4 步「drop `sink` 让对端看到 EOF」不成立，测试不能这样断言；
-- `close_timeout`（默认 5 s）从**本端调 `close()` 的时刻**起算（不是从对端回 `GoAway` 起算），否则对端不配合时会白等一个完整的超时周期；
-- 正因为没有 EOF 信号，「双方宣告后才拒」这条规则更重要：本端只能靠对端 `GoAway` 判断它是否还会发请求，丢掉这个信号就没有任何依据。
+| 能力 | 收尾表现 | 测试怎么断言 |
+|---|---|---|
+| 有半关闭（`tcp` / `local`(Unix) / `memory` / `shm`） | writer drop `sink` 后对端读到 EOF，可能比 `GoAway` 更早收敛 | 可以断言「drop 后对端在 N ms 内读到 `UnexpectedEof`」 |
+| 无半关闭（Windows named pipe，尚未实现） | `Draining → Closed` 对端**完全不可见**，唯一信号是 `GoAway` | 不能断言 EOF；断言「对端收到 `GoAway` 后在本端 `close_timeout` 内退出」 |
 
----
+与能力无关、任何实现都必须成立的三条：
+
+- **`close_timeout`（默认 5 s）从本端调 `close()` 的时刻起算**，不是从对端回 `GoAway` 起算——否则对端不配合时要白等一个完整周期；
+- **「双方宣告后才拒」这条规则更重要**：本端只能靠对端的 `GoAway` 判断它是否还会发请求，丢掉这个信号就没有任何依据（`INV-10b`）；
+- **`Remote{7}` 的窄窗口不变**：只在双方都宣告关闭之后仍有 `Request` 冒出来时出现。
+
+能力位本身只出现在 `tests/transport.rs` 的 `Harness::PEER_SEES_EOF` 上：声明 `true` 的实现必须真给 EOF，声明 `false` 的必须真给不出（断言「读不到结束信号」）。**不要**把它提进 `Transport` trait 让 L3 分支。
 
 ## 8. 错误映射总表（L3 的唯一权威）
 

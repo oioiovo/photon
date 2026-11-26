@@ -1,6 +1,6 @@
 # photon 分层详细设计 —— 索引与全局约束
 
-> 本组文档是 `docs/design.md`（**v0.14**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。v0.11 只动模块布局：入口文件改为 `transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`（2024 风格，不用 `*/mod.rs`）。v0.12 改样例承载方式：七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 内联字节数组，目录与 `include_bytes!` 一并取消；线格式与接口签名均未变化。v0.13 把 `Transport::bind` 改为异步（`L1-C4` 随之从「bind 同步」改为「三者皆异步」），`Server::bind` 因此变成 `async fn`，`detail/04` 的 `pub fn bind` 与装配清单同步加上 `.await`；线格式零改动。v0.14 落地 `memory` 传输并新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体单份、`tcp` 与 `memory` 各跑一遍；`Memory::pair` 同时去掉 `opts` 参数（`TransportOptions` 的两项对它无意义），且 `memory` 不实现 `Transport`。
+> 本组文档是 `docs/design.md`（**v0.15**）的**实现层展开**，不新增任何架构决定。v0.10 与本文档相关的改动集中在三处：`Session::new` 签名（补 `registry`、删 codec 泛型）、出站/入站配额拆两张表、关闭序列（`ingress` 延迟 Draining + writer 排空退出）。v0.11 只动模块布局：入口文件改为 `transport.rs` / `proto.rs` / `proto/codec.rs` / `session.rs`（2024 风格，不用 `*/mod.rs`）。v0.12 改样例承载方式：七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 内联字节数组，目录与 `include_bytes!` 一并取消；线格式与接口签名均未变化。v0.13 把 `Transport::bind` 改为异步（`L1-C4` 随之从「bind 同步」改为「三者皆异步」），`Server::bind` 因此变成 `async fn`，`detail/04` 的 `pub fn bind` 与装配清单同步加上 `.await`；线格式零改动。v0.14 落地 `memory` 传输并新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体单份、`tcp` 与 `memory` 各跑一遍；`Memory::pair` 同时去掉 `opts` 参数（`TransportOptions` 的两项对它无意义），且 `memory` 不实现 `Transport`。v0.15 落地 `local` 传输（Unix 手搓 UDS，保留半关闭；Windows 未实现、开启即编译失败），并把 drop 契约从「必须尽力半关闭」改判为「本端 drop 后不再写」——对端能否观测 EOF 降级为能力声明（`PEER_SEES_EOF`），正确性由 `GoAway` + 收尾超时兜底；`INV-16` 随之重写。
 >
 > 三类文档的优先级从高到低：**`docs/PROTOCOL.md`（线格式唯一权威）> `docs/design.md`（架构与决策）> `docs/detail/*.md`（实现细节）**。任何冲突以高优先级为准；本组文档若与 `design.md` 打架，是本文档的 bug，不是 `design.md` 的。
 
@@ -62,7 +62,7 @@
 | `INV-13` | `Service::call` 的接收者是 `self: Arc<Self>`；`spawn` 每请求只在 L3 发生一次 | 编译通过即证明（`&self` 版本编不过 blocking 分支） |
 | `INV-14` | `#[photon::service]` 的 `id` 必填、`u16`、注册撞号报错不覆盖 | 编译失败测试 + 注册期单测 |
 | `INV-15` | method id 只哈希方法名，编译期常量，golden 向量锁死 | `photon-macros` 单元测试 |
-| `INV-16` | `drop Sink` 尽力半关写方向、`drop Source` 关读方向；做不到的平台降级为整连接关闭 | 各 transport 的「drop 后对端在若干毫秒内看到 EOF/错误」测试（Windows named pipe 允许跳过，改测应用层 `GoAway`） |
+| `INV-16` | `drop Sink` 后**本端**不再写、`drop Source` 后不再读；对端能否观测到 EOF 是实现能力，**不是契约**（正确性由 `GoAway` + `close_timeout` 兜底） | 各 transport 按 `Harness::PEER_SEES_EOF` 的声明断言：`true` 必须读到 `UnexpectedEof`，`false` 必须读不到结束信号 |
 | `INV-17` | `recv` 与 `send` 只允许终态取消，不得用于单次超时 | 代码评审 + 文档；单测里禁止 `timeout(send())` 写法 |
 | `INV-18` | 所有基准测试与性能验收禁止使用 `AnySource` / `AnySink` 门面，必须走泛型单态化路径 | `benches/` 里出现 `AnySource` 即评审否决；M4/M5 数字必须标注所用具体 transport 类型 |
 | `INV-19` | 只有 `recv_limit()` / `send_limit()` 交出的 `Arc<AtomicU32>` 能承载协商后的帧长上限；`Session` 不得自己再存一份 | `max_message_len` 的唯一真相点检查（代码评审）；1 MiB 协商测试必须走过旋钮 |

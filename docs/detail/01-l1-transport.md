@@ -57,22 +57,28 @@ pub trait Transport: Sized {
 | `L1-C4` | `bind` / `connect` / `accept` **三者皆异步**；`opts` 是参数不是成员 | 同步 `bind` 会把「必须在 runtime 内」藏进注释，漏了的调用方在构造期 panic 而不是拿到 `Err` |
 | `L1-C5` | 两个上限旋钮必须能从 `recv_limit()` / `send_limit()` 取到，且**同一份 `Arc` 贯穿半身生命周期** | L3 拿不到旋钮 → 协商形同虚设（`INV-19`） |
 
-### 2.2 drop 契约（**验收项，不是说明**）
+### 2.2 drop 契约（**本端承诺，不是平台承诺**）
 
-没有 `close`、没有 `flush`（`design.md` 2.1）。关闭的唯一触发是 **drop**，因此 drop 必须在网络上可观测：
+没有 `close`、没有 `flush`（`design.md` 2.1）。关闭的唯一触发是 **drop**。但 drop 能承诺什么必须写清楚，否则验收项会挂在平台给不了的能力上（v0.15 改判）。
 
-| transport | drop `Sink` | drop `Source` | 是否满足半关闭契约 |
+**契约：drop `Sink` 后本端不再向这条连接写任何字节；drop `Source` 后本端不再读。**
+
+「对端能否观测到收尾」属于**实现能力**，不属于契约：
+
+| transport | drop `Sink` 后本端 | 对端可见 EOF | 能力声明 |
 |---|---|---|---|
-| `tcp` | `OwnedWriteHalf::drop` → `shutdown(SHUT_WR)`，对端读侧 EOF | `OwnedReadHalf::drop` 关读方向 | 满足 |
-| `local`（`interprocess`，Unix UDS） | 两半同处一个 `Arc<RawPipeStream>`，drop 一半只减引用计数 | 同左 | **不满足**，只能整连接关闭 |
-| `local`（Windows named pipe） | **无半关闭**：关写句柄 = 结束整个 pipe 实例 | 同左 | **不满足**，降级为整连接关闭 |
-| `memory` | drop 写半 = drop `mpsc::Sender` → 对端 `recv` 得到 `None` | drop 读半同理 | 满足（通道语义天然单向） |
-| `shm` | drop 写半 = 置段头 `state` 并停写 `head` | drop 读半 = 停推进 `tail` | 满足（但**必须显式做**，否则对端静默停住，见第 8 节） |
+| `tcp` | 不再写 | 是（`OwnedWriteHalf::drop` → `SHUT_WR`） | `PEER_SEES_EOF = true` |
+| `local`（Unix，手搓 UDS） | 不再写 | 是（同上） | `PEER_SEES_EOF = true` |
+| `local`（Windows named pipe，未实现） | 不再写 | 否（关写句柄 = 结束整个 pipe 实例） | 若实现则 `false` |
+| `memory` | 不再写 | 是（drop `Sender` → 对端 `recv` 得 `None`） | `PEER_SEES_EOF = true` |
+| `shm` | 停写 `head`、置段头 `state` | 是（靠状态位，不是 EOF） | `PEER_SEES_EOF = true` |
 
-契约写法：**`drop Sink` 必须尽力半关闭写方向；`drop Source` 关闭读方向；做不到半关闭的实现降级为「drop 任一半即整连接关闭」，并在实现文档里注明。** `local`（两种平台）属于降级档，因此：
+两条推论，都必须在 L3 侧成立：
 
-- 优雅关闭在 `local` 上**只能**靠应用层 `GoAway` 传达，不能指望 EOF；
-- 反向依赖成立：正因为存在无半关闭的平台，`GoAway` 才是必选控制帧，不是可选优化。
+- **正确性不挂在 EOF 上**：`GoAway` + 收尾超时（`design.md` 4.6 的 5 s 兜底）是唯一保证。没有半关闭只让收敛慢，不会死锁；
+- **半关闭只是加速**：有就顺手拿（`UnixStream` / `TcpStream` 的 `OwnedWriteHalf` 都免费给 `SHUT_WR`），没有也不影响任何上层代码。
+
+**不要**把这件事提到 `Transport` trait 上（加个 `HALF_CLOSE` 常量之类）让 L3 分支——L3 若要分辨具体 transport，铁律 ① 就破了（`design.md` 1.2）。能力位只活在测试里（`tests/transport.rs` 的 `PEER_SEES_EOF`），作用是**防止实现吹牛**：声明 `true` 就必须真给 EOF，声明 `false` 就必须真给不出。
 
 ### 2.3 所有权决定「并发模型」
 
@@ -89,7 +95,7 @@ src/transport.rs          trait 定义、Endpoint、TransportOptions、错误构
 src/transport/
   framing.rs    FramedSource<S> / FramedSink<S>：长度前缀、读满、双向上限旋钮
   tcp.rs        TcpTransport（tokio bind + nodelay + into_split）
-  local.rs      LocalTransport（interprocess，tokio feature）
+  local.rs      LocalTransport（Unix 手搓 UDS，feature = "local"）
   memory.rs     Memory::pair() -> ((Source, Sink), (Source, Sink))；不实现 Transport
   any.rs        AnySource / AnySink / AnyTransport（枚举门面，按 feature 裁剪变体）
   shm.rs        （M5）段管理、SPSC 环、块池、心跳；内部真拆子模块时须回填 1.3 的树
@@ -115,7 +121,7 @@ src/transport/
 | 变体 | 载荷 | 语义 | 解析方 |
 |---|---|---|---|
 | `Tcp` | `SocketAddr` | 已解析好的地址，不做 DNS | `tcp` |
-| `Local` | `LocalSocketAddr` | Unix 路径或 Windows pipe 名（`interprocess` 抽象） | `local` |
+| `Local` | `LocalAddr`（包 `PathBuf`） | Unix socket 文件路径；Windows pipe 名待扩载荷 | `local` |
 | `Memory` | `MemoryAddr` | **不参与查找**，只用于日志与 `Debug` | `memory` |
 | `Shm` | `{ name: String }` | **段基名**；实际两段 `{name}-a2b`、`{name}-b2a` | `shm` |
 
@@ -212,14 +218,30 @@ src/transport/
 - 分半：`into_split()` 得 `OwnedReadHalf` / `OwnedWriteHalf`，两半各自包 `FramedSource` / `FramedSink`。
 - `accept`：`listener.accept()` 循环由 L3 调用，L1 每次只产出一对半身。
 
-### 6.2 `local`（M1 起首选，仍是可选 feature）
+### 6.2 `local`（Unix UDS；Windows 推迟）
 
-- `interprocess` 的 tokio 封装，Windows → named pipe，Unix → UDS。
-- **Windows 上是纯字节流**：`interprocess` 的 tokio named pipe 实现里消息读取被显式关闭（源码注释 `MESSAGE READING DISABLED`，原因是要处理 `ERROR_MORE_DATA` 而 Mio 不支持），所以不能指望消息模式划边界 → **必须走 5 节的 framing**。
-- **drop 不能半关闭**（2.2 表）：`Draining → Closed` 在对端不可见。因此：
-  - `local` 上**必须**用 `GoAway` 传达收尾（不能像 `tcp` 那样「drop 就完事」）；
-  - 测试里对 `local` 不能断言「drop 后对端 N ms 内 EOF」，只能断言「收到 `GoAway` 后对端在 100 ms 内退出」（`INV-16` 的例外条款）。
-- Unix 上虽然底层是 UDS（本可半关闭），但 `interprocess` 把两半包在同一个 `Arc<RawPipeStream>` 里，drop 一半只减引用计数 → 与 Windows 同档处理。**不要**为 Unix 单独做半关闭优化，那会让平台行为分叉。
+**实现形状**：直接拿 `tokio::net::UnixListener` / `UnixStream`，比 `tcp` 少一层协议栈，零新依赖（`net` feature 本来就要开）。
+
+- `bind`：先 `prepare_path`，再 `UnixListener::bind`；
+- `connect`：`UnixStream::connect` + `connect_timeout`（UDS 上基本用不到，留口子是为了与 `tcp` 同签名）；
+- `accept`：`listener.accept()` 每次产出一对半身；
+- 分半：`UnixStream::into_split()` → `OwnedReadHalf` / `OwnedWriteHalf`，与 `tcp` 完全相同地包 `FramedSource` / `FramedSink`。
+
+**为什么手搓而不是套 `interprocess`（v0.15 结论）**：`interprocess` 把两半包在同一个 `Arc<RawPipeStream>` 里，drop 一半只减引用计数、不产生任何关闭信号——它为了在 Windows named pipe 上也能工作，把 Unix 的能力削到了 Windows 的水平。代价是 `UnexpectedEof` 在 `local` 上变成死代码、正常收尾留僵尸连接、对端继续写到管道缓冲满而阻塞。而我们要的东西在 `tokio` 里本来就是现成的：`OwnedWriteHalf::drop` 就是 `SHUT_WR`。
+
+**`prepare_path`：绑定前必须处理残留 socket**（三条规则，写死）：
+
+1. 路径不存在 → 直接用；
+2. 存在但**不是 socket**（普通文件、目录、符号链接）→ `InvalidInput` 拒绝，**绝不删除**。删用户文件换来的「bind 成功」不值得；
+3. 是 socket → `UnixStream::connect` 探活：连得上 = 有活着的监听者，拒绝（删掉路径不会杀掉它，只会让它静默接不到新连接）；`ECONNREFUSED` = 上次崩溃的残留，删掉重建；其它错误（`EACCES` 之类）原样上报，不当成残留。
+
+探活会对活着的服务端产生一次「连上即断」的幽灵连接，这是可接受的代价——比抢走别人的 socket 好得多。
+
+**路径长度**：`sockaddr_un.sun_path` 上限 Linux 108 / macOS 104，取 104。超长时内核只报 `ENAMETOOLONG`，不说哪个路径，所以 `bind` 前自己查一遍并给出明确错误（超过 103 字节即拒）。
+
+**关闭**：`OwnedWriteHalf::drop` 给出 `SHUT_WR`，对端读到 `UnexpectedEof`；drop 读半关读方向。因此 `local` 的能力声明与 `tcp` 一致（`PEER_SEES_EOF = true`），测试矩阵不需要为它写例外分支。
+
+**Windows 分支：不做（v0.15）**。四条理由见 `design.md` 2.6：无半关闭、server 需 per-connection 新建 pipe 且首个实例要 `first_pipe_instance(true)` 规避 `ERROR_PIPE_BUSY`、无 `into_split()`（`tokio::io::split` 是 `Arc<Mutex>`，读写抢锁且同样无半关闭）、**没有测试环境**。`local` feature 在非 Unix 目标上直接 `compile_error!`，把不支持写成编译期事实。
 
 ### 6.3 `memory`（一致性测试替身）
 
@@ -328,11 +350,11 @@ pub enum AnySource { Tcp(TcpSource), Local(LocalSource), Memory(MemorySource), S
 | 超本端上限被拒 | ✓ | ✓ | ✓ | ✓ | `InvalidData` + 断连 |
 | 超对端上限本地拒发 | ✓ | ✓ | ✓ | ✓ | `InvalidInput`，连接仍可用 |
 | 上限旋钮真的生效 | ✓ | ✓ | ✓ | ✓ | 同一对半身：先 `store` 到 1 MiB 发 500 KiB（通过），再 `store` 回 64 KiB 发 500 KiB（本地 `InvalidInput`） |
-| 对端 drop 后本端收到 EOF | ✓ | ✗（降级档） | ✓ | ✓（心跳/状态） | `INV-16` 的平台差异 |
+| 对端 drop 后本端收到 EOF | ✓ | ✓（按 `PEER_SEES_EOF` 声明断言） | ✓ | ✓（心跳/状态） | 能力声明，不是契约（2.2）；无半关闭的实现声明 `false` 并断言「读不到结束信号」 |
 | 并发 32 个写者排队 | — | — | — | — | 由 L3 的 writer task 保证，L1 不测 |
 | `Bytes::from_owner` 零拷贝落地 | ✓ | ✓ | ✓ | ✓ | owner 归还语义必须配对；`bytes >= 1.10.1` |
 
-M0 的落地项：trait + `framing.rs` + `tcp` + `memory` + `examples/echo.rs` 跑通，`cargo deny` 从 M0 就开（查的是「依赖死掉」而不是许可证）。
+M0 的落地项：trait + `framing.rs` + `tcp` + `memory` + `local`（Unix）+ `examples/echo.rs` 跑通（`cargo test --features local` 共 21 条 transport 用例），`cargo deny` 从 M0 就开（查的是「依赖死掉」而不是许可证）。
 
 ---
 
@@ -340,7 +362,7 @@ M0 的落地项：trait + `framing.rs` + `tcp` + `memory` + `examples/echo.rs` �
 
 - `close` / `flush`：删过两次，别再回来（所有权论证见 `design.md` 2.1）。
 - `unix` 原生 transport / `SOCK_SEQPACKET`：`local` 已覆盖 UDS，特化留到真需要 fd 传递时。
-- 消息模式 named pipe：`interprocess` 读侧不支持，Mio 也没有。
+- 消息模式 named pipe：读侧不替我们切消息（超缓冲返 `ERROR_MORE_DATA`），且没有半关闭；Windows `local` 整体推迟（`design.md` 2.6）。
 - 压缩：协议层不留位，L1 更不做。
 - 大消息分片协议（chunking）：`max_message_len` 是硬上限，超了就说清楚，不做隐式分片——隐式分片会把「一条完整消息」的契约打破（`L1-C1`）。
 - TLS / 认证：本地 IPC 场景无收益，属非目标。

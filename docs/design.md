@@ -4,7 +4,7 @@
 >
 > 当前阶段：**M0 — 搭架构骨架，先实现 Rust ↔ Rust 的进程间通讯**。
 >
-> 版本：**v0.14**（`memory` 传输落地，`Memory::pair` 去掉 `opts` 参数并明确不实现 `Transport`；新增 `tests/transport.rs` 用同一套用例同时验收 `tcp` 与 `memory`。线格式、字节布局与 17 条校验零改动）
+> 版本：**v0.15**（`local` 传输落地：Unix 上手搓 `tokio::net::UnixStream`，保留半关闭；同时把 drop 契约从「必须半关闭」改判为「本端不再写 + 能力声明」。线格式、字节布局与 17 条校验零改动）
 
 ## 变更记录
 
@@ -25,6 +25,7 @@
 | **v0.12** | **样例承载方式改为源码内联，线格式零改动**。① 七个黄金样例从 `tests/fixtures/*.bin` 改为 `photon/tests/protocol.rs` 里的内联字节数组（`assert_golden` 的 `expected` 参数），删除 `tests/fixtures/` 目录与 `include_bytes!` 这层路径管理。理由：`.bin` 在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可审、可逐段注释字段名与宽度，冻结效果完全等价。② 布局约束第 4 条随之重写（原「`tests/fixtures/` 从 M0 就存在」→「样例内联在 `tests/protocol.rs`」），1.3 目录树删掉 fixtures 子目录。③ **`PROTOCOL.md` §9 第 12 条（帧长上限）在 M0 落地**：新增 `proto::MAX_MESSAGE_LEN = 64 KiB`，`parse` 在解码与切片之前先查长度（`check_len`），恰好等于上限放行、多 1 字节拒绝，两个用例都只差长度、字段全合法。④ 同步 `PROTOCOL.md` §8.8 表头与 §11 生成/冻结流程、`detail/02` §10 与测试矩阵。 |
 | **v0.13** | **`Transport::bind` 改为异步，线格式零改动**。① 原同步签名与实现的真实前置条件不符：tokio 的 `TcpListener::from_std` 必须把 fd 注册进当前 runtime 的 driver，取不到 `Handle` 时 `Handle::current()` 直接 panic（`there is no reactor running`），而签名返回 `io::Result` 又让调用方以为失败一定可处理——错误类型错位。② 改为返回 `impl Future<Output = io::Result<Self>> + Send`：实现可直接用 `tokio::net::TcpListener::bind().await`，不再需要 `std::net::TcpListener::bind` + `set_nonblocking` + `from_std` 三步，也不需要运行时的 `try_current` 补丁——「必须被某个 executor poll」成为类型上的前置条件，漏掉是编译错误而不是构造期 panic。③ 三个发起动作（`bind` / `connect` / `accept`）由此统一在 async 世界，`detail/01` 的 `L1-C4` 改为「三者皆异步」。④ 门面代价口径修正：`AnyTransport::bind` 现在同样要一次 `Box::pin`，但一个进程只调一次，不在热路径。**同步改动**：`design.md` 2 节 trait 片段与 2.5 门面代价段、`detail/01` `L1-C4` / 模块表 / §6.1 / §7.2、`detail/04` `Server::bind` 签名与装配清单、`detail/00` 版本指向、`PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
 | **v0.14** | **`memory` 落地，`Memory::pair` 去掉 `opts`，线格式零改动**。① 产出 `transport/memory.rs`：`pair()` 造两条单向 `mpsc`（容量 `DEFAULT_QUEUE_CAPACITY = 1024`，实现常量不是协议约定）；读半把通道 `None` 映射 `UnexpectedEof`（返回空消息会让 L2 误诊成「头不完整」），读侧超上限报 `InvalidData`，写侧超上限报 `InvalidInput` 且连接保持可用。② **不实现 `Transport`**：`bind` / `connect` / `accept` 对「已经接好的一对 channel」没有对应动作，造一个按名字查找的注册表等于给它加一套不该有的寻址。③ `pair(opts)` → `pair()`：`TransportOptions` 的 `connect_timeout` 与 `spin_hint` 对进程内配对都无意义，收下不用就是坏参数。④ 新增 `tests/transport.rs`：以 `Harness` 只抽象「怎么接上一对半身」，6 条用例体只写一份，`tcp` 与 `memory` 各跑一遍（12 条全绿）——这是 M0 对 L1 抽象的唯一客观证据。**同步改动**：`design.md` 2.7 与 10.5、`detail/01` §3 目录树与 §6.3、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。 |
+| **v0.15** | **`local` 落地 + drop 契约改判**。① 产出 `transport/local.rs`：Unix 上手搓 `tokio::net::UnixStream`（零新依赖，约 240 行含测试），`OwnedWriteHalf::drop` 免费拿到 `SHUT_WR`；`Endpoint::Local(LocalAddr)` + `local` feature（不进默认集）；Windows 开启该 feature 直接 `compile_error!`（named pipe 无半关闭、server 需 per-connection 新建，没有测试环境不写）。② **把 2.1 的 drop 契约从「必须尽力半关闭写方向（验收项）」改判为「drop 后本端不再写」**，对端能否观测 EOF 降级为**实现能力**，正确性改由 `GoAway` + `close_timeout` 兜底——原写法需要给 named pipe 开例外条款，而需要例外才成立的契约不是契约。③ `tests/transport.rs` 的 `Harness` 增加 `const PEER_SEES_EOF: bool` 能力位，EOF 用例改为「按声明断言」，同一份用例体覆盖 3 个实现（21 条）。④ 顺带修一处测试自身的缺陷：`limit_knob` 先写 500 KiB 再读，在 UDS 缓冲区上会自堵（tcp 的缓冲够大所以没暴露），改为 `join!` 并发推进。 |
 
 ---
 
@@ -44,7 +45,7 @@
 「依赖不超过 8 个」如果不说清怎么数，就是个不可证伪的魔数。三个限定：
 
 - 只算 **直接依赖**（`Cargo.toml` 里显式列出的），不算传递依赖——后者由 tokio / serde 决定，我们控制不了
-- 只算 **默认 feature**：`interprocess`（`local`）、`shared_memory` + `crossbeam-utils`（`shm`）、`criterion`（dev）、`tracing-subscriber`（示例）全部不计
+- 只算 **默认 feature**：`shared_memory` + `crossbeam-utils`（`shm`）、`criterion`（dev）、`tracing-subscriber`（示例）全部不计；`local` 手搓 `tokio::net::UnixStream`，**不引入新依赖**
 - `syn` / `quote` / `proc-macro2` 住在 `photon-macros`，不计入主 crate
 
 当前默认集正好 8 个：`tokio` / `bytes` / `serde` / `postcard` / `thiserror` / `tracing` / `tokio-util` / `parking_lot`。
@@ -207,7 +208,7 @@ photon/                          # workspace 根
 |---|---|---|---|
 | `tcp` | ✅ | `transport/tcp.rs` | 跨平台、零额外依赖，M0 的默认通道 |
 | `memory` | ✅ | `transport/memory.rs` | 常开：接口验收与单元测试的基础 |
-| `local` | ❌ | `transport/local.rs` | 依赖 `interprocess`，本地 IPC |
+| `local` | ❌ | `transport/local.rs` | Unix 手搓 UDS（零新依赖）；Windows 未实现，开启即编译失败 |
 | `shm` | ❌ | `transport/shm.rs` | M5；依赖 `shared_memory` + `crossbeam-utils` |
 | `blocking` | ❌ | `session/blocking.rs` | 生成 `BlockingClient`，支持同步调用，见 5.5 |
 | `interceptor` | ❌ | 接 `tower::Service` / `Layer` | M3 评估后再引入；它会把直接依赖推到 9 个，所以不进默认集（见 0 节） |
@@ -282,15 +283,25 @@ pub trait Transport: Sized {
 
 `flush` 同理：TCP 写本来就由内核缓冲承托、shm 根本没有 flush 概念、memory 是 channel——三种里两种是 no-op，留着只会让每个新 transport 都多实现一个空函数。收尾交给 sink 的 `drop`。
 
-**但「收尾交给 drop」是一条契约，不是一句免责声明（v0.9 补）。** 既然没有 `close`，那 `Draining → Closed` 在网络上能不能被对端看见，就完全取决于 `drop` 对底层的效果。三种 transport 的实际行为差别很大：
+**但「收尾交给 drop」必须先说清它能承诺什么（v0.15 改判）。** 既然没有 `close`，那 `Draining → Closed` 在网络上能不能被对端看见，就完全取决于 `drop` 对底层的效果——而这个效果**逐平台不同**。所以契约只能承诺本端行为：
 
-| transport | drop `Sink` | drop `Source` |
+**契约（唯一可作为验收条件的一条）：drop `Sink` 之后本端不再向这条连接写任何字节；drop `Source` 之后本端不再读。其余一概不承诺。**
+
+「对端能否观测到收尾」是**实现能力**，不是契约：
+
+| transport | drop `Sink` 的实际效果 | 对端可见 EOF |
 |---|---|---|
-| `tcp`（tokio 分裂半身） | `OwnedWriteHalf::drop` 会 `shutdown(Write)`，对端收到 EOF | `OwnedReadHalf::drop` 关读方向 |
-| `local`（`interprocess`） | 两半包在同一个 `Arc<RawPipeStream>` 里，**drop 一半只是减引用计数，不会产生任何关闭信号** | 同左 |
-| Windows named pipe | **没有半关闭**：关掉写句柄等于结束整个 pipe 实例 | 同左 |
+| `tcp`（tokio 分裂半身） | `OwnedWriteHalf::drop` → `shutdown(SHUT_WR)` | 是 |
+| `local`（Unix，手搓 UDS） | 同上 | 是 |
+| `local`（Windows named pipe，未实现） | 无半关闭：关写句柄 = 结束整个 pipe 实例 | 否 |
+| `memory` | drop `mpsc::Sender`，对端 `recv` 得到 `None` | 是（不是 EOF，是通道关闭） |
+| `shm` | 置段头 `state` 并停写 `head` | 是（靠状态位） |
 
-所以 trait 契约必须这么写，而且是**验收条件**：**drop `Sink` 必须尽力半关闭写方向；drop `Source` 关闭读方向；做不到半关闭的平台，降级为「drop 任一半即整连接关闭」，并在实现文档里注明。** 不写这条，M1 换到 `local` 之后会出现「对端永远等不到 EOF、客户端不退出」——而且从代码上看不出任何错误。
+**为什么不再写成「必须尽力半关闭」（v0.15）**：原来那条契约要求四个实现里有两个（`interprocess`、Windows named pipe）开例外条款——**一个需要例外才成立的契约不是契约，是偏好**。硬写进验收条件，只会让那个平台要么永远红着，要么逼实现撒谎。正确性改挂在这里：
+
+- **由 `GoAway` + 收尾超时保证**（4.6 的默认 5 s 兜底）：没有 EOF 时收敛慢一点，但不会卡死；
+- **半关闭降级为推动收敛的加速路径**：实现拿得到就拿（Unix 上 `tokio::net::UnixStream` 免费给 `SHUT_WR`），拿不到就不拿，L2 以上一行代码都不用改；
+- **能力位只出现在测试里**（`tests/transport.rs` 的 `PEER_SEES_EOF`），用来验证实现没撒谎；**不要**把它提到 `Transport` trait 上让 L3 分支——L3 一旦开始分辨具体 transport，铁律 ①（L2 以上不认识 fd 与底层概念）就已经破了。
 
 由此推出第二条使用约束（原来只写了 `recv`）：**`recv` 与 `send` 都只允许在「终态取消」时被打断，不能用来做单次超时。** `recv` 被打断会丢掉已读进内部缓冲的字节；`send` 被打断更糟——它会在流里留下**半帧**，对端解析到一半的长度前缀，整条连接只能废弃。把 `send` 的 future 拿去做 `timeout`，等于在生产环境里随机制造「连接无端损坏」。
 
@@ -310,8 +321,9 @@ pub trait Transport: Sized {
 | 实现 | 平台 | 优点 | 缺点 | 定位 |
 |---|---|---|---|---|
 | `tcp`（127.0.0.1） | 全平台 | 零平台差异、最省事 | 比 UDS 慢约 20–30%（量级估计，非实测） | **M0 打通链路用这个** |
-| `local`（`interprocess`） | 全平台 | Windows 走 named pipe、Unix 走 UDS，一套 API | 多一层薄封装；**Windows 上拿不到消息边界**（见 2.6），必须走 framing | **M1 起的首选本地 IPC**（注意：仍是**可选 feature**，不进默认集） |
-| `unix`（原生 `tokio::net`） | Unix only | 最直接；`SOCK_SEQPACKET` 原生带消息边界；支持 fd 传递 | Windows 不可用 | **当前不做**：`local` 已覆盖 UDS；仅当需要 `SOCK_SEQPACKET` 时作为可选特化，见 12 节第 11 条 |
+| `local`（手搓 UDS） | Unix only | 零新依赖（`tokio::net::UnixStream` 已在默认依赖里）；**天然半关闭**，与 `tcp` 同语义；比 TCP loopback 少一层协议栈 | Windows 不可用；路径受 `sun_path` 长度限制（约 104 字节） | **M0 起落地的本地 IPC**（可选 feature，不进默认集）；M1 用它做「换 transport 不改上层」的架构验收 |
+| `local`（Windows named pipe） | Windows only | 系统原生 | 无半关闭；server 需 per-connection 新建并用 `first_pipe_instance` 规避 `ERROR_PIPE_BUSY`；无 `into_split`；**当前无测试环境** | **推迟**：实现代码没人验证过就是负债，等有 Windows CI 再谈（见 2.6） |
+| `unix`（`SOCK_SEQPACKET` 特化） | Unix only | 原生带消息边界；支持 fd 传递 | Windows 不可用 | **当前不做**：`local` 已覆盖 `SOCK_STREAM`；仅当需要 fd 传递/seqpacket 时再加，见 12 节第 11 条 |
 | `memory` | 全平台 | 零 syscall；**与 `tcp` 走同一套 `Bytes` 载体**，是最低成本的一致性测试替身 | 不能跨进程 | **单测 + 消息导向接口的验收 + 零拷贝形状验证** |
 | `shm` | 全平台（实现各异） | 建立后完全不经内核，RTT 100–600 ns（配置相关，见附录 B.2） | 实现复杂（一致性 / 崩溃检测 / 生命周期） | **M5，见附录 B** |
 
@@ -335,7 +347,7 @@ pub trait Transport: Sized {
    边界由 OS 或环本身提供，跳过长度前缀，直接一条消息一个 Bytes
 ```
 
-**注意 `local` 在 Windows 上属于「流式」这一档，不是消息式。** 原因见 2.6：named pipe 的消息读取在 `interprocess` 的 tokio 实现里被显式关闭了，所以长度前缀不能省。
+**注意：若将来实现 Windows `local`，它属于「流式」这一档，不是消息式。** 原因见 2.6：named pipe 在消息超出缓冲时返回 `ERROR_MORE_DATA`，读侧不替我们切消息，长度前缀不能省。Unix 上本来就是流，无此问题。
 
 **读路径上有一个容易做错的地方**：拼帧时不要「先 `read_exact` 到一个临时 Vec、再拷进 `BytesMut`」。直接用 `read_buf(&mut BytesMut)` 让数据一次落进目标缓冲，读完再 `split_to(len).freeze()`。前者对一条 1 MiB 消息会多一次整块拷贝，而且两者都发生在 reader task 的关键路径上——这是 M4 里最容易拿到的一笔免费收益。
 
@@ -402,34 +414,35 @@ pub enum AnySource {
 
 > **一个容易误判的地方**：`AnySource` 消除的是**单态化组合爆炸**，不是**泛型传染**。`Session<S, K>` 仍会把 `S`/`K` 一路带到 `Server`、`connect`、生成的客户端类型上；想真正擦除，必须在每个边界上都擦（`Session<AnySource, AnySink>` + `Server::bind` 返回 `Session<AnySource, AnySink>` 的入口）。只擦一半，调用方照样被 `S` 绑住。
 
-### 2.6 Windows 平台的现实约束
+### 2.6 Windows 平台的现实约束（`local` 的 Windows 分支推迟）
 
 必须先明确的事实：
 
 - `tokio::net::UnixStream` / `UnixListener` 都标了 `Available on Unix only`，Windows 上没有。
 - Windows 10 1803+ 内核支持 `AF_UNIX`，但 Rust 标准库与 tokio 都**没有**提供封装。
-- Windows 的本地 IPC 正解是 **named pipe**（`tokio::net::windows::named_pipe`）。OS 与 tokio 都能**创建**消息模式的 pipe（`PipeMode::Message`），**但读侧不替我们切消息**——一条消息超出缓冲时返回 `ERROR_MORE_DATA`，得自己续读拼完。所以「消息模式」在这里只解决「一次读会不会混进下一条」，不解决「边界要不要自己算」。
+- Windows 的本地 IPC 正解是 **named pipe**（`tokio::net::windows::named_pipe`）。OS 与 tokio 都能**创建**消息模式的 pipe（`PipeMode::Message`），**但读侧不替我们切消息**——一条消息超出缓冲时返回 `ERROR_MORE_DATA`，得自己续读拼完。所以即使将来做，长度前缀也不能省。
 
-**但这里有个必须纠正的坑（v0.7 修正）**：`interprocess` 的 tokio named pipe 实现在源码里明确写着 `MESSAGE READING DISABLED`——消息读取要处理 `ERROR_MORE_DATA`（一条消息超出缓冲要分多次读），Mio 没有支持，所以被整段注释掉了。
-
-结论：**只要用 `interprocess`，Windows 上就是纯字节流，必须走长度前缀 framing**；不能指望 named pipe 的消息模式替我们划边界。这与 v0.2–v0.6 里「named pipe 消息模式原生带边界，省掉长度前缀」的说法相反，M1 的工作量按字节流重估：`local` 与 `tcp` 共用同一个 `FramedSource` 即可，实际增加的工作量很小，但**不能**按「消息式」去设计它的背压与上限校验。
-
-路线：
+路线（v0.15 重写）：
 
 1. **M0 用 TCP loopback 打通全链路**。内核 loopback 绕过大部分网络栈，吞吐 GB/s 级、延迟微秒级。用它能先把 L2/L3 调对，不被平台差异干扰。
-2. **M1 换成 `interprocess`**（开 `tokio` feature）：Windows 映射到 named pipe，Unix 映射到 UDS。
-3. **这一步同时是架构验收**：换 transport 不改 L2 以上一行业务代码，才叫可扩展。
+2. **M0 同时落地 `local`（Unix UDS）**：直接拿 `tokio::net::UnixStream` + `FramedSource/FramedSink`，零新依赖，`OwnedWriteHalf::drop` 免费给出 `SHUT_WR`。
+3. **M1 做架构验收**：把 transport 从 TCP 换成 `local`，`Session` 一行不改。
+4. **Windows 分支明确推迟**（v0.15）。四条理由，按严重程度排：
+   - **没有半关闭**：关掉写句柄等于结束整个 pipe 实例，进程间看不到「我先不发、但仍能收」；
+   - **server 侧要 per-connection 新建 pipe**，且第一个实例必须 `first_pipe_instance(true)`，否则两个进程先后 bind 会撞 `ERROR_PIPE_BUSY` 这种「看起来像随机失败」的竞态；
+   - **没有 `into_split()`**，只能 `tokio::io::split`（内部 `Arc<Mutex>`，读写抢同一把锁，也就永远拿不到半关闭）；
+   - **没有测试环境**：手搓一段没人跑过的 Windows 代码，不是「提前布局」，是给 CI 埋一颗只在特定机器上炸的雷。
 
-**Windows 上的关闭降级，必须提前记下来（v0.9）。** tokio 的 `TcpStream::into_split()` 两半是真正独立的半身，drop 写半会 `shutdown(SHUT_WR)`；而 named pipe **没有半关闭**——关掉写句柄就是这个 pipe 实例结束，进程间看不到「我先不发、但仍能收」。`interprocess` 又把读写包在同一个 `Arc<RawPipeStream>` 里，drop 其中一半只是减引用计数。
+   落地方式：`local` feature 在非 Unix 目标上直接 `compile_error!`。**把「不支持」写成编译期事实，而不是运行时惊喜。**
 
-结果：**`local` 在 Windows 上，`Draining → Closed` 对端看不见任何信号**，只能靠应用层 `GoAway` 已经通知过、或等整条 pipe 被关闭。所以 2.1 的 drop 契约在这里必须写成降级形态：「drop 任一半 = 整连接关闭」。这也是为什么 `GoAway` 必须是显式控制帧——在没有半关闭的平台上，它是唯一的优雅关闭信号。
+**Windows 上的关闭差异，仍然要提前记下来（v0.9 提出，v0.15 改判表述）。** tokio 的 `TcpStream::into_split()` 两半是真正独立的半身，drop 写半会 `shutdown(SHUT_WR)`；named pipe **没有半关闭**。因此 2.1 的 drop 契约只能承诺「本端 drop 后不再写」，对端能不能看见收尾交给 `GoAway` + 收尾超时。这也正是为什么 `GoAway` 必须是显式控制帧——在没有半关闭的平台上，它是唯一的优雅关闭信号。
 
 ### 2.7 Endpoint 抽象
 
 ```rust
 pub enum Endpoint {
     Tcp(SocketAddr),
-    Local(LocalSocketAddr),                  // 路径或 pipe 名
+    Local(LocalAddr),                        // Unix：socket 文件路径；Windows pipe 名待扩
     Memory(MemoryAddr),                      // 进程内直接配对的通道标识（无注册表，见下）
     Shm { name: String },                    // 段基名；双向 = 两个段（见附录 B.3），容量写在段头
 }
@@ -1238,7 +1251,7 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 | 错误 | `thiserror`（库）/ `anyhow`（示例） | 库必须给结构化错误 |
 | 观测 | `tracing` + `tracing-subscriber` | 每个请求一个 span，带 `service_id` + `method_name` + `request_id`（只有 id 的 span 排障时基本没用，见 3.5）；**`tracing-subscriber` 只在示例与 dev 依赖里，不进主 crate** |
 | 取消 | `tokio-util`（`CancellationToken`、`codec`） | |
-| 本地 IPC | `interprocess`（`tokio` feature） | Windows named pipe / Unix UDS 统一抽象 |
+| 本地 IPC | **无**（`tokio::net::UnixStream`） | Unix 手搓 UDS；Windows named pipe 推迟，不为统一抽象引第三方依赖 |
 | 低开销锁 | `parking_lot` | pending map 用 |
 | cache line 对齐 | `crossbeam-utils`（`CachePadded`） | **M5 shm 必需**，避免伪共享 |
 | proc-macro | `syn`（`full`）、`quote`、`proc-macro2` | |
@@ -1293,7 +1306,7 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 25. **超时不回收 `pending` 就是泄漏。** 不要指望「sender 发送失败自然清理」——响应不来就永远不清理，配额也不会释放。必须 `Drop` guard（见 4.1/4.2）。
 26. **`GoAway` 里放「最后已处理的 id」在双向会话下说不清。** 两侧各有自己的 id 空间，这个字段没有良定义，已删（见 4.6）。
 27. **控制帧不能用 `Codec` 编码。** `Handshake` 要交代 codec 身份，用它解自己就是循环依赖；而且握手阶段 codec 还没确认。控制帧一律手写定长（见 6 节机制 2）。
-28. **`interprocess` 的 Windows named pipe 没有消息边界。** 源码里 `MESSAGE READING DISABLED` 写得明明白白，`local` 必须全平台走 framing（见 2.6）。这一点如果按「消息式」设计背压，会在 Windows 上直接跑不通。
+28. **Windows named pipe 没有可信的消息边界，也没有半关闭。** 消息模式能创建，但读侧一条消息超出缓冲就返回 `ERROR_MORE_DATA`，边界仍要自己算；关写句柄又等于结束整个 pipe 实例。所以将来做 Windows `local` 时：必须走 framing、必须靠 `GoAway` 收尾（见 2.6）。现在这段推迟，不写没人验证的代码。
 29. **`Bytes::from_owner` 的 owner 必须 `Send`，且 `bytes` 下限是 1.10.1。** 少一个 `Send`，`Bytes` 就不再是 `Send`，铁律③当场破；用 1.9.x 会踩它和 `to_vec` 的内存泄漏。
 30. **选依赖前先查 RUSTSEC。** bincode 的死法是「维护者直接发一个只含 `compile_error!` 的 3.0.0」，不是没人维护那么简单——`cargo deny` 会拦，CI 会红。核心依赖每年复查一次。**line format 里出现的对齐假设同理**：20 字节头让 rkyv 无法原地读，这类「不是 bug 但堵死未来」的约束，越早发现越便宜。
 
@@ -1330,7 +1343,9 @@ v0.6 的设计是「检测到 runtime 上下文就直接拒绝，debug panic / r
 - [ ] `Session`：pending map（**带 `Drop` guard 的 `PendingEntry`**）+ reader task + writer task
 - [ ] `Request` / `Response` 语义
 - [ ] `Handshake` **最小版**：固定 12 字节、版本 1、首帧强制、握手超时与握手前 64 KiB 上限（完整协商留到 M3）
-- [ ] `Transport` 换成 `interprocess::local`（Windows 走 framing，见 2.6）
+- [x] `Transport` 换成 `local`（Unix 手搓 UDS，M0 已落地；Windows 分支推迟，见 2.6）
+- [ ] 用 `cargo test --features local` 跑通本地 IPC 的 21 条用例
+
 - [ ] `shutdown` token 覆盖 reader **与 writer** 两个 task，让两边都能被唤醒并非阻塞退出（v0.8 删掉了 `MessageSource::close`，见 2.1）
 - [ ] 并发测试：100 个并发请求乱序返回，互不串包
 - [ ] **零拷贝形状验证**：在 `memory` 上返回 `Bytes::from_owner`，确认全程没有额外拷贝
