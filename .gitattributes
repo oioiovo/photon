@@ -1,0 +1,6 @@
+# 仓库内统一 LF：文档与源码都不允许 CRLF，避免 diff 噪声与行尾漂移
+* text=auto eol=lf
+
+*.md   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
