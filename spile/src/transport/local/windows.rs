@@ -365,7 +365,12 @@ mod tests {
         let again = pipe_name(&a).expect("映射");
         assert_eq!(first, again, "同一个地址必须映射到同一个名字");
         assert_ne!(first, pipe_name(&b).expect("映射"), "不同地址不该撞名");
-        assert!(first.starts_with(r"\\.\pipe\spile-alpha-"), "前缀应可辨认");
+        // 前缀只保留 `[A-Za-z0-9_-]`（种子里的 `.` 等字符一律丢掉，免得任意路径文本
+        // 直接漏进机器全局的 pipe 命名空间），所以 `alpha.sock` 的可读前缀是 `alphasock`。
+        assert!(
+            first.starts_with(r"\\.\pipe\spile-alphasock-"),
+            "前缀应可辨认：{first}"
+        );
         assert!(first.chars().count() <= NAME_LIMIT);
     }
 
