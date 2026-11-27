@@ -585,6 +585,75 @@ async fn peer_declared_limit_governs_sending<H: Harness>() {
     server.close().await.expect("关闭");
 }
 
+/// 超过**对端**声明的上限：本端就地判 `InvalidInput`，不发出去、也不关连接。
+///
+/// 这条边界以前漏了：判定只做在 framing 的发送侧，而 writer 把「写失败」当成连接
+/// 级别的死——一次「发太大」会顺手带走整条连接，和「超限只影响这一次调用」的语义
+/// 相反。现在判定提到 `send_once` 里、占 pending 之前。
+async fn request_over_peer_limit_is_invalid_input<H: Harness>() {
+    // 服务端只肯收 4 KiB，客户端仍是默认 64 KiB。
+    let server_opts = SessionOptions {
+        max_message_len: 4096,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, Arc::new(Ack)),
+        server_opts,
+        SessionOptions::default(),
+    )
+    .await;
+
+    let err = ch
+        .call(7, 1, Bytes::from(vec![0xABu8; 8 * 1024]), CALL_DEADLINE)
+        .await
+        .expect_err("超过对端上限应当本端拒绝");
+    match err {
+        CallFailure::Failed(RpcError::InvalidInput(message)) => {
+            assert!(
+                message.contains("max_message_len"),
+                "文本应当指明是对端上限：{message}"
+            );
+        }
+        other => panic!("应当是 InvalidInput，实际 {other:?}"),
+    }
+
+    // 关键的一半：连接必须还能用。
+    let reply = ch
+        .call(7, 1, Bytes::from_static(b"small"), CALL_DEADLINE)
+        .await
+        .expect("超限之后连接应当仍然可用");
+    assert_eq!(&reply[..], b"ok");
+    assert!(!server.is_closed(), "超限不该把连接打死");
+
+    server.close().await.expect("关闭");
+}
+
+/// 通知方向同一条边界：超限返回 `InvalidInput`，连接不跟着死。
+async fn notification_over_peer_limit_is_invalid_input<H: Harness>() {
+    let server_opts = SessionOptions {
+        max_message_len: 4096,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, Arc::new(Ack)),
+        server_opts,
+        SessionOptions::default(),
+    )
+    .await;
+
+    let err = ch
+        .notify(7, 1, Bytes::from(vec![0xCDu8; 8 * 1024]))
+        .await
+        .expect_err("超过对端上限的通知应当本端拒绝");
+    assert!(matches!(err, RpcError::InvalidInput(_)), "实际 {err:?}");
+
+    ch.call(7, 1, Bytes::from_static(b"small"), CALL_DEADLINE)
+        .await
+        .expect("通知超限之后连接应当仍然可用");
+
+    server.close().await.expect("关闭");
+}
+
 /// 两类入站额度互不挤占：阻塞池打满时，异步请求必须照样跑得动。
 async fn blocking_quota_is_separate<H: Harness>() {
     let mut registry = ServiceRegistry::empty();
@@ -815,6 +884,99 @@ async fn graceful_close_waits_inflight<H: Harness>() {
         .expect("call task")
         .expect("优雅关闭期间在飞请求应当正常完成");
     assert_eq!(&reply[..], b"done");
+}
+
+/// 对端宣告关闭后，**被动一侧**的会话也必须真的进 `Closed`。
+///
+/// 这条钉的是「排空即收尾」的**终点**：只把两个 task 停掉是不够的，`phase` 也必须
+/// 落到 `Closed`，否则 `wait_closed()` 永远挂着、`Server::serve` 永远收不回这条连接。
+/// 在没有半关闭的后端（named pipe）上尤其致命——那里连 EOF 都不会来。
+async fn peer_goaway_closes_the_passive_side<H: Harness>() {
+    let (server, _sh, _client, ch) = boot::<H>(
+        registry_with(7, Arc::new(Echo { slow: false })),
+        SessionOptions::default(),
+        SessionOptions::default(),
+    )
+    .await;
+
+    // 先跑通一次，确保这条连接是真的活着（否则「收敛」可能只是连都没连上）。
+    let reply = ch
+        .call(7, 1, Bytes::from_static(b"hello"), CALL_DEADLINE)
+        .await
+        .expect("第一次调用");
+    assert_eq!(&reply[..], b"hello");
+
+    ch.close().await.expect("客户端宣告关闭");
+
+    tokio::time::timeout(Duration::from_secs(2), server.wait_closed())
+        .await
+        .expect("被动一侧必须自己收敛进 Closed");
+    assert!(
+        server.is_closed(),
+        "wait_closed 返回了，phase 也必须是 Closed"
+    );
+}
+
+/// 只有 `GoAway`、没有 EOF 时，被动一侧也必须自己收敛——这才是 named pipe / shm 的处境。
+///
+/// 假对端发完 `Handshake` + `GoAway` 就把两端半身**一直握在手里**（不断连、不 EOF），
+/// 于是「收到宣告 → 排空 → 停 task → 置 `Closed`」这条链是唯一的收尾路径。
+/// 顺带钉住协议那一半：收到对端宣告后，本端必须回自己的 `GoAway`。
+async fn peer_goaway_without_eof_closes_the_passive_side<H: Harness>() {
+    let ((s_src, s_sink), (mut c_src, mut c_sink)) = H::connected().await;
+    let (server, _sh) = Session::new(
+        s_src,
+        s_sink,
+        registry_with(7, Arc::new(Echo { slow: false })),
+        SessionOptions::default(),
+    )
+    .expect("服务端会话");
+
+    c_sink
+        .send(spile::proto::handshake::Handshake::new(DEFAULT_MAX_MESSAGE_LEN, 0).encode_frame())
+        .await
+        .expect("握手帧应当发得出");
+    let their_handshake = c_src.recv().await.expect("应当收到服务端握手帧");
+    assert_eq!(
+        spile::proto::Header::decode(&their_handshake[..])
+            .expect("头可解")
+            .kind,
+        spile::proto::Kind::Handshake
+    );
+
+    c_sink
+        .send(control_frame(spile::proto::Kind::GoAway, 0, 0, 0, 0, 0))
+        .await
+        .expect("GoAway 应当发得出");
+
+    // 服务端必须回自己的 `GoAway`：两边都宣告过，收尾才对等。
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "2 s 内没等到服务端回的 GoAway"
+        );
+        let frame = tokio::time::timeout(Duration::from_millis(200), c_src.recv())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        let Some(frame) = frame else { continue };
+        if spile::proto::Header::decode(&frame[..])
+            .expect("头可解")
+            .kind
+            == spile::proto::Kind::GoAway
+        {
+            break;
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), server.wait_closed())
+        .await
+        .expect("没有 EOF 时，被动一侧也必须自己收敛进 Closed");
+    assert!(server.is_closed());
+
+    // 两端半身在上面全程都没被 drop —— 收敛不是靠断开连接换来的。
+    drop((c_src, c_sink));
 }
 
 /// 急停不等在飞：对端的在飞请求要立刻失败，而不是等到自己的期限。
@@ -1143,6 +1305,16 @@ macro_rules! suite {
             }
 
             #[tokio::test]
+            async fn request_over_peer_limit_is_invalid_input() {
+                super::request_over_peer_limit_is_invalid_input::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn notification_over_peer_limit_is_invalid_input() {
+                super::notification_over_peer_limit_is_invalid_input::<$H>().await
+            }
+
+            #[tokio::test]
             async fn blocking_quota_is_separate() {
                 super::blocking_quota_is_separate::<$H>().await
             }
@@ -1175,6 +1347,16 @@ macro_rules! suite {
             #[tokio::test]
             async fn graceful_close_waits_inflight() {
                 super::graceful_close_waits_inflight::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn peer_goaway_closes_the_passive_side() {
+                super::peer_goaway_closes_the_passive_side::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn peer_goaway_without_eof_closes_the_passive_side() {
+                super::peer_goaway_without_eof_closes_the_passive_side::<$H>().await
             }
 
             #[tokio::test]

@@ -92,7 +92,13 @@ async fn prepare_path(path: &Path) -> io::Result<()> {
     // 是 socket，还要确认没人在听：删掉路径不会杀掉监听者，只会让它再也接不到
     // 新连接，而它自己毫无察觉——这种「看起来还活着」的状态最难查。
     match UnixStream::connect(path).await {
-        Ok(_) => Err(invalid_input(format!("{path:?} 已有活跃监听者，拒绝覆盖"))),
+        // 契约 2：活着的监听者不可抢占，错误种类必须是 `AlreadyExists` ——
+        // 和 Windows 后端（`ERROR_ACCESS_DENIED` 归一过来）保持同一类，上层才不用
+        // 按平台分支处理。
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{path:?} 已有活跃监听者，拒绝覆盖"),
+        )),
         // ECONNREFUSED：文件在但没人 listen，是上次崩溃的残留。
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
             std::fs::remove_file(path)?;
@@ -242,7 +248,8 @@ mod tests {
         let err = LocalTransport::bind(&local_ep(&path), &TransportOptions::default())
             .await
             .expect_err("第二个监听者不该抢走路径");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // 契约 2 说的就是这个错误种类，两平台必须一致。
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
         drop(first);
         let _ = std::fs::remove_file(&path);

@@ -4,9 +4,10 @@
 >
 > 当前阶段：**M3 已完成（v0.32），M4 进行中（v0.33 起测，v0.34 已落第一刀：合 spawn；v0.35 是平台补齐，M4 本身未再推进）**。M3 的全部条目都在下方列了证据；M4 的第一件事是测，而不是改（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落十块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。⑩ `Interceptor` 链（v0.32：自研、不接 `tower`、零新依赖、空链零成本，11 条用例）。M3 清单自此全空。
 >
-> 版本：**v0.35**（**`local` 补上 Windows 后端，并按编译目标自动分派**）：`transport/local.rs` 拆成 `local/{mod,unix,windows}.rs`，`mod` 只留两个后端的共同契约（7 条：同名同监听者 / 活监听不可抢占 / 非法地址 `InvalidInput` / `connect_timeout` 必 `TimedOut` / 整连接关闭对端见 `UnexpectedEof` / 并发上限是平台常量 / 只有同一用户可连），具体实现在 `unix` 与 `windows` 里，`pub use` 出同名 `LocalTransport` / `LocalSource` / `LocalSink`，上层一行不改。**Windows 侧不引 `interprocess`**：能力都在已有的 `tokio::net::windows::named_pipe`（`net` feature）里，手搓的只有三件事——实例轮换的 listener（`accept` 里 `connect` 成功后立刻补新实例）、`ERROR_PIPE_BUSY` 的退让重试、`NamedPipeServer`/`NamedPipeClient` 合成 `PipeStream` 再 `io::split`。`LocalAddr` 在 Windows 上是**名字种子**（`\\.\pipe\spile-<可读前缀>-<16 位 hex FNV-1a>`，已是 `\\.\pipe\...` 的原样用）。**`local` 进默认集**：本地 IPC 是基本能力，不该因为平台不同变成可选项。契约收窄到两平台交集，「只 drop 写半是否产生关闭信号」「崩溃残留能否清理」明确划为后端私有。新增 7 条 Windows 用例（roundtrip + 整连接关闭见 EOF、只 drop 写半不产生 EOF、第二个监听被拒、无监听者 `NotFound`、实例轮换、名字映射、完整 pipe 名原样透传），`PEER_SEES_EOF` 在 `tests/transport.rs` 改为 `cfg!(unix)`；顺带修 `tests/tracing_spans.rs` 一处**跨用例污染**（同一全局 capture 里混着另一个用例的 span，`--test-threads=1` 下必红）。**两个平台都真机跑过**：macOS 150 条全绿（Windows 专用用例在 macOS 上不编译）；Windows 11 真机（rustc 1.93.1 / `x86_64-pc-windows-msvc`）152 条全绿（`lib` 42 = 40 + 7 Windows 用例 − 5 Unix UDS 用例，其余各组与 macOS 同数），另跑 `calc_local` 两进程 —— `local://spile-calc` 上 `add(2, 3) = 5`、`div(1, 0) -> Err(Rejected(DivideByZero))`。真机跑出**唯一一处偏差**：可读前缀会把种子里的 `.` 滤掉（`alpha.sock` → `alphasock`），是断言写错、实现正确，已改为断言现状并把过滤规则写进 `detail/01` 6.2。fmt/clippy 两头干净，`--target x86_64-pc-windows-msvc` 交叉 `check`/`clippy` 亦干净。
+> 版本：**v0.36**（**示例从「演示」升级为「可判定验收」，并修两处文档承诺与实现不符**）：① 新增 `spile/examples/support/check.rs`——一个只有 `Check`（`expect` / `eq` / `finish`）与 `fail` 的小工具，输出 `[<名>] ok …` / `[<名>] FAIL …（期望/实际）`，末尾打 `n/n 全过`，有失败就 `exit(1)`。示例从此不看人眼比对，只看退出码。② 四份示例各自补齐：`local_calc` 17 条断言（四种调用形态 + 三档声明 + **拦截器逐方法账本** + **入站配额** + 优雅关闭）；`calc_local` 两进程两端都自检（客户端 4 条，服务端 `--check` 用服务端拦截器记账、等 `GoAway` 收尾后比对条数再退出，这条同时把「跨进程优雅关闭」变成可判定项）；`examples/calc-split` 的 `calc-client` 加 2 条断言；**新增 `conformance`** 12 条负路径（unknown service→`PeerRejected{2}`、unknown method→`{3}`、通知指向未知服务仍成功、关闭后调用→`Closed`、配额满→`{1}`、超对端上限→`InvalidInput` 且连接存活（local 与 tcp 各一遍）、第二个监听者→`AlreadyExists`、连没人听的地址→`Io(NotFound)` / `Io(ConnectionRefused)`）。③ **顺带修三处「文档说得到、实现做不到」**：**发送侧超限**以前只由 framing 兜，writer 把「写失败」当连接级死亡——一次超发会顺手打死整条连接（`framing` 的注释却写着「连接仍然可用」）；现在在 `send_once` / `notify` 里就地对 `limits.1`（对端声明值）判 `InvalidInput`，一个字节都不写、连接不动，配 2 条用例 × 2 个 harness。**Unix `local` 的「活着的监听者」**返回的是 `InvalidInput`，与 `transport/local/mod.rs` 契约 2 要求的 `AlreadyExists` 不符（Windows 后端是对的），改为 `AlreadyExists`。**收到对端 `GoAway` 的被动一侧**排空之后只 `shutdown.cancel()`、从不置 `Closed`——两个 task 是退了，但 `phase` 停在 READY，`wait_closed()` 永远挂着、`Server::serve` 永远收不回这条连接（没有半关闭的后端上连 EOF 都不会来，只能一直挂着）；改为排空后走**与 `close()` 同一条**收尾路径（回自己的 `GoAway` → 停 task → 置 `Closed`），配 2 条用例 × 2 个 harness（其中一条用假对端「只发 `GoAway`、始终不断连」，去掉修复必红）。④ 全量 **158 条**（macOS；Windows 真机 160 条）全绿。
+> 上一版（v0.35）（**`local` 补上 Windows 后端，并按编译目标自动分派**）：`transport/local.rs` 拆成 `local/{mod,unix,windows}.rs`，`mod` 只留两个后端的共同契约（7 条：同名同监听者 / 活监听不可抢占 / 非法地址 `InvalidInput` / `connect_timeout` 必 `TimedOut` / 整连接关闭对端见 `UnexpectedEof` / 并发上限是平台常量 / 只有同一用户可连），具体实现在 `unix` 与 `windows` 里，`pub use` 出同名 `LocalTransport` / `LocalSource` / `LocalSink`，上层一行不改。**Windows 侧不引 `interprocess`**：能力都在已有的 `tokio::net::windows::named_pipe`（`net` feature）里，手搓的只有三件事——实例轮换的 listener（`accept` 里 `connect` 成功后立刻补新实例）、`ERROR_PIPE_BUSY` 的退让重试、`NamedPipeServer`/`NamedPipeClient` 合成 `PipeStream` 再 `io::split`。`LocalAddr` 在 Windows 上是**名字种子**（`\\.\pipe\spile-<可读前缀>-<16 位 hex FNV-1a>`，已是 `\\.\pipe\...` 的原样用）。**`local` 进默认集**：本地 IPC 是基本能力，不该因为平台不同变成可选项。契约收窄到两平台交集，「只 drop 写半是否产生关闭信号」「崩溃残留能否清理」明确划为后端私有。新增 7 条 Windows 用例（roundtrip + 整连接关闭见 EOF、只 drop 写半不产生 EOF、第二个监听被拒、无监听者 `NotFound`、实例轮换、名字映射、完整 pipe 名原样透传），`PEER_SEES_EOF` 在 `tests/transport.rs` 改为 `cfg!(unix)`；顺带修 `tests/tracing_spans.rs` 一处**跨用例污染**（同一全局 capture 里混着另一个用例的 span，`--test-threads=1` 下必红）。**两个平台都真机跑过**：macOS 150 条全绿（Windows 专用用例在 macOS 上不编译）；Windows 11 真机（rustc 1.93.1 / `x86_64-pc-windows-msvc`）152 条全绿（`lib` 42 = 40 + 7 Windows 用例 − 5 Unix UDS 用例，其余各组与 macOS 同数），另跑 `calc_local` 两进程 —— `local://spile-calc` 上 `add(2, 3) = 5`、`div(1, 0) -> Err(Rejected(DivideByZero))`。真机跑出**唯一一处偏差**：可读前缀会把种子里的 `.` 滤掉（`alpha.sock` → `alphasock`），是断言写错、实现正确，已改为断言现状并把过滤规则写进 `detail/01` 6.2。fmt/clippy 两头干净，`--target x86_64-pc-windows-msvc` 交叉 `check`/`clippy` 亦干净。
 >
-> 上一版（v0.34）（**M4 第一刀：把每请求两层 `tokio::spawn` 合成一层，`CatchUnwind` 替掉外层 task**）：`Session::dispatch` 不再「外层 task await 里层句柄」，改为单个 task 内 `CatchUnwind::new(handler_body).await`——自研 `CatchUnwind<F>`（`poll` 里 `catch_unwind(AssertUnwindSafe(..))`，`Output = Result<F::Output, String>`，不到 40 行、零依赖），panic 就在 `poll` 里被接住，回包路径（框架码 `0` + `handler panicked: …`）与 token 清理一个字没变。**A/B**（同机 release / payload 64 B / 5000 次 / 单会话）：`memory` 顺序 p50 **5.38 → 4.46–4.88 µs**（mean 5.60 → 4.82–4.99），即省下的正是那一次 spawn 的 1–2 次唤醒；并发 64 落在噪声内（≈296k–307k vs ≈299k–351k），不作为收益证据。新增 `panic_returns_inbound_quota`（上限 1 时 panic 一次之后正常调用仍须成功）钉住「panic 也要归还入站配额」；全量 150 条全绿，fmt/clippy 干净。
+> 更早（v0.34）（**M4 第一刀：把每请求两层 `tokio::spawn` 合成一层，`CatchUnwind` 替掉外层 task**）：`Session::dispatch` 不再「外层 task await 里层句柄」，改为单个 task 内 `CatchUnwind::new(handler_body).await`——自研 `CatchUnwind<F>`（`poll` 里 `catch_unwind(AssertUnwindSafe(..))`，`Output = Result<F::Output, String>`，不到 40 行、零依赖），panic 就在 `poll` 里被接住，回包路径（框架码 `0` + `handler panicked: …`）与 token 清理一个字没变。**A/B**（同机 release / payload 64 B / 5000 次 / 单会话）：`memory` 顺序 p50 **5.38 → 4.46–4.88 µs**（mean 5.60 → 4.82–4.99），即省下的正是那一次 spawn 的 1–2 次唤醒；并发 64 落在噪声内（≈296k–307k vs ≈299k–351k），不作为收益证据。新增 `panic_returns_inbound_quota`（上限 1 时 panic 一次之后正常调用仍须成功）钉住「panic 也要归还入站配额」；全量 150 条全绿，fmt/clippy 干净。
 >
 > 更早（v0.33.1）（**基准补两把拆账尺子，代码零改动（只动 example）**）：`bench` 多了第 5 个位置参数（期限毫秒，验「期限 0 是否真的不建 timer」）与两把尺子——「裸 mpsc echo」与「空 `spawn` + `join`」。实测把 `memory` 单跳 5 µs 拆成「6–8 次任务唤醒 × 0.5–2 µs」，而不是某一处昂贵：裸 mpsc 0.24 µs、空 spawn+join 0.24 µs。同时纠正 v0.33 的一条误判——「期限 0 不注册 timer」v0.20 已实现，A/B 只差 0.2 µs，不是杠杆。
 > 更早（v0.33）（**M4 起步：往返基准，不引基准框架**）：新增 `spile/examples/bench.rs`——`Instant` 采样 + 自算 p50/p90/p99，量「顺序单跳」与「并发吞吐」两件事，`memory` 与 `tcp` 各一行；特意把采样放在 worker 线程里、再在阻塞主线程上复测一遍，把 tokio 的 park/unpark（本机 ≈ +6 µs）与框架成本分开。首次基线：`memory` p50 5.3 µs / 单连接 ≈180k QPS / 并发 64 ≈315k QPS；`tcp` 回环 p50 22 µs / ≈41k / ≈128k。payload 从 0 B 到 8 KB 几乎不影响单跳 → 瓶颈在「两次唤醒 + 每请求一次 `spawn`」而非 codec，这也是 `rkyv` 排在 `shm` 之后的实测依据。代码与线格式零改动，不加任何（含 dev）依赖。
@@ -66,6 +67,7 @@
 
 | **v0.18** | **M2 收尾：服务端装配、客户端连接、示例与并发验收，线格式零改动**。① **`Server<T>`**：`bind(ep, transport_opts, session_opts)` → `register`（撞号 `Err` 不覆盖）→ `serve` / `serve_with`。注册表**按值**持有、`serve` 时才包 `Arc`：把「运行中改注册表」从类型上排除，比事后加锁便宜；`registry()` 交出 `&mut ServiceRegistry` 让宏生成的 `register_calc(server.registry(), svc)` 直接可用，`transport()` 交出 listener（端口写 `0` 的测试靠它拿真地址）。accept 循环里连接级错误（`ConnectionAborted` / `ConnectionReset` / `Interrupted` / `WouldBlock`）记一行继续，listener 级错误才返回 `Err`——`while let Ok(..)` 会把 listener 死亡静默吞掉。② **`Session::wait_closed()`**：`closed: Arc<Notify>` + 进 `Closed` 的唯一写点；`serve` 循环靠它知道「这条连接不用再持有」。**先建 waiter 再看状态**，反序会丢通知并留下永久等待。③ **客户端拆成两步**：`connect::<T>(ep, ConnectOptions)` 拿 `SessionHandle`，`CalcClient::new(handle)` 包一层。原因是 `CalcClient` 只泛型化到半身 `CalcClient<S, K>`——`Memory::pair` 不实现 `Transport`，若 stub 绑在 `Transport` 上，`local_calc` 根本用不了同一份 stub；`connect` 本身还要等握手到 `Ready`（`codec_id`/版本不符在 connect 上就报错，而不是第一次业务调用超时）。④ **示例**：`examples/calc_service/mod.rs`（共用 `Calc` 服务，两个 example `#[path]` 各引一次）、`local_calc`（memory pair，四条输出与 10.5 逐字一致）、`calc_server`/`calc_client`（TCP，客户端 50 ms 间隔重试、2 s 预算）。⑤ **`tests/concurrency.rs`**：32 并发 + 100 乱序，同一套断言在 `memory` 与 `tcp` 上各跑一遍，比对「每个请求拿到的是不是自己的值」，整体套 10 s 超时（卡住必须变失败）。变异验证：把 dispatch 的已注册分支改成不可达 → 两条用例同时红。⑥ 全量 39 + 1 + 2 + 9 + 8 + 16 + 21 + 3 全绿。**同步改动**：`detail/03`（`wait_closed` / `set_closed` 的写法与原因）、`detail/04`（§4 stub 改为半身泛型、§10 三小节按实现重写）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
 | **v0.19** | **M3 第一步：三档声明形态与调度分流，线格式零改动**。① **宏**：`async fn` / `fn` / `#[spile(blocking)] fn` 三档都接受，形态判定在展开期写死（`MethodKind::{Async, Sync, Blocking}`），`rewrite_sigs` 只改 `async fn`（同步 `fn` 本来就没有 future 可改写）；方法级 `#[spile(...)]` 展开后从 trait 上摘掉——留着 rustc 会去解析一个不存在的属性并报错。② **dispatch 三分支**：`async` 分支 await；`fn` 分支包进 async 块首 poll 就地跑完（不换线程）；`blocking` 分支 `spawn_blocking`，**decode 搬进闭包**（它也是 CPU 工作），`JoinError` 映射 `Internal`（线上按 `0` 兜底）。③ **`Service::schedule(method) -> Schedule`**：额度必须在「进 handler」之前扣，那时只有 `service_id + method`，还看不到实现内部分支——所以调度类别由生成代码交出来（默认 `Async`，只有 `blocking` 方法生成 `Blocking`；没有 blocking 方法时干脆不生成，用 trait 默认实现）。④ **入站配额拆两张**：`InboundQuota{async_used, blocking_used}` + `try_acquire(Slot)` 一次持锁完成「检查 + 计数」，`InboundGuard` 按 slot 归还；阻塞池满时异步请求照跑。⑤ **debug 慢 handler 告警**：超过 100 µs 打 `tracing::warn` 提示加 `#[spile(blocking)]`；顺手把 handler panic 也改成 `tracing::error!`（原来只回包不记日志，服务端看起来「什么都没发生」）。⑥ **验收**：`tests/service_macro.rs` 12 条（同步就地执行、blocking 走线程池、blocking panic 不挂住、`schedule` 逐方法正确）、`tests/session.rs` 18 条（新增「阻塞额度只有 1 个 → 一次成功两次过载、异步不受影响」，`memory`/`local` 各一遍）、`tests/compile-fail/` 换成 `blocking_on_async` / `unknown_method_attr`（`sync_method` 已合法，删除）。变异验证：把 `Schedule::Blocking` 也映射到 `Slot::Async` → 两条配额用例同时红。全量 39 + 1 + 2 + 9 + 12 + 18 + 21 + 3 全绿。**同步改动**：`detail/04`（§3 属性表标未实现、§4 产物补 `schedule`、§5 三分支与 `schedule`、§9 检查表与 trybuild 清单）、`detail/03`（§6.2 补 slot 选择与阻塞分支的 `JoinError`、§6.3 补慢 handler 告警）、`design.md` 5.1 / 5.3 片段、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
+| **v0.36** | **示例变成可判定验收，并修两处「文档承诺与实现不符」（线格式零改动）**。① `spile/examples/support/check.rs`：`Check::{expect,eq,finish}` + `fail`，失败打「期望 / 实际」并 `exit(1)`，成功打 `[名] n/n 全过`；各示例用 `#[path]` 引它，不新增 target（`examples/` 的子目录不是 target）。② 补齐示例：`local_calc` 17 条断言，新增**拦截器账本**（客户端链 37 / 服务端链 38，逐条数与总次数都用精确值——链漏了某条路径会立刻红）与**入站配额**（`max_async_in_flight=1`，第二条拿 `PeerRejected{code:1}`）；`calc_local` 客户端 4 条断言 + 服务端 `server --check`（手写 accept 循环 + 服务端拦截器记账，等对端 `GoAway` 收尾后比对条数并退出 0，把「跨进程优雅关闭」变成可判定项）；`calc-split` 的 `calc-client` 加 2 条断言；新增 `conformance` 12 条负路径，memory / local / tcp 各验一段。③ **发送侧超限**：`Session::send_once` 与 `notify` 在占 pending / 入队**之前**就对 `limits.1`（对端声明值）判 `InvalidInput`。此前只靠 framing 兜，而 writer 把任何写失败当连接级死——一次「发太大」会带走整条连接，与 `framing` 注释承诺的「连接仍然可用」相反。新增 `request_over_peer_limit_is_invalid_input` / `notification_over_peer_limit_is_invalid_input`（× 2 harness）。④ **Unix `local` 的「活监听」错误种类**：`InvalidInput` → `AlreadyExists`，与 `local/mod.rs` 契约 2、以及 Windows 侧（`ERROR_ACCESS_DENIED` 归一）一致；`refuses_live_listener` 一并改断言。⑤ **被动一侧收到 `GoAway` 后不置 `Closed`**：`spawn_finish_when_drained` 排空后只 `shutdown.cancel()`，两个 task 退了但 `phase` 停在 READY——`wait_closed()` 永远挂着、`Server::serve` 永远收不回连接（named pipe / shm 上连 EOF 都没有，等价于永久泄漏）；改为排空后 `me.close()`（回自己的 `GoAway` → 停 task → 置 `Closed`）。新增 `peer_goaway_closes_the_passive_side` 与 `peer_goaway_without_eof_closes_the_passive_side`（假对端只发 `GoAway`、始终不断连）各 × 2 harness；后者去掉修复必红（等不到回的 `GoAway`）。⑥ 全量 158 条（Windows 真机 160）全绿，`fmt` / `clippy` 干净；文档同步 `detail/00`（`INV-38` / `INV-39`）、`detail/04` §11、10.1/10.3/10.4/10.5 与 `examples/calc-split/README.md`。 |
 | **v0.35** | **`local` 补 Windows 后端，`local` 进默认集（线格式与会话零改动）**。① `transport/local.rs` 拆成 `local/{mod,unix,windows}.rs`：`mod` 只放两个后端的**共同契约**（7 条，见 6.2 与 `transport/local/mod.rs`），`unix` 是原 UDS 实现原样搬家，`windows` 是新增的 named pipe 后端，两边 `pub use` 出同名 `LocalTransport` / `LocalSource` / `LocalSink`。② **不引 `interprocess`**：需要的能力（Byte 模式默认、`first_pipe_instance`、`max_instances`、`reject_remote_clients`、`AsyncRead + AsyncWrite`、`connect().await`）都在已开启的 `net` feature 里；手搓的只有三件事——`accept` 里 `connect` 成功后**立刻补一个新实例**（否则后续客户端撞 `NotFound`）、`ERROR_PIPE_BUSY` 的 1 ms 退让重试、`NamedPipeServer`/`NamedPipeClient` 合成 `PipeStream` 后 `io::split`。③ `LocalAddr` 在 Windows 上是**名字种子**：`\\.\pipe\spile-<可读前缀>-<16 位 hex FNV-1a(路径字节)>`，已是 `\\.\pipe\...` 的原样使用；相对路径不解析。④ **契约收窄到两平台交集**：「只 drop 写半是否产生关闭信号」「崩溃残留能否清理」「名字长度上限」明确划为后端私有，`PEER_SEES_EOF` 在 `tests/transport.rs` 改为 `cfg!(unix)`。⑤ `default` 加 `local`；新增 7 条 Windows 用例；修 `tests/tracing_spans.rs` 一处跨用例的 span 污染（`--test-threads=1` 下必红）。⑥ 验收：macOS 150 条全绿；Windows 11 真机 152 条全绿 + `calc_local` 两进程实跑（`local://spile-calc`）；`--target x86_64-pc-windows-msvc` 的 `check`/`clippy` 亦干净。真机暴露的唯一偏差是可读前缀会滤掉种子里的 `.`（实现正确、断言写错，已改断言并补记规则）。 |
 | **v0.34** | **M4 第一刀：每请求两层 `tokio::spawn` 合成一层（自研 `CatchUnwind`，零新依赖）**。① `Session::dispatch` 不再「外层 task await 里层句柄」，改为单层 task 内 `CatchUnwind::new(handler_body).await`——`poll` 里 `catch_unwind(AssertUnwindSafe(..))`，`Output = Result<F::Output, String>`，`Pending` 透传、`Ready` 包 `Ok`、`Err` 交 `panic_message`；回包路径（框架码 `0` + `handler panicked: …`）与 token 清理一字未改。② A/B（同机 release / payload 64 B / 5000 次 / 单会话）：`memory` 顺序 p50 5.38 → 4.46–4.88 µs，省下的正是那一次 spawn 的 1–2 次唤醒；并发 64 落在噪声内，不作收益证据。③ 新增 `panic_returns_inbound_quota`（上限 1 时 panic 一次之后再调正常服务必须成功），钉住「panic 也要归还入站配额」。线格式零改动。 |
 | **v0.33.1** | **基准补拆账尺子（只改 example，四层实现零改动）**。① `bench` 第 5 个位置参数 = 期限毫秒，用来 A/B「有没有 timer」：250 ms vs 0 的 p50 为 5.38 vs 5.08 µs，差约 0.2 µs，并由此确认「期限 0 不注册 timer」v0.20 就已实现（`session.rs` 的 `if deadline_ms == 0` 分支）。② 新增两条基线：裸 mpsc echo 0.24 µs、空 `spawn`+`join` 0.24 µs。③ 结论：`memory` 单跳 5 µs 的成本来自 6–8 次任务唤醒的**次数**，不是某一件昂贵；并发 64 时每次有效成本 ≈3.1 µs。④ 优化候选改为「合并两层 spawn（自研 `CatchUnwind`）」，并明确不推荐「release 下不兜 panic」。 |
@@ -989,7 +991,8 @@ M5 加全局开关时**用户代码不用改**——属性已经存在，只是�
 
 - **收到 `GoAway` 的一侧怎么处理新到的 `Request`**：继续 dispatch，直到「双方都已宣告关闭」才拒（回框架码 7）。已经在 UDS / pipe 缓冲里的请求不可能「撤回」，既不能静默丢弃（调用方会吊死在超时上），也不能提前拒绝（会把合法请求打死）
 - **发起方的出站 pending 要不要等**：要等。清空的是「**本端发出的**、还没拿到 `Response` 的请求」，它们的响应来自对端的**出站**方向，而 `GoAway` 只让对端停止「新发起」，不禁止它回包。v0.7 写「本端 in-flight 清空」没说方向，容易实现成「等对端发来的请求处理完」，方向反了
-- **收到 `GoAway` 的一方怎么知道自己该退出了**：排空即退，**不等 EOF**。socket 上 EOF 只是加速路径，named pipe / shm 连 EOF 都没有；所以收到宣告后要起一个后台收尾任务（`spawn_finish_when_drained`）：等 `pending` 与 `handlers` 双零（`close_timeout` 兜底）→ `shutdown.cancel()`。没有这条，会话会一直挂着，直到用户自己再调 `close()`
+- **收到 `GoAway` 的一方怎么知道自己该退出了**：排空即退，**不等 EOF**。socket 上 EOF 只是加速路径，named pipe / shm 连 EOF 都没有；所以收到宣告后要起一个后台收尾任务（`spawn_finish_when_drained`）：等 `pending` 与 `handlers` 双零（`close_timeout` 兜底）→ 走与 `close()` 相同的收尾（回自己的 `GoAway`、停两个 task、置 `Closed`）。没有这条，会话会一直挂着，直到用户自己再调 `close()`。
+  **v0.36 补的是这条链的「终点」**：早先后台任务只做了 `shutdown.cancel()`——两个 task 确实退了，但 `phase` 停在 READY，`wait_closed()` 永远等不到，`Server::serve` 也就永远收不回这条连接。在没有半关闭的后端（named pipe / shm）上这不是「慢一点」，而是**永久泄漏**：EOF 永远不会来，而唯一能置 `Closed` 的 `close()` 正卡在 `wait_closed()` 上。现在被动一侧自己把收尾走完，`wait_closed()` 才有意义。
 - **谁关哪半边**：谁 `Draining` 完谁关自己的那一半。出站 `Draining` 结束时等队列排空 → writer 退出 → drop `sink`；本端 pending 与 handler 都清零后取消 reader → reader 退出 → drop `source`
 
 步骤（优雅关闭，`flags` bit2 = 0）：
@@ -1608,14 +1611,16 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 
 ### 10.1 示例清单
 
-| 示例 | 进程数 | transport | 阶段 | 验证什么 |
+| 示例 | 进程数 | transport | 断言条数 | 验证什么 |
 |---|---|---|---|---|
-| `echo` | 1 | `tcp` | M0 | 24 字节头编解码、长度前缀、消息边界正确 |
-| `local_calc` | 1 | `memory` | M2 | **最小集**全链路（stub → session → dispatch → codec → 返回），第 1/2/5 三形态；**一条命令可跑** |
-| `local_calc`（补齐形态） | 1 | `memory` | M3（v0.24 / v0.27 已落地） | 七种形态全跑（Notification / 超时 / GoAway / 同步 handler）+ 同步客户端（第二条会话，服务端在自己的线程上） |
-| `calc_local` | 2 | `local` | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收） |
-| `bench` | 1 | `memory` + `tcp` | M4（v0.33 已落地） | 往返延迟 / 吞吐基线；**尺子**，不验语义 |
-| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | 2 | `tcp` | M3（v0.29 新增） | **真实发布形态**：契约 / 服务端 / 客户端三个 crate，客户端依赖树里没有服务端（见 10.7）；**TCP 跨进程这一形态自 v0.30 起只由它承担** |
+| `echo` | 1 | `tcp` | 2 | 24 字节头编解码、长度前缀、消息边界正确（**唯一绕过 `Session` 的 L1/L2 证据**） |
+| `local_calc` | 1 | `memory` | **17**（v0.36） | 四种调用形态 + 三档声明形态 + **拦截器逐方法账本** + **入站配额** + 优雅关闭；一条命令跑完 |
+| `calc_local` | 2 | `local` | 客户端 **4** + 服务端账本（v0.36） | 换 transport 不改业务代码；两端都自检，`--check` 顺带把「跨进程优雅关闭」变成可判定项（Unix socket / Windows pipe 同一条命令） |
+| `conformance` | 1 | `memory` + `local` + `tcp` | **12**（v0.36 新增） | **负路径**：未注册服务 / 未知方法 / 通知指向未知服务 / 关闭后调用 / 配额满 / 超对端上限（连接存活）/ 第二个监听者 / 连没人听的地址 |
+| `bench` | 1 | `memory` + `tcp` | 2 | 往返延迟 / 吞吐基线；**尺子**，不验语义 |
+| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | 2 | `tcp` | 客户端 **2**（v0.36） | **真实发布形态**：契约 / 服务端 / 客户端三个 crate，客户端依赖树里没有服务端（见 10.7）；**TCP 跨进程这一形态自 v0.30 起只由它承担** |
+
+> **v0.36 起，每一行都是「可判定」的**：示例自己断言，全过时最后一行打 `[<名>] n/n 全过`，任何一条不符就打 `FAIL`（带期望/实际）并以 `1` 退出。`本地 IPC` 与 `三 crate` 这两个两进程形态，以前只有「人眼看三行输出」，现在连「服务端真的进了 handler 几次」「连接是被对端优雅关掉而不是被进程退出带走的」都能判。
 
 ### 10.2 为什么必须有一个「单进程示例」
 
@@ -1638,6 +1643,12 @@ v0.2 及以前只在里程碑里提过「echo 测试」「CalcService 两进程�
 5. 一次并发调用（M2，同时发 32 个，确认响应不串包）
 6. 一次优雅关闭（M3，`GoAway` 优雅模式，确认 in-flight 正常完成后再退出）
 7. 一次**同步 handler**调用（M3，`fn` 声明，验证不 `await` 也能正常分发，见 5.2）
+
+v0.36 补的三项（它们不验「能不能通」，验的是「框架拒绝一件事时的具体形态」，全部落在 `conformance` 与 `local_calc` 里）：
+
+8. **拦截器账本**（`local_calc`）：客户端链与服务端链各挂一个逐方法计数的拦截器，末尾比对**精确条数**（客户端 37 / 服务端 38——通知不回包，但服务端 handler 照跑，所以服务端多一条）。链上漏掉任何一条路径（通知、业务拒绝、超时取消）都会立刻红。
+9. **入站配额**（`local_calc`）：`max_async_in_flight = 1` 时，在飞一条再发一条 → 第二条拿 `PeerRejected{code=1}`，在飞那条仍正常完成。
+10. **负路径**（`conformance`）：未注册服务→`{2}`、未知方法→`{3}`、通知指向未知服务仍「发出即成功」、`close()` 之后再调→`Closed`、超对端上限→`InvalidInput` 且**连接存活**（local 与 tcp 各一遍）、同一地址第二个监听者→`AlreadyExists`、连没人听的地址→`Io(NotFound)` / `Io(ConnectionRefused)`。
 
 这样"示例能跑"就等价于"主要路径没坏"，不必再单独维护一套脆弱的集成测试。但**每阶段的预期输出要分开写**，否则 M2 的验收会永远红着。
 
@@ -1669,6 +1680,19 @@ cargo run --example calc_local -- client /tmp/spile-calc.sock
 
 两个平台的区别只在**传给示例的那个字符串**：Unix 是真实 socket 文件路径；Windows 上它只是 pipe 名的种子（`\\.\pipe\...` 可直接给），两端必须给同一个串——Windows 上把 `/tmp/spile-calc.sock` 换成 `spile-calc` 这类短串即可（见 2.6）。
 
+两进程（带机器判定；`--check` 让服务端只服务一条连接、验完账本就退出）：
+
+```
+cargo run --example calc_local -- server --check
+cargo run --example calc_local -- client
+```
+
+负路径全览（单进程，一条命令 12 条断言，退出码即结论）：
+
+```
+cargo run --example conformance
+```
+
 裸字节往返（M0）：
 
 ```
@@ -1683,39 +1707,90 @@ cargo run --example echo
 
 ### 10.5 预期输出与验收门槛
 
-`local_calc` 的预期输出分两批——**M2 阶段只有前四条，M3 才补齐其余**。把两批写在一起，M2 的验收会永远红着（v0.7 修正）。
+**验收口径（v0.36 起）：看退出码，不看人眼。** 每个示例自己断言，成功时最后一行是 `[<名>] n/n 全过`，
+失败时打印 `[<名>] FAIL …（期望 / 实际）` 并以 `1` 退出。所以门槛只有两句：
 
-M2（最小集）：
+1. 进程退出码 `0`；
+2. 最后一行形如 `[local_calc] 17/17 全过`（条数与示例清单一致）。
 
-```
+**不再有「逐字比对输出」这一条**——那是 v0.35 及以前的做法，代价是文案一改文档就得跟着改，
+而且它只挡「格式变了」，挡不住「值错了」。现在值错由断言挡，文案只是给人看的。
+
+`local_calc`（单进程 `memory`，17 条）：
+
+```text
 [server] listening on memory (in-process pair, no endpoint)
-[client] add(2, 3) = 5
-[client] div(1, 0) -> Err(Rejected(DivideByZero))
-[client] 32 concurrent calls -> all matched, mismatched = 0
-```
-
-M3（补齐全量形态，M2 那四条仍然要在）：
-
-```
-[client] notify ping (no reply)
-[client] slow_op -> Err(Timeout after 50ms)
-[client] fast_hash(data) = 0x8b195a8adb8d1842   (sync handler, 未 await)
-[blocking] add(20, 22) = 42   (no runtime, no await)
-[blocking] slow_op -> Err(Timeout after 30ms, local)
+[local_calc] ---- 四种调用形态 ----
+[local_calc] ok   add(2, 3) = 5（不可失败方法）
+[local_calc] ok   div(1, 0) → 业务拒绝 DivideByZero
+[local_calc] ok   32 并发 add：回包不串号
+[local_calc] ok   notify ping 发出即成功（没有回包可等）
+[local_calc] ---- 三档声明形态：async / 同步 fn / blocking ----
+[local_calc] ok   slow_op(200) 在 50 ms 处被本端放弃
+[local_calc] ok   fast_hash 与本地同算法一致（同步 handler 就地跑完）
+[local_calc] ok   blocking add(20, 22) = 42（无 runtime、无 await）
+[local_calc] ok   blocking slow_op 在 30 ms 处放弃（本端判）
+[local_calc] ---- 入站配额：max_async_in_flight = 1 ----
+[local_calc] ok   第二条调用被配额挡下（对端回 code=1 overloaded）
+[local_calc] ok   在飞的第一条照常完成
+[local_calc] ---- 拦截器：逐方法账本 ----
+[local_calc] ok   客户端链总次数
+[local_calc] ok   服务端链总次数（多一条通知）
+[local_calc] ok   客户端链 slow_op 次数
+[local_calc] ok   服务端链 slow_op 次数
+[local_calc] ---- 优雅关闭：在飞请求清空后才收尾 ----
+[local_calc] ok   宣告关闭时在飞的请求仍然拿到了回包
 [server] shutdown (in-flight drained)
+[local_calc] ok   客户端链最终总次数
+[local_calc] ok   服务端链最终总次数
+[local_calc] 17/17 全过
 ```
 
-`fast_hash` 那一行打的是 FNV-1a 的完整 16 位（`{:#018x}`），省略号在文档里可以留白、在输出里不行——验收要能逐字比对。
+> `fast_hash` 那条以前是「打印一个十六进制值、文档里写死」；现在客户端用**同一套 FNV-1a 本地再算一遍**
+> 与回包比对——验的是「payload 穿过线路没被改」，顺便把文档里那串魔数删了。
 
-> `div(1, 0)` 那行的文案在 v0.31 变了一次：`Err(Remote(code=0x10001, "divide by zero"))` → `Err(Rejected(DivideByZero))`。**这不是美化，是业务错误不再有号码**——框架不再替业务错误分配码段，`Rejected` 里的东西就是契约自己的 `CalcError`。
+`conformance`（单进程，`memory` → `local` → `tcp`，12 条）：
 
-两个两进程示例同理，只把第一行换成 `listening on tcp://127.0.0.1:7001`（`calc-split`）或 `local:///tmp/spile-calc.sock`（`calc_local`）；客户端只有三行——`connected to …` / `[client] add(2, 3) = 5` / `[client] div(1, 0) -> Err(Rejected(DivideByZero))`。它们不跑 `local_calc` 那份七形态全量：跨进程验的是「协议与 transport 通了」，不是把 API 面再走一遍。
+```text
+[conformance] ---- memory：服务 / 方法不存在、通知、关闭之后 ----
+[conformance] ok   未注册的 service_id → PeerRejected{code=2}
+[conformance] ok   未知 method → PeerRejected{code=3}
+[conformance] ok   通知指向未注册服务：发出即成功（没有回包通道）
+[conformance] ok   close() 之后再发请求 → Closed
+[conformance] ok   配额满 → PeerRejected{code=1 overloaded}
+[conformance] ---- local：对端上限、监听者独占、无人监听 ----
+[conformance] ok   发 8 KiB 给 4 KiB 的对端 → InvalidInput（message exceeds peer max_message_len: 8218 > 4096）
+[conformance] ok   超限之后同一条连接仍然可用 → add(1, 1) = 2
+[conformance] ok   同一地址的第二个监听者 → AlreadyExists
+[conformance] ok   连到没人监听的地址 → Io(NotFound)
+[conformance] ---- tcp：对端上限、端口无人监听 ----
+[conformance] ok   tcp：发 8 KiB 给 4 KiB 的对端 → InvalidInput
+[conformance] ok   tcp：超限之后连接仍可用
+[conformance] ok   tcp：连到没人监听的端口 → Io(ConnectionRefused)
+[conformance] 12/12 全过
+```
 
-> **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** v0.7 的输出暗示 `memory` 有一个「按名字注册服务」的注册表，而 2.x 从头到尾只定义了「进程内直接配对的两半」，没有名字解析。诚实的形态是 `Memory::pair()` 返回 `(Source, Sink)` 两半，示例内部把它们分别交给 server 与 client——**单进程示例不需要地址，也不需要注册表**。`Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
+两进程（`local`）：客户端最后一行 `[calc_local] 4/4 全过`，服务端（`--check`）在收到对端 `GoAway` 之后打
 
-`[blocking]` 那两行来自第二条会话：服务端跑在一条 std 线程上，客户端是 `<Svc>BlockingClient`。它们**是默认验收门槛的一部分**——同步客户端不需要任何 feature，`cargo run --example local_calc` 一条命令就能看到（见 5.5）。
+```text
+[server] 连接已关闭
+[server] 账本：add=1 div=1 slow_op=1 fast_hash=1（共 4 次）
+[server] check ok：4 次调用，连接已被对端优雅关闭
+```
 
-**验收门槛**：对应阶段该出现的条目全部出现、**且字段值正确**，进程退出码为 0。注意「出现」不等于「正确」——所以 13.3 要求把结果输出成结构化行，CI 断言字段而不是 grep 文本。任何一条缺失或值不对，都视为该里程碑未完成——不允许用"手工验证过"代替。
+并退出 `0`。**服务端那条 `[server] 连接已关闭` 是跨进程 `GoAway` 的直接证据**：它不是「客户端进程被杀」，
+而是「对端宣告 → 入站清空 → 两个 task 收尾」这条链走完了。没有 `--check` 时服务端照旧一直 serve（
+业务演示不需要收尾）。
+
+两进程（`tcp`，三 crate）：`[client] ok add(2, 3) = 5` / `[client] ok div(1, 0) → 业务拒绝 DivideByZero` /
+`[client] 2/2 全过`，退出码 `0`。
+
+> **`div(1, 0)` 那行的文案在 v0.31 变了一次**：`Err(Remote(code=0x10001, "divide by zero"))` → `Err(Rejected(DivideByZero))`。
+> **这不是美化，是业务错误不再有号码**——框架不再替业务错误分配码段，`Rejected` 里的东西就是契约自己的 `CalcError`。
+
+> **`local_calc` 不打印任何 `memory://…` 地址（v0.8 修）。** `memory` 是「进程内直接配对的两半」，
+> 没有名字解析；示例内部把两半分别交给 server 与 client。**单进程示例不需要地址，也不需要注册表**。
+> `Endpoint::Memory` 只做日志标识与 `Debug` 输出，不参与查找。
 
 ### 10.6 示例的长期角色
 

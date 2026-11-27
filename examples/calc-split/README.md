@@ -15,8 +15,11 @@ calc-split/
 ```text
 cd examples/calc-split
 cargo run -p calc-server            # 默认 127.0.0.1:7001
-cargo run -p calc-client
+cargo run -p calc-client            # 末尾 `[client] 2/2 全过`
 ```
+
+`calc-client` **自带断言**（v0.36）：`add(2,3)=5` 与 `div(1,0)→Rejected(DivideByZero)` 两条，
+不符就打 `FAIL …（期望 / 实际）` 并以 `1` 退出。所以这条示例的判据是**退出码**，不是人眼看三行输出。
 
 ## 为什么这么拆
 

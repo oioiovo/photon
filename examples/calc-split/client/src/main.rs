@@ -8,9 +8,9 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use calc_api::{CalcClient, describe};
+use calc_api::{CalcClient, CalcError, describe};
 use spile::{
-    ConnectOptions, Endpoint, connect,
+    CallError, ConnectOptions, Endpoint, connect,
     transport::tcp::{TcpSink, TcpSource, TcpTransport},
 };
 
@@ -28,15 +28,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = connect_with_retry(addr).await?;
     println!("[client] connected to {addr}");
 
+    // 这个 crate 的定位是「客户端只依赖契约」的可执行证据，所以结论也要机器可判：
+    // 逐条断言，有失败就退出码 1（与 `spile/examples/support/check.rs` 同一口径，
+    // 但这里刻意不引 `spile/examples` 下的文件——那是另一个 package 的东西）。
+    let mut failures = 0usize;
+
     let sum = client.add(2, 3).await?;
-    println!("[client] add(2, 3) = {sum}");
+    if sum == 5 {
+        println!("[client] ok   add(2, 3) = 5");
+    } else {
+        failures += 1;
+        println!("[client] FAIL add(2, 3) —— 实际 {sum}，期望 5");
+    }
 
     match client.div(1, 0).await {
-        Ok(value) => println!("[client] div(1, 0) = {value}"),
-        Err(err) => println!("[client] div(1, 0) -> {}", describe(&err)),
+        Err(CallError::Rejected(CalcError::DivideByZero)) => {
+            println!("[client] ok   div(1, 0) → 业务拒绝 DivideByZero");
+        }
+        Ok(value) => {
+            failures += 1;
+            println!("[client] FAIL div(1, 0) —— 居然成功：{value}");
+        }
+        Err(err) => {
+            failures += 1;
+            println!("[client] FAIL div(1, 0) —— 实际 {}", describe(&err));
+        }
     }
 
     client.handle().close().await?;
+
+    if failures > 0 {
+        println!("[client] {failures} 条失败");
+        std::process::exit(1);
+    }
+    println!("[client] 2/2 全过");
     Ok(())
 }
 

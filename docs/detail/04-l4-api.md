@@ -574,21 +574,22 @@ impl<S, K> SessionHandle<S, K> {
 
 ## 11. 示例与验收
 
-| 示例 | 形态 | 阶段 | 关键点 |
+| 示例 | 形态 | 断言 | 关键点 |
 |---|---|---|---|
-| `local_calc` | `memory`，单进程 | M2 | 最小集全链路：stub → session → dispatch → codec → 返回；一条命令可跑 |
-| `local_calc`（补齐） | `memory` | M3 | 七种形态：`async fn` / `fn` / blocking / `Notification` / 超时 / `GoAway` / 错误体；v0.27 起多两行同步客户端（第二条会话，服务端在独立线程上） |
-| `calc_local` | `local`，两进程 | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收）；同一二进制 `server` / `client` 两角色 |
-| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | `tcp`，两进程，**三个 crate** | M3（v0.29 新增） | 真实发布形态：契约 / 服务端 / 客户端各自独立编译；客户端依赖树里没有服务端（判据见 `design.md` 10.7） |
+| `local_calc` | `memory`，单进程 | 17（v0.36） | 最小集全链路：stub → session → dispatch → codec → 返回；七种形态 + **拦截器账本** + **入站配额** + 优雅关闭 |
+| `calc_local` | `local`，两进程 | 客户端 4 + 服务端账本（v0.36） | 换 transport 不改业务代码（架构验收）；同一二进制 `server --check` / `client` 两角色；`--check` 把跨进程 `GoAway` 收尾变成可判定项 |
+| `conformance` | `memory` + `local` + `tcp`，单进程 | 12（v0.36 新增） | 负路径：未注册服务 /{2}、未知方法 /{3}、通知无回包、关闭后 `Closed`、配额 `{1}`、超对端上限 `InvalidInput`（连接存活）、第二个监听者 `AlreadyExists`、连没人听 `Io(...)` |
+| `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | `tcp`，两进程，**三个 crate** | 客户端 2（v0.36） | 真实发布形态：契约 / 服务端 / 客户端各自独立编译；客户端依赖树里没有服务端（判据见 `design.md` 10.7） |
+
+**判据是退出码，不是文案（v0.36）**：每个示例由 `examples/support/check.rs` 提供 `Check`（`#[path]` 引入，不占 target），
+`expect` / `eq` 失败即打 `FAIL …（期望 / 实际）` 并累计，`finish()` 全过时打 `[<名>] n/n 全过`、否则 `exit(1)`。
+所以验收只需看「退出码 0 + 末尾 `n/n 全过`」；**`local_calc` 等示例的逐行文案不再是硬指标**（v0.35 及以前是），
+理由很直接：逐字比对挡的是「文案被改」，挡不住「值算错了」，而后者才是回归真正会出的问题。
+唯一还带「文案」的断言是错误分类与错误码（`PeerRejected{code}` 的那几位），因为那是对外契约。
 
 **示例的接口与实现必须分文件（v0.28.1）**：`calc_service/api.rs` 只放 `Calc` trait 与打印/构造错误的小工具，`calc_service/imp.rs` 放 `Calculator` 与业务逻辑。v0.30 删掉 `calc_server` / `calc_client` 后，`spile/examples/` 里剩下的 `calc_local` 与 `local_calc` 都同时扮演两端，两半都得引——所以这条规则在**本 package 内**已经没有反例可打，真正守住它的判据移到 `examples/calc-split/`（契约是独立 crate，客户端 crate 的依赖树里没有服务端）。
 
 判据不是「看着分开了」，而是客户端二进制里没有那个类型：在 `examples/calc-split` 下 `nm target/debug/calc-client | grep -c Calculator` = 0（服务端同一命令是 37）。v0.29 之前这条判据打在 `examples/calc_client` 上，v0.30 删掉它之后只剩跨 crate 这一处可验——恰好也是更强的形态（依赖树里连 `calc-server` 都没有，`cargo tree -p calc-client | grep calc-server` 为空）。这件事在 RPC 项目里不是洁癖——宏产物只有 `Service::call` 的 `match` 分支体依赖实现类型，把实现编进客户端等于**把业务逻辑分发出去**。
-
-`local_calc` 的两条预期输出是验收硬指标（不能随手改文案）：
-
-- `[server] listening on memory (in-process pair, no endpoint)`
-- `Err(Rejected(DivideByZero))`
 
 M2 的范围必须写清：**只支持 `async fn` 声明**，不含 `Notification` / 超时 / `GoAway` / 同步 handler。把七种形态全压给 M2 是 v0.6 的错误，按现文不可能通过。
 

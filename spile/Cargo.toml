@@ -46,3 +46,8 @@ required-features = ["memory", "codec-postcard"]
 [[example]]
 name = "calc_local"
 required-features = ["local", "codec-postcard"]
+
+# 负路径全览：memory / local / tcp 各验一段「拒绝时的具体形态」。
+[[example]]
+name = "conformance"
+required-features = ["memory", "local", "tcp", "codec-postcard"]

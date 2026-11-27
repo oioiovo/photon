@@ -40,7 +40,7 @@ use crate::{
         handshake::{CODEC_POSTCARD, Handshake},
         parse_with_limit,
     },
-    transport::{MessageSink, MessageSource},
+    transport::{MSG_EXCEEDS_PEER_LIMIT, MessageSink, MessageSource},
 };
 
 /// `request_id` 从 1 起，0 是保留值。
@@ -477,6 +477,22 @@ where
         }
 
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        // 先成型再比上限，且**必须在占 pending 之前**。
+        //
+        // 超限可以就地判定（对端在握手时已经声明过它的上限）。交给 writer 去发现的话，
+        // writer 只会把「写失败」当成连接级别的死，整条连接跟着收尾——而「这次发的
+        // 消息太大」只该是这一次调用的问题，连接本身还是好的。`framing` 的发送侧有
+        // 同一个判定，这里做的是「别让它走到那一步」。
+        let frame = request_frame(service_id, request_id, method, deadline_ms, payload);
+        let peer_limit = self.limits.1.load(Ordering::Acquire) as usize;
+        if frame.len() > peer_limit {
+            return Err(CallFailure::Failed(RpcError::InvalidInput(format!(
+                "{MSG_EXCEEDS_PEER_LIMIT}: {} > {peer_limit}",
+                frame.len()
+            ))));
+        }
+
         // 回填 `request_id` 到调用方的 span（`spile.call`）。字段在宏产物里先占位
         // 为 `Empty`，因为「分配的瞬间」只有这里知道；span 上没有这个字段时（比如
         // 用户直接调 `handle.call`）`record` 是空操作，不会报错。
@@ -506,7 +522,6 @@ where
             request_id,
         };
 
-        let frame = request_frame(service_id, request_id, method, deadline_ms, payload);
         if self.tx.send(frame).await.is_err() {
             // writer 已经不在了：把刚插进去的那条收回来，不让调用方白等。
             drop(self.take_pending(request_id));
@@ -542,10 +557,16 @@ where
         }
         // 协议要求 `request_id != 0`：通知也要能被日志和对端 handler 区分开。
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.tx
-            .send(notification_frame(service_id, request_id, method, payload))
-            .await
-            .map_err(|_| RpcError::Closed)
+        let frame = notification_frame(service_id, request_id, method, payload);
+        // 与 `send_once` 同一条理由：超限只该让这一次发送失败，不该拖死整条连接。
+        let peer_limit = self.limits.1.load(Ordering::Acquire) as usize;
+        if frame.len() > peer_limit {
+            return Err(RpcError::InvalidInput(format!(
+                "{MSG_EXCEEDS_PEER_LIMIT}: {} > {peer_limit}",
+                frame.len()
+            )));
+        }
+        self.tx.send(frame).await.map_err(|_| RpcError::Closed)
     }
 
     /// 优雅关闭：宣告 → 等在飞归零 → 停两个 task → 兜底。
@@ -645,7 +666,11 @@ where
             {
                 tracing::debug!("对端宣告关闭后仍未排空，按 close_timeout 收尾");
             }
-            me.shutdown.cancel();
+            // 排空之后必须走**与 `close()` 同一条**收尾路径：回自己的 `GoAway`、
+            // 停两个 task、置 `Closed`。只 `shutdown.cancel()` 的话，两个 task 确实
+            // 退了，但 `phase` 停在 READY——`wait_closed()` 永远等不到，`Server::serve`
+            // 也就永远收不回这条连接（被动一侧只能靠对端 EOF 撞运气收敛）。
+            let _ = me.close().await;
         });
     }
 
