@@ -22,7 +22,7 @@ pub use server::Server;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -923,102 +923,99 @@ where
         let method = header.method;
         let deadline_ms = header.deadline_ms;
 
-        // 外层 task 只负责一件事：里层 panic 时也要回一个错。
-        // 服务是被第三方代码调用的，panic 属于真实输入；没有这一层，那个请求
-        // 就只能等调用方的期限自己超时，而服务端看起来「什么都没发生」。
-        // 代价是每个请求多一次 spawn；将来若压测显示这层成本显著，再换成
-        // `catch_unwind`（要引入 futures，且 panic 语义得搬进 async 块里）。
+        // handler 本体跑在**一个** task 里，panic 由 `CatchUnwind` 在 `poll` 上兜住。
+        //
+        // v0.33 之前是两层：外层 task 只负责「内层 panic 时也要回一个错」，内层跑 handler。
+        // 每请求多一次唤醒（单跳 5 µs 里约 1–2 µs），而这件事同一层就能做完——panic 是
+        // `poll` 里能接住的东西，没必要为它多开一个 task。
+        // panic 之后要回包、要摘 token，所以这两样必须先克隆一份留在 task 外层；
+        // handler 正常路径用的是被 body 移走的原值。
         let outer_tx = tx.clone();
         let outer_cancels = Arc::clone(&cancels);
-        // span 只装在里层：外层那个 task 只做 panic 兜底，没有业务语义；
-        // 里层才是「这个请求」的全部生命周期。
-        let inner_span = span;
-        tokio::spawn(async move {
-            let inner = tokio::spawn(async move {
-                let deadline = async move {
-                    match deadline_ms {
-                        0 => std::future::pending::<()>().await,
-                        ms => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
-                    }
-                };
 
-                #[cfg(debug_assertions)]
-                let started_at = std::time::Instant::now();
-
-                let outcome = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => Err(HandlerError::Framework {
-                        code: 5,
-                        message: "cancelled by peer".into(),
-                    }),
-                    _ = shutdown.cancelled() => Err(RpcError::Closed.into()),
-                    _ = deadline => Err(RpcError::Timeout.into()),
-                    res = call_through_chain(
-                        &server_chain,
-                        &svc,
-                        ServerCall::new(service_id, method, method_name, request_id, deadline_ms, payload),
-                    ) => res,
-                };
-
-                #[cfg(debug_assertions)]
-                {
-                    let elapsed = started_at.elapsed();
-                    if elapsed > SLOW_HANDLER_WARN {
-                        tracing::warn!(
-                            service_id,
-                            method,
-                            ?elapsed,
-                            "handler 超过 100µs 仍占用 runtime worker，考虑加 #[spile(blocking)]"
-                        );
-                    }
+        let body = async move {
+            let deadline = async move {
+                match deadline_ms {
+                    0 => std::future::pending::<()>().await,
+                    ms => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
                 }
+            };
 
-                if !want_reply {
-                    // 通知没有回包通道，失败只能记日志：静默吞掉等于让调用方
-                    // 以为「发到了」，而服务端什么都没发生。
-                    if let Err(e) = &outcome {
-                        tracing::warn!(service_id, method, request_id, error = ?e, "notification handler 失败");
-                    }
-                } else {
-                    let frame = match outcome {
-                        Ok(body) => {
-                            // 成功也写 `code = 0`：这样「有没有这个字段」不再有歧义，
-                             // 按 `code` 过滤时不会漏掉成功的请求。
-                            tracing::Span::current().record("code", 0u32);
-                            response_frame(request_id, body, 0)
-                        }
-                        Err(HandlerError::Business(tail)) => {
-                            // 业务拒绝没有码可记：`code` 只描述框架判定。日志里用
-                            // `BUSINESS_CODE_MARK` 标出来，方便按「有没有业务拒绝」筛。
-                            tracing::Span::current().record("code", BUSINESS_CODE_MARK);
-                            response_frame(request_id, tail, FLAG_ERR | FLAG_BUSINESS)
-                        }
-                        Err(HandlerError::Framework { code, message }) => {
-                            tracing::Span::current().record("code", u32::from(code));
-                            let body = error_body::encode(code, &message);
-                            response_frame(request_id, body, FLAG_ERR)
-                        }
-                    };
-                    let _ = tx.send(frame).await;
-                }
+            #[cfg(debug_assertions)]
+            let started_at = std::time::Instant::now();
 
-                cancels.lock().remove(&request_id);
-                // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
-                drop(guard);
-            }
-            .instrument(inner_span));
+            let outcome = tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(HandlerError::Framework {
+                    code: 5,
+                    message: "cancelled by peer".into(),
+                }),
+                _ = shutdown.cancelled() => Err(RpcError::Closed.into()),
+                _ = deadline => Err(RpcError::Timeout.into()),
+                res = call_through_chain(
+                    &server_chain,
+                    &svc,
+                    ServerCall::new(service_id, method, method_name, request_id, deadline_ms, payload),
+                ) => res,
+            };
 
-            if let Err(join) = inner.await
-                && join.is_panic()
+            #[cfg(debug_assertions)]
             {
-                let text = panic_text(join);
+                let elapsed = started_at.elapsed();
+                if elapsed > SLOW_HANDLER_WARN {
+                    tracing::warn!(
+                        service_id,
+                        method,
+                        ?elapsed,
+                        "handler 超过 100µs 仍占用 runtime worker，考虑加 #[spile(blocking)]"
+                    );
+                }
+            }
+
+            if !want_reply {
+                // 通知没有回包通道，失败只能记日志：静默吞掉等于让调用方
+                // 以为「发到了」，而服务端什么都没发生。
+                if let Err(e) = &outcome {
+                    tracing::warn!(service_id, method, request_id, error = ?e, "notification handler 失败");
+                }
+            } else {
+                let frame = match outcome {
+                    Ok(body) => {
+                        // 成功也写 `code = 0`：这样「有没有这个字段」不再有歧义，
+                        // 按 `code` 过滤时不会漏掉成功的请求。
+                        tracing::Span::current().record("code", 0u32);
+                        response_frame(request_id, body, 0)
+                    }
+                    Err(HandlerError::Business(tail)) => {
+                        // 业务拒绝没有码可记：`code` 只描述框架判定。日志里用
+                        // `BUSINESS_CODE_MARK` 标出来，方便按「有没有业务拒绝」筛。
+                        tracing::Span::current().record("code", BUSINESS_CODE_MARK);
+                        response_frame(request_id, tail, FLAG_ERR | FLAG_BUSINESS)
+                    }
+                    Err(HandlerError::Framework { code, message }) => {
+                        tracing::Span::current().record("code", u32::from(code));
+                        let body = error_body::encode(code, &message);
+                        response_frame(request_id, body, FLAG_ERR)
+                    }
+                };
+                let _ = tx.send(frame).await;
+            }
+
+            cancels.lock().remove(&request_id);
+            // guard 最后 drop：先回包再减计数，关闭流程等的就是「已回包」。
+            drop(guard);
+        }
+        .instrument(span);
+
+        tokio::spawn(async move {
+            if let Err(text) = CatchUnwind::new(body).await {
                 // 只回包不记日志，就变成「客户端收到 code 0，服务端日志一片安静」，
                 // 排障时根本看不出是 handler 崩了。
                 tracing::error!(service_id, method, request_id, %text, "handler panic");
                 // guard 已在 unwind 里 drop，这里只剩「回包 + 摘 token」。
-                let body = error_body::encode(0, &text);
+                let payload = error_body::encode(0, &text);
                 let _ = outer_tx
-                    .send(response_frame(request_id, body, FLAG_ERR))
+                    .send(response_frame(request_id, payload, FLAG_ERR))
                     .await;
                 outer_cancels.lock().remove(&request_id);
             }
@@ -1202,14 +1199,52 @@ async fn writer_loop<K>(
 
 /// 从 `JoinError` 里掏出 panic 的文本：`panic!("boom")` 与 `panic!("{}", x)` 的
 /// payload 类型不同，两种都要认。
-fn panic_text(err: JoinError) -> String {
-    let payload = err.into_panic();
+/// 把 panic payload 变成一句给人看的话。两种 payload 形态（`&str` / `String`）都认，
+/// 其余（比如 `panic_any(42)`）只留一句通用文案——反正调用方拿到的框架码已经是 `0`。
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(text) = payload.downcast_ref::<&'static str>() {
         format!("handler panicked: {text}")
     } else if let Some(text) = payload.downcast_ref::<String>() {
         format!("handler panicked: {text}")
     } else {
         "handler panicked".into()
+    }
+}
+
+/// 把 panic 兜在 `poll` 上：零依赖，每次请求一次 `Box::pin`。
+///
+/// 为什么不引 `futures::FutureExt::catch_unwind`：默认集只剩一个余量的预算（0 节），
+/// 而这段逻辑不到三十行。它替掉的是原来「外层 task 只等内层 task、只为接住 `JoinError`」
+/// 的那一层——panic 本来就是 `poll` 里能接住的东西。
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> CatchUnwind<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, String>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // `AssertUnwindSafe` 在这里是成立的：一旦 catch 到 panic 就立刻返回 `Ready`，
+        // 不会再有第二次 `poll` 去观察那个「可能半截」的 future；而它的 Drop 由外层
+        // task 正常执行（guard、token 清理都还在原来的位置上）。
+        let me = self.get_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.inner.as_mut().poll(cx)))
+        {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Err(payload) => std::task::Poll::Ready(Err(panic_message(payload))),
+        }
     }
 }
 

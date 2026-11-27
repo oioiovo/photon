@@ -2,10 +2,12 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M3 已完成（v0.32），M4 性能待起步**。M3 的全部条目都在下方列了证据；M4 的第一件事是测，而不是改（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落十块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。⑩ `Interceptor` 链（v0.32：自研、不接 `tower`、零新依赖、空链零成本，11 条用例）。M3 清单自此全空。
+> 当前阶段：**M3 已完成（v0.32），M4 进行中（v0.33 起测，v0.34 已落第一刀：合 spawn）**。M3 的全部条目都在下方列了证据；M4 的第一件事是测，而不是改（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落十块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。⑩ `Interceptor` 链（v0.32：自研、不接 `tower`、零新依赖、空链零成本，11 条用例）。M3 清单自此全空。
 >
-> 版本：**v0.33.1**（**基准补两把拆账尺子，代码零改动（只动 example）**）：`bench` 多了第 5 个位置参数（期限毫秒，验「期限 0 是否真的不建 timer」）与两把尺子——「裸 mpsc echo」与「空 `spawn` + `join`」。实测把 `memory` 单跳 5 µs 拆成「6–8 次任务唤醒 × 0.5–2 µs」，而不是某一处昂贵：裸 mpsc 0.24 µs、空 spawn+join 0.24 µs。同时纠正 v0.33 的一条误判——「期限 0 不注册 timer」v0.20 已实现，A/B 只差 0.2 µs，不是杠杆。
-> 上一版（v0.33）（**M4 起步：往返基准，不引基准框架**）：新增 `spile/examples/bench.rs`——`Instant` 采样 + 自算 p50/p90/p99，量「顺序单跳」与「并发吞吐」两件事，`memory` 与 `tcp` 各一行；特意把采样放在 worker 线程里、再在阻塞主线程上复测一遍，把 tokio 的 park/unpark（本机 ≈ +6 µs）与框架成本分开。首次基线：`memory` p50 5.3 µs / 单连接 ≈180k QPS / 并发 64 ≈315k QPS；`tcp` 回环 p50 22 µs / ≈41k / ≈128k。payload 从 0 B 到 8 KB 几乎不影响单跳 → 瓶颈在「两次唤醒 + 每请求一次 `spawn`」而非 codec，这也是 `rkyv` 排在 `shm` 之后的实测依据。代码与线格式零改动，不加任何（含 dev）依赖。
+> 版本：**v0.34**（**M4 第一刀：把每请求两层 `tokio::spawn` 合成一层，`CatchUnwind` 替掉外层 task**）：`Session::dispatch` 不再「外层 task await 里层句柄」，改为单个 task 内 `CatchUnwind::new(handler_body).await`——自研 `CatchUnwind<F>`（`poll` 里 `catch_unwind(AssertUnwindSafe(..))`，`Output = Result<F::Output, String>`，不到 40 行、零依赖），panic 就在 `poll` 里被接住，回包路径（框架码 `0` + `handler panicked: …`）与 token 清理一个字没变。**A/B**（同机 release / payload 64 B / 5000 次 / 单会话）：`memory` 顺序 p50 **5.38 → 4.46–4.88 µs**（mean 5.60 → 4.82–4.99），即省下的正是那一次 spawn 的 1–2 次唤醒；并发 64 落在噪声内（≈296k–307k vs ≈299k–351k），不作为收益证据。新增 `panic_returns_inbound_quota`（上限 1 时 panic 一次之后正常调用仍须成功）钉住「panic 也要归还入站配额」；全量 150 条全绿，fmt/clippy 干净。
+>
+> 上一版（v0.33.1）（**基准补两把拆账尺子，代码零改动（只动 example）**）：`bench` 多了第 5 个位置参数（期限毫秒，验「期限 0 是否真的不建 timer」）与两把尺子——「裸 mpsc echo」与「空 `spawn` + `join`」。实测把 `memory` 单跳 5 µs 拆成「6–8 次任务唤醒 × 0.5–2 µs」，而不是某一处昂贵：裸 mpsc 0.24 µs、空 spawn+join 0.24 µs。同时纠正 v0.33 的一条误判——「期限 0 不注册 timer」v0.20 已实现，A/B 只差 0.2 µs，不是杠杆。
+> 更早（v0.33）（**M4 起步：往返基准，不引基准框架**）：新增 `spile/examples/bench.rs`——`Instant` 采样 + 自算 p50/p90/p99，量「顺序单跳」与「并发吞吐」两件事，`memory` 与 `tcp` 各一行；特意把采样放在 worker 线程里、再在阻塞主线程上复测一遍，把 tokio 的 park/unpark（本机 ≈ +6 µs）与框架成本分开。首次基线：`memory` p50 5.3 µs / 单连接 ≈180k QPS / 并发 64 ≈315k QPS；`tcp` 回环 p50 22 µs / ≈41k / ≈128k。payload 从 0 B 到 8 KB 几乎不影响单跳 → 瓶颈在「两次唤醒 + 每请求一次 `spawn`」而非 codec，这也是 `rkyv` 排在 `shm` 之后的实测依据。代码与线格式零改动，不加任何（含 dev）依赖。
 > 更早（v0.32.1）（**M3 收尾审计，代码零改动**）：把 v0.32 落地后遗留的文档口径补齐——`docs/design.md` 的阶段行从「M3 进行中」改成「M3 已完成」；`docs/PROTOCOL.md` 的版本指向升到 v0.32（并写明拦截器不进握手、不改字节，本文不需要改一个字）；`docs/detail/03-l3-session.md` 补上链的位置（§6.1 说明 `call_named` → `send_once` 的切分与「短路时 ①–⑧ 一步都不发生」，§6.2 补第 1 步之后 `call_through_chain` 的落点，§10 补两条验收）；`docs/detail/04-l4-api.md` §5.2 里还残留 `Result<i64, RpcError>` 的老样例，改回契约自定义的 `CalcError`。全量 148 条仍全绿。
 > 更早（v0.32）（**Interceptor 链落地：自研、零新依赖、线格式零改动**）：`spile::interceptor` 给出两条字节级链——`ClientInterceptor` / `ServerInterceptor`，配 `ClientCall` / `ServerCall`（只读上下文；路由字段不给 setter，只有 `with_deadline` / `with_payload` 两个派生口）与 `ClientNext` / `ServerNext`（洋葱顺序，`ClientNext: Clone` 支持重放）。注册走 `SessionOptions::client_interceptor` / `server_interceptor`；`Session::call` 拆成「进链」(`call_named`) + 「单次尝试」(`send_once`)，空链直接短路到 `send_once`，存量调用不多一次虚调用；`SessionHandle::call_named` 把方法名带进 ctx，宏 stub 与同步客户端改走它；服务端 `dispatch` 的 handler 臂改经 `call_through_chain`。不设 feature、不加依赖，`protocol_version` 仍是 **2**。
 > 更早（v0.31.1）（**更名，代码与线格式零改动**）：项目、仓库根目录与两个 crate 由 `photon` / `photon-macros` 更名为 `spile` / `spile-macros`；宏路径随之是 `#[spile::service]`、`#[spile(blocking)]`、`#[spile(zero_copy)]`，宏生成的工具模块从 `__photon_<snake>` 变成 `__spile_<snake>`，span 名从 `photon.call` / `photon.request` 变成 `spile.call` / `spile.request`；`protocol_version` 仍是 **2**，字节布局、校验清单与七条黄金样例一字未动。
@@ -1560,7 +1562,19 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 
 **已排除的候选**：「`deadline_ms = 0` 时不注册 timer」v0.20 就实现了（`session.rs` 的 `if deadline_ms == 0 { rx.await } else { timeout(..) }`）。A/B 实测：期限 250 ms 与 0 的 p50 是 5.38 vs 5.08 µs，**只差约 0.2 µs（4%）**——它不是杠杆。
 
-**下一步候选（按预期收益排序，尚未动手）**：① 把每请求的**两层 `spawn` 合成一层**：自研一个 `CatchUnwind` future 包装（`poll` 里 `catch_unwind(AssertUnwindSafe(..))`，约 40 行、零依赖），外层 task 就不必存在，panic 仍能回包；预期省 1–2 次唤醒。② 单连接场景下的线程亲和性（reader/writer 与调用方同 worker）：只对「一条连接一个客户端」的形态有效，价值取决于部署。③ 保留两层 spawn 但把外层换成「只在 `debug_assertions` 下开」，release 直接不兜 panic——**不推荐**：panic 回包是 M1 的验收项，不该随构建档位漂移。
+**第一刀（v0.34）：每请求两层 `spawn` 合成一层。** 原来的形状是「外层 task 只 await 里层句柄，为的是接住 `JoinError`」；现在只剩一层：handler 本体包进自研的 `CatchUnwind<F>`——`struct CatchUnwind<F> { inner: Pin<Box<F>> }`，`poll` 内 `catch_unwind(AssertUnwindSafe(|| me.inner.as_mut().poll(cx)))`，`Pending` 透传、`Ready` 包 `Ok`、`Err(payload)` 交给 `panic_message` 出 `handler panicked: …`。`AssertUnwindSafe` 的依据是「catch 到就立刻返回 `Ready`，不会有第二次 `poll` 去观察半截的 future」。panic 回包、`tracing::error!`、token 摘除全部沿用原逻辑，只是从「外层 task 拿到 `JoinError` 后做」变成「同一个 task 拿到 `Err(String)` 后做」。
+
+**A/B（同机、同一 release、payload 64 B、5000 次、单条会话）：**
+
+| 量 | 两层 spawn（v0.33.1） | 一层 + `CatchUnwind`（v0.34） |
+|---|---|---|
+| `memory` 顺序 p50（worker 内） | 5.38 µs | 4.46 / 4.88 µs |
+| 同上 mean | 5.60 µs | 4.82 / 4.99 µs |
+| 并发 64 QPS | ≈299k–351k | ≈296k–307k（噪声内） |
+
+读法：省下的就是那一次 spawn 带走的 1–2 次唤醒，**顺序单跳约 −10~14%**；并发下唤醒本来就被重叠掉，数字落在噪声里，不拿它当收益证据。语义侧没有让步，并新增 `panic_returns_inbound_quota`（`max_async_in_flight = 1` 时 panic 一次、再调正常服务仍须成功）——否则「配额泄漏一次就永久少一格」。
+
+**剩余候选（按预期收益排序）**：① 单连接场景下的线程亲和性（reader/writer 与调用方同 worker）：只对「一条连接一个客户端」的形态有效，价值取决于部署。② 把外层换成「只在 `debug_assertions` 下开」——**不推荐**：panic 回包是 M1 的验收项，不该随构建档位漂移（v0.34 之后这条已不需要：只有一层，本来就没得省）。
 
 ### M5 — 共享内存（附录 B）
 

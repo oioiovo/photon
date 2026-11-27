@@ -460,6 +460,42 @@ async fn handler_panic_returns_internal<H: Harness>() {
     server.close().await.expect("关闭");
 }
 
+/// panic 之后**入站额度必须归还**：配额上限 1 时，panic 一次、再调一个正常服务
+/// 仍然要成功。否则就是 guard 没在 unwind 里 drop——配额泄漏一次，这条连接永久少一格。
+async fn panic_returns_inbound_quota<H: Harness>() {
+    let mut reg = ServiceRegistry::empty();
+    reg.insert(7, Arc::new(Boom) as Arc<dyn Service>)
+        .expect("注册不应撞号");
+    reg.insert(8, Arc::new(Echo { slow: false }) as Arc<dyn Service>)
+        .expect("注册不应撞号");
+    let opts = SessionOptions {
+        max_async_in_flight: 1,
+        ..SessionOptions::default()
+    };
+    let (server, _sh, _client, ch) =
+        boot::<H>(Arc::new(reg), opts, SessionOptions::default()).await;
+
+    let err = ch
+        .call(7, 1, Bytes::from_static(b"x"), CALL_DEADLINE)
+        .await
+        .expect_err("panic 必须回包");
+    assert!(matches!(
+        err,
+        CallFailure::Failed(RpcError::PeerRejected { code: 0, .. })
+    ));
+
+    // guard 是在回包**之后**才 drop 的，客户端拿到回包到服务端 task 收尾之间有一个极短
+    // 窗口；等一小会儿再发第二枪，免得把调度延迟误判成配额泄漏。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let reply = ch
+        .call(8, 1, Bytes::from_static(b"hi"), CALL_DEADLINE)
+        .await
+        .expect("panic 之后配额应当已归还");
+    assert_eq!(reply, Bytes::from_static(b"hi"));
+
+    server.close().await.expect("关闭");
+}
+
 async fn close_makes_subsequent_calls_closed<H: Harness>() {
     let (server, _sh, _client, ch) = boot::<H>(
         registry_with(7, Arc::new(Echo { slow: false })),
@@ -1076,6 +1112,11 @@ macro_rules! suite {
             #[tokio::test]
             async fn handler_panic_returns_internal() {
                 super::handler_panic_returns_internal::<$H>().await
+            }
+
+            #[tokio::test]
+            async fn panic_returns_inbound_quota() {
+                super::panic_returns_inbound_quota::<$H>().await
             }
 
             #[tokio::test]

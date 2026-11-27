@@ -268,14 +268,14 @@ loop {
    **注册表里查到之后**，`ServerCall` 先过一遍服务端链：`call_through_chain(&server_chain, &svc, call)`——空链就是一次 `Service::call`，非空则从最外层 `ServerInterceptor` 往里走（v0.32）。链短路产生的 `HandlerError::Framework { code, .. }` 与 handler 自己产生的走同一套第 5 步三分布帧，所以「链把请求拒了」在线上与「handler 拒了」不可区分——这正是 `INV-32` 要的形状；
 2. 扣额度：`svc.schedule(method)` 给出 `Slot::Async | Slot::Blocking` → `inbound.try_acquire(slot, opts)`。**必须在 spawn 之前**：等 `call` 被 poll 才知道走哪个分支，那时额度已经扣过了。抢不到 → `send_error(id, 1, "overloaded" | "blocking pool overloaded")`，不登记 cancel token（v0.19）；
 3. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `Err(HandlerError::Framework { code: 3, message: "unknown method" })`（`Service::call` 的失败面就是 `HandlerError`，不必绕 `RpcError`）；
-4. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
+4. `tokio::spawn(CatchUnwind::new(handler_body))`——**只有一层 task**（v0.34）：handler 本体（`call_through_chain` + 结果成帧）整个被包进自研的 `CatchUnwind`，它的 `poll` 里用 `catch_unwind(AssertUnwindSafe(..))` 兜住 panic，`Output = Result<(), String>`，task 外层只判这个 `Result`。v0.33 及以前是「外层 task await 里层 `JoinHandle`」的两层结构，外层存在的唯一理由就是接住 `JoinError`——v0.34 把这件职责搬进 `poll`，于是每请求省掉一次 spawn 与 1–2 次唤醒；
 5. 结果映射：`svc.call` 交出 `Result<Bytes, HandlerError>`，**三分支各自成帧**（`02-l2-protocol.md` 7.1）：
    - `Ok(bytes)` → `Response`，flags = `0`；
    - `Err(HandlerError::Business(tail))` → `Response`，flags = `0x09`，payload 原样就是 `tail`；
    - `Err(HandlerError::Framework { code, message })` → `error_body::encode(code, &message)` + flags = `0x01`。`code` 只允许 `0..=7`：`RpcError` 若在 handler 内部被 `into` 成 `HandlerError`，由 `wire()` 决定码，`Io`/`Protocol`/`RuntimeDropped` 落 `0`（**不许静默丢帧**）；
-   - 外层 `Err(JoinError)`（panic）→ 框架码 `0` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
+   - 外层 `Err(text)`（panic）→ 框架码 `0` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认，其余 payload 只说 `handler panicked`）。panic 路径的 `guard` 已随 unwind drop（**配额照样归还**），随后才回包、再 `cancels.lock().remove(&request_id)`；
 6. `#[spile(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `HandlerError::Framework { code: 0, .. }`，L3 不必再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
-7. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性：v0.19 起 panic 走 `tracing::error!(service_id, method, request_id, %text)`，不再只有默认 panic hook 的 stderr 一行。
+7. **v0.34 起 async handler 不存在「句柄被 drop 就静默丢 panic」的形态**：panic 在 `poll` 里立刻变成 `Err(String)`，外层 task 一定看得到。`#[spile(blocking)]` 分支仍然如此——它靠宏在第 6 步里 await `spawn_blocking` 的句柄，句柄被 drop 就只剩默认 panic hook 的一行 stderr。本端可见性：v0.19 起 panic 走 `tracing::error!(service_id, method, request_id, %text)`，不再只有默认 panic hook 的 stderr 一行。
 
 > **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `error::wire()` 一张表，且它只服务「`RpcError` 被 `into` 成 `HandlerError`」这一条通道：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
 
