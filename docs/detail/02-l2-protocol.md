@@ -138,7 +138,7 @@ L2 只负责「头 + 裸 payload 的边界」。`codec.decode` 发生在 L3 spaw
 
 ### 5.3 golden 向量
 
-必须有一条：`"add"` → 一个固定的 u64 字面量。位置在 **`photon-macros` 的单元测试**（或纯文本常量），**不要混进 `photon/tests/protocol.rs` 的 §8 帧样例**——那里放的是线格式帧，而这是哈希常量，不是帧。
+必须有一条：`"add"` → 一个固定的 u64 字面量。位置在 **`spile-macros` 的单元测试**（或纯文本常量），**不要混进 `spile/tests/protocol.rs` 的 §8 帧样例**——那里放的是线格式帧，而这是哈希常量，不是帧。
 
 用途：一旦有人「优化」哈希实现（换 xxh3 版本、改 `Hasher::write` 的字节布局），测试立刻红。没有它，某次 `xxhash-rust` 升级就会静默改掉全部线上 method id，而且没有任何现象能提示你。
 
@@ -290,7 +290,7 @@ src/error.rs    RpcError / HandlerError / CallFailure / CallError<E>（全部 `#
 
 **两个 `parse` 入口**：帧长上限不是常量——它来自握手，且两个方向可以不同。`parse()` 用 `MAX_MESSAGE_LEN` 这个常量上限，供单测与 M0 的固定上限场景；`Session` 的 reader 用 `parse_with_limit(msg, 本端声明值)`。二者只是把上限当参数，校验逻辑同一份。
 
-**codec 不在 `proto/` 下（v0.17 修）**：v0.11 起模块表把 `codec.rs` 写在 `src/proto/` 里，而实现放在 `src/codec.rs`（对外路径 `photon::codec::Default` 也一直是顶层的）。两者只能留一个，现在按实现走：`codec` 是 L2 的**能力**，但它的模块位置与 `proto` 平级——`Codec` 不解析头、不看 kind，把它关进 `proto` 只会让「关掉 codec feature 就没有错误类型」那类荒唐依赖再出现一次。
+**codec 不在 `proto/` 下（v0.17 修）**：v0.11 起模块表把 `codec.rs` 写在 `src/proto/` 里，而实现放在 `src/codec.rs`（对外路径 `spile::codec::Default` 也一直是顶层的）。两者只能留一个，现在按实现走：`codec` 是 L2 的**能力**，但它的模块位置与 `proto` 平级——`Codec` 不解析头、不看 kind，把它关进 `proto` 只会让「关掉 codec feature 就没有错误类型」那类荒唐依赖再出现一次。
 
 **模块文件是 `proto.rs` 而不是 `proto/mod.rs`（2024 风格）**：入口文件与子目录同名并列，`proto.rs` 里用 `pub mod header;` 声明子模块。`codec.rs` 与 `codec/` 同理。
 
@@ -304,7 +304,7 @@ src/error.rs    RpcError / HandlerError / CallFailure / CallError<E>（全部 `#
 
 - `PROTOCOL.md` 是本项目**线格式唯一权威**；`design.md` 3.3.1 只是设计视角速查表，与它同源。任何字段改动先改 `PROTOCOL.md`，再同步速查表与逐字节样例。真正要照着写解析器时，看它第 2 节（头）、第 4 节（逐 kind 语义）、第 6 节（错误体）、第 7 节（控制帧）、第 9 节（校验清单）。
 - `PROTOCOL.md` 最小结构：头字段表（含偏移与宽度）、逐 kind 语义、flags、错误帧（框架/业务两条）、控制帧、每条 kind 一段 hex 样例与字段解读。
-- 七个样例（`Request`、`Response Ok`、`Response Err`、`Notification`、`Cancel`、`GoAway`、`Handshake`）全部**内联在 `photon/tests/protocol.rs`**，由 `assert_golden(name, header, payload, expected)` 逐个断言。**没有 `.bin` 文件、没有 `tests/fixtures/` 目录、不用 `include_bytes!`**（v0.12）：二进制在 diff 里不可见，而内联字面量逐行可审、可逐段注释字段与宽度，冻结效果等价。
+- 七个样例（`Request`、`Response Ok`、`Response Err`、`Notification`、`Cancel`、`GoAway`、`Handshake`）全部**内联在 `spile/tests/protocol.rs`**，由 `assert_golden(name, header, payload, expected)` 逐个断言。**没有 `.bin` 文件、没有 `tests/fixtures/` 目录、不用 `include_bytes!`**（v0.12）：二进制在 diff 里不可见，而内联字面量逐行可审、可逐段注释字段与宽度，冻结效果等价。
 - 生成顺序（写死）：**先用实现生成 → 人工对照 `PROTOCOL.md` 逐字节审 → 把审过的字节内联冻结 → 测试只做 decode/encode 比对，运行时绝不重新生成**。运行时重生成等于把当前实现的 bug 固化进样例。
 - 反例用例（同等重要，没有它们硬约束就没有测试）：`Cancel.service_id != 0`、`Notification.request_id == 0`、`Handshake.reserved != 0`、`flags` bit3 置位、`kind = 7`，每条都断言「必须报 `Protocol`」。
 

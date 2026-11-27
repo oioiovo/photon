@@ -201,7 +201,7 @@ loop {
 reader 只做「头解析 + 路由 + 登记 + spawn」。`codec.decode` 在 spawn 出来的 task 里做：
 
 - 大 payload 解码可能几十 µs，留在 reader 里会卡住整条通道的多路复用（`design.md` 8 节第 1 条）；
-- `#[photon(blocking)]` 方法在 `spawn_blocking` 的闭包里 decode + 执行，一次线程切换干两件事。
+- `#[spile(blocking)]` 方法在 `spawn_blocking` 的闭包里 decode + 执行，一次线程切换干两件事。
 
 ### 4.3 reader 出错的处理
 
@@ -271,7 +271,7 @@ loop {
    - `Err(HandlerError::Business(tail))` → `Response`，flags = `0x09`，payload 原样就是 `tail`；
    - `Err(HandlerError::Framework { code, message })` → `error_body::encode(code, &message)` + flags = `0x01`。`code` 只允许 `0..=7`：`RpcError` 若在 handler 内部被 `into` 成 `HandlerError`，由 `wire()` 决定码，`Io`/`Protocol`/`RuntimeDropped` 落 `0`（**不许静默丢帧**）；
    - 外层 `Err(JoinError)`（panic）→ 框架码 `0` + panic 文本（`panic!` 的 `&str` / `String` 两种 payload 都认）。
-6. `#[photon(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `HandlerError::Framework { code: 0, .. }`，L3 不必再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
+6. `#[spile(blocking)]` 分支的 `JoinError` 在 dispatch 内部就变成 `HandlerError::Framework { code: 0, .. }`，L3 不必再判一次「这是不是 panic」——`spawn_blocking` 由宏生成，L3 只看得到一个 `BoxFuture`。
 7. `Drop` 句柄才会静默丢失 panic——这是「客户端只等到超时、日志里什么都没有」的经典形态。所以句柄必须 await；本端可见性：v0.19 起 panic 走 `tracing::error!(service_id, method, request_id, %text)`，不再只有默认 panic hook 的 stderr 一行。
 
 > **不要再写「`Timeout → 6`、`Overloaded → 1`」这种散装映射（v0.10）**：它在本文、`02`、`04`、`design.md` M2 验收里演化出了四份互不相同的定义。现在只有 `error::wire()` 一张表，且它只服务「`RpcError` 被 `into` 成 `HandlerError`」这一条通道：`Timeout → 6` / `Overloaded → 1` 之所以成立，是因为这两条出现在**回包侧**；发起侧的 `Timeout` / `Overloaded` 永远不会被编码。方向规则见 `02-l2-protocol.md` 7.3。
@@ -285,8 +285,8 @@ loop {
 | 协议 `deadline_ms` | 客户端按「**发送时刻起还剩多少**」填剩余预算；服务端从**解析完 24B 头**开始计时，因此实际可用 = 头部值 + 传输延迟 | **尽力**（能停就停，停不下就跑完丢结果） |
 | `Cancel` 发送 | `PendingEntry::drop` 里 `try_send`：走到 drop 说明结果从未送达（超时 / 放弃 / 断连），告诉对端别算了。**用 `try_send` 不用 `send`**——为一条「别算了」卡在背压上比不发更糟；队列满时对端仍会按 deadline 自行收尾 | 尽力 |
 | `Cancel` 到达 | `async fn` handler：`select!` 到 `token.cancelled()` → 中止，回 `PeerRejected{5}` | 有效 |
-| `Cancel` 到达 | `fn` / `#[photon(blocking)]` handler：标记已取消，**继续跑完、结果丢弃、不回 `Response`** | 只丢结果 |
-| 慢 handler 告警 | debug 构建下从 `call` 开始 poll 到结束计时，超过 100 µs 打 `tracing::warn`，提示该方法应加 `#[photon(blocking)]` | 诊断，非语义 |
+| `Cancel` 到达 | `fn` / `#[spile(blocking)]` handler：标记已取消，**继续跑完、结果丢弃、不回 `Response`** | 只丢结果 |
+| 慢 handler 告警 | debug 构建下从 `call` 开始 poll 到结束计时，超过 100 µs 打 `tracing::warn`，提示该方法应加 `#[spile(blocking)]` | 诊断，非语义 |
 
 必须写进文档的三条：
 
@@ -415,12 +415,12 @@ struct ClosingState {
 
 | 项 | 内容 | 成本 |
 |---|---|---|
-| 请求 span | 服务端 `photon.request`：`service_id` + `method` + `method_name` + `request_id` + `code`（成功写 `0`，失败写错误体里的码）。在 `dispatch` 里**进 handler 之前**建好，`code` 回包时回填；只 `instrument` 里层 task（外层只是 panic 兜底）。`method_name` 来自 `Service::method_name`（宏用名字表覆盖，手写实现默认 `None` → `<unknown>`） | 零（全是常量；`instrument` 只多一层 poll 包装） |
-| 调用 span | 客户端 `photon.call`：字段与服务端**同名同值**；`method_name` 是宏的编译期常量，`request_id` 由 `Session::call` 分配后 `Span::current().record` 回填（字段不存在时是 no-op） | 零 |
+| 请求 span | 服务端 `spile.request`：`service_id` + `method` + `method_name` + `request_id` + `code`（成功写 `0`，失败写错误体里的码）。在 `dispatch` 里**进 handler 之前**建好，`code` 回包时回填；只 `instrument` 里层 task（外层只是 panic 兜底）。`method_name` 来自 `Service::method_name`（宏用名字表覆盖，手写实现默认 `None` → `<unknown>`） | 零（全是常量；`instrument` 只多一层 poll 包装） |
+| 调用 span | 客户端 `spile.call`：字段与服务端**同名同值**；`method_name` 是宏的编译期常量，`request_id` 由 `Session::call` 分配后 `Span::current().record` 回填（字段不存在时是 no-op） | 零 |
 | 队列深度 | `tx.capacity()` / 已排队条数，超阈值 warn | 低 |
 | pending 大小 | 定期采样 `outbound.lock().pending.len()`，接近配额时 warn | 低 |
 | 入站配额 | `inbound.async_used` / `blocking_used` 采样；与 pending 分开报，否则看不出是哪个方向过载 | 低 |
-| handler 耗时 | debug 构建下 > 100 µs 打 warn，提示该加 `#[photon(blocking)]` | 仅 debug |
+| handler 耗时 | debug 构建下 > 100 µs 打 warn，提示该加 `#[spile(blocking)]` | 仅 debug |
 | shm 槽位占用时长 | ZeroCopy 路径下 payload 从交出处到 drop 的时长，做指标 | M5 |
 
 只带 `request_id` 的 span 在排障时基本没用——一个数字对不上任何业务语义；只有 `service_id + method` 也一样（哈希认不出方法名）。所以名字必须由宏那一侧交出来（`Service::method_name`），L3 自己反推不了。

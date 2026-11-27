@@ -33,8 +33,8 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 name = "calc-api"
 version = "0.1.0"
 dependencies = [
- "photon",
  "serde",
+ "spile",
 ]
 
 [[package]]
@@ -42,7 +42,7 @@ name = "calc-client"
 version = "0.1.0"
 dependencies = [
  "calc-api",
- "photon",
+ "spile",
  "tokio",
 ]
 
@@ -51,7 +51,7 @@ name = "calc-server"
 version = "0.1.0"
 dependencies = [
  "calc-api",
- "photon",
+ "spile",
  "tokio",
 ]
 
@@ -209,31 +209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "photon"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "parking_lot",
- "photon-macros",
- "postcard",
- "serde",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "photon-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "xxhash-rust",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,6 +325,31 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "spile"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "postcard",
+ "serde",
+ "spile-macros",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "spile-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "xxhash-rust",
 ]
 
 [[package]]

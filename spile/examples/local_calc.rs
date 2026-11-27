@@ -1,0 +1,154 @@
+//! 单进程全链路：client stub → session → dispatch → codec → 回包。
+//!
+//! M2 的四种形态之外，M3 的形态也在这里跑一遍：通知（无回包）、超时（客户端准、
+//! 服务端尽力）、同步 handler、优雅关闭（等在飞清空再收尾）、同步客户端（自带
+//! 线程与 runtime，调用点不写 `await`）。一条命令：`cargo run --example local_calc`。
+
+// 单进程示例同时扮演两端，所以接口与实现都引；两进程示例里客户端只引 `api.rs`。
+#[path = "calc_service/api.rs"]
+mod calc;
+#[path = "calc_service/imp.rs"]
+mod calc_imp;
+
+use std::sync::Arc;
+
+use calc::{CalcBlockingClient, CalcClient, describe, describe_call, register_calc};
+use calc_imp::Calculator;
+use spile::{ServiceRegistry, Session, SessionOptions, transport::memory::Memory};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 两条队列合成的双向连接：没有端点、没有 connect/accept，但线格式与真连接
+    // 完全同一条路径（L2/L3 一行不改）。
+    let (client_halves, server_halves) = Memory::pair();
+
+    let mut registry = ServiceRegistry::empty();
+    register_calc(&mut registry, Arc::new(Calculator))?;
+
+    let (server_session, _server_handle) = Session::new(
+        server_halves.0,
+        server_halves.1,
+        Arc::new(registry),
+        SessionOptions::default(),
+    )?;
+    println!("[server] listening on memory (in-process pair, no endpoint)");
+
+    // 服务端会话由内部的 reader task 持有；这里留个名字，最后用它的 `close()`
+    // 演示「宣告关闭 + 等在飞清空」。
+    let server = server_session;
+
+    let (client_session, client_handle) = Session::new(
+        client_halves.0,
+        client_halves.1,
+        Arc::new(ServiceRegistry::empty()),
+        SessionOptions::default(),
+    )?;
+    client_session.wait_ready().await?;
+    let client = CalcClient::new(client_handle);
+
+    let sum = client.add(2, 3).await?;
+    println!("[client] add(2, 3) = {sum}");
+
+    match client.div(1, 0).await {
+        Ok(value) => println!("[client] div(1, 0) = {value}"),
+        Err(err) => println!("[client] div(1, 0) -> {}", describe_call(&err)),
+    }
+
+    // 32 个并发：每个请求的参数不同，只要有一份应答串了包就会落在 mismatched 上。
+    let mut tasks = Vec::new();
+    for i in 0..32i64 {
+        let client = CalcClient::new(client.handle().clone());
+        tasks.push(tokio::spawn(async move { (i, client.add(i, 1000).await) }));
+    }
+    let mut mismatched = 0;
+    for task in tasks {
+        let (i, result) = task.await?;
+        match result {
+            Ok(value) if value == i + 1000 => {}
+            _ => mismatched += 1,
+        }
+    }
+    println!("[client] 32 concurrent calls -> all matched, mismatched = {mismatched}");
+
+    // 通知：不插 pending、不占出站配额，`Ok` 只代表帧进了队列。
+    client
+        .handle()
+        .notify(calc::service_id(), calc::ping_method(), bytes::Bytes::new())
+        .await?;
+    println!("[client] notify ping (no reply)");
+
+    // 超时：期限挂在客户端上，`slow_op(200)` 在 50 ms 处被本端放弃，
+    // 服务端自己的 deadline 也是 50 ms，于是 handler 一并被丢掉。
+    let strict = CalcClient::new(client.handle().clone()).with_deadline(50);
+    match strict.slow_op(200).await {
+        Ok(ms) => println!("[client] slow_op -> Ok({ms})  (超时没生效？)"),
+        Err(spile::RpcError::Timeout) => println!("[client] slow_op -> Err(Timeout after 50ms)"),
+        Err(err) => println!("[client] slow_op -> {}", describe(&err)),
+    }
+
+    // 同步 handler：声明是 `fn`，stub 仍是 async（线上永远异步）。
+    let hash = client.fast_hash(b"spile".to_vec()).await?;
+    println!("[client] fast_hash(data) = {hash:#018x}   (sync handler, 未 await)");
+
+    // 同步客户端：底层是一条自带线程与 runtime 的会话，所以调用点既不需要 runtime
+    // 也不需要 `await`。这里另开一对半身，服务端跑在一条 std 线程上——这正好是
+    // 「同步库被 async 程序调用」的形状。
+    let ((sync_server_src, sync_server_sink), (sync_client_src, sync_client_sink)) = Memory::pair();
+    let mut sync_registry = ServiceRegistry::empty();
+    register_calc(&mut sync_registry, Arc::new(Calculator))?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let sync_server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("同步服务端 runtime");
+        rt.block_on(async move {
+            let (session, _handle) = Session::new(
+                sync_server_src,
+                sync_server_sink,
+                Arc::new(sync_registry),
+                SessionOptions::default(),
+            )
+            .expect("同步服务端会话");
+            session.wait_ready().await.expect("握手");
+            let _ = stop_rx.await;
+            let _ = session.close().await;
+        });
+    });
+
+    let blocking = CalcBlockingClient::new(spile::blocking::BlockingSession::from_parts(
+        sync_client_src,
+        sync_client_sink,
+        SessionOptions::default(),
+    )?);
+    let sum = blocking.add(20, 22)?;
+    println!("[blocking] add(20, 22) = {sum}   (no runtime, no await)");
+
+    // 外层期限：只保护调用方这一侧（对端不回时不会一直挂着）。
+    match blocking
+        .with_timeout(std::time::Duration::from_millis(30))
+        .slow_op(200)
+    {
+        Ok(ms) => println!("[blocking] slow_op -> Ok({ms})  (超时没生效？)"),
+        Err(spile::RpcError::Timeout) => {
+            println!("[blocking] slow_op -> Err(Timeout after 30ms, local)")
+        }
+        Err(err) => println!("[blocking] slow_op -> {}", describe(&err)),
+    }
+    let _ = stop_tx.send(());
+    sync_server.join().expect("同步服务端线程");
+
+    // 优雅关闭：留一个在飞的请求，然后由服务端宣告关闭；
+    // `close()` 不返回直到 handler 清空，回包也在这之前进了 writer。
+    let inflight = tokio::spawn({
+        let client = CalcClient::new(client.handle().clone());
+        async move { client.slow_op(30).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    server.close().await?;
+    let _ = inflight.await?;
+    println!("[server] shutdown (in-flight drained)");
+
+    client.handle().close().await?;
+    Ok(())
+}

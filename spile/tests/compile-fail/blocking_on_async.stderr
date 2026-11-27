@@ -1,0 +1,5 @@
+error: `#[spile(blocking)]` 只能标在同步 `fn` 上：`async fn` 本身就是非阻塞的，挪进 blocking 线程池只会白白占一个线程
+ --> tests/compile-fail/blocking_on_async.rs:6:5
+  |
+6 |     async fn add(&self, a: i64, b: i64) -> i64;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

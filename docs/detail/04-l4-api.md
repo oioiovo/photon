@@ -2,7 +2,7 @@
 
 > 上位文档：`docs/design.md` 5 节、10 节。
 > 本层是**唯一对用户可见**的一层：一个 trait + 一个属性宏 + 两个客户端变体。
-> 产出：用户写 `#[photon::service(id = 7)] pub trait Calc { … }` 之后得到的全部代码。
+> 产出：用户写 `#[spile::service(id = 7)] pub trait Calc { … }` 之后得到的全部代码。
 
 ---
 
@@ -12,7 +12,7 @@
 
 **不做**：不认识 `request_id`、不认识连接、不认识 `tx`、不认识 `Endpoint`（除了 `connect` 那一层薄封装）；不解析 24 字节头；不做序列化（交给 `Codec`）。
 
-红线：`photon-macros` 里不许出现任何运行期逻辑；用户的 `trait` 里不许出现任何框架类型（`Bytes` / `RpcError` 只在返回值里出现，这是 5.1 已经接受的例外）。
+红线：`spile-macros` 里不许出现任何运行期逻辑；用户的 `trait` 里不许出现任何框架类型（`Bytes` / `RpcError` 只在返回值里出现，这是 5.1 已经接受的例外）。
 
 ---
 
@@ -36,7 +36,7 @@ pub trait Service: Send + Sync + 'static {
 
 `Service::call` 的 `payload` 是**已过 24 字节头剥离的裸 payload**。反序列化发生在 `call` 内部（宏生成的代码里），不发生在 L3——L3 只负责「把它搬进 task」。这一点与 4.2 第 ⑤ 步一致：读者只需记住「decode 不在 reader loop 里」。
 
-> 编解码器从哪来：宏生成的 `call` 用编译期别名 `photon::codec::Default`（由 `codec-*` feature 决定是 postcard 还是 rkyv）。**`Session` 不再有 `C` 泛型参数（v0.10）**——它只持 `S: MessageSource` / `K: MessageSink`，握手固定填 `codec::Default::ID`。v0.9 的 `Session<S, K, C>` 里 `C` 是死参数：`Service::call` 没有 `C` 槽位，热路径的字节从来不用 `C`，`C` 只在握手贡献一个 id——于是 `Session<S, K, OtherCodec>` 会「宣告 A、线上却是 B」，**静默错线格式**。将来若真要同构建内支持第二种 codec，必须先引入 `AnyCodec` 门面。
+> 编解码器从哪来：宏生成的 `call` 用编译期别名 `spile::codec::Default`（由 `codec-*` feature 决定是 postcard 还是 rkyv）。**`Session` 不再有 `C` 泛型参数（v0.10）**——它只持 `S: MessageSource` / `K: MessageSink`，握手固定填 `codec::Default::ID`。v0.9 的 `Session<S, K, C>` 里 `C` 是死参数：`Service::call` 没有 `C` 槽位，热路径的字节从来不用 `C`，`C` 只在握手贡献一个 id——于是 `Session<S, K, OtherCodec>` 会「宣告 A、线上却是 B」，**静默错线格式**。将来若真要同构建内支持第二种 codec，必须先引入 `AnyCodec` 门面。
 
 ---
 
@@ -45,8 +45,8 @@ pub trait Service: Send + Sync + 'static {
 ### 3.1 服务级属性
 
 ```rust
-#[photon::service(id = 7)]                    // 必填
-#[photon::service(id = 7, blocking)]          // 额外生成同步客户端
+#[spile::service(id = 7)]                    // 必填
+#[spile::service(id = 7, blocking)]          // 额外生成同步客户端
 ```
 
 | 参数 | 是否必填 | 类型 | 规则 |
@@ -60,8 +60,8 @@ pub trait Service: Send + Sync + 'static {
 
 | 属性 | 适用 | 语义 |
 |---|---|---|
-| `#[photon(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking`（v0.19 生效） |
-| `#[photon(zero_copy)]` | 仅同步 `fn` | 该方法的入站 payload 允许直传；生成 `payload_mode` 覆盖返回 `ZeroCopy`（v0.26 生效，v1 上是 no-op，等 shm） |
+| `#[spile(blocking)]` | 仅 `fn` | 该 handler 走 `spawn_blocking`（v0.19 生效） |
+| `#[spile(zero_copy)]` | 仅同步 `fn` | 该方法的入站 payload 允许直传；生成 `payload_mode` 覆盖返回 `ZeroCopy`（v0.26 生效，v1 上是 no-op，等 shm） |
 
 **服务级属性只剩 `id = N` 与 `blocking`（v0.31）**：v0.25 的 `error = MyError` 已删除，错误类型改由方法签名表达（`-> T` / `-> Result<T, E>`），宏只在展开期做两件校验——`E` 不许是 `RpcError`（否则报「契约方法不能返回 `RpcError`」），`T` / `E` 不做其它限制。
 
@@ -75,7 +75,7 @@ pub trait Service: Send + Sync + 'static {
 |---|---|---|---|
 | `async fn` | 在当前 task 里 await | `async fn` | 异步 |
 | `fn` | 就地执行完（不换线程） | `async fn` | 异步 |
-| `fn` + `#[photon(blocking)]` | `spawn_blocking` | `async fn`（`BlockingXxxClient` 里是 `fn`） | 异步 / 同步 |
+| `fn` + `#[spile(blocking)]` | `spawn_blocking` | `async fn`（`BlockingXxxClient` 里是 `fn`） | 异步 / 同步 |
 
 混写三档是允许的，宏逐方法读 `async` 关键字与属性。
 
@@ -83,7 +83,7 @@ pub trait Service: Send + Sync + 'static {
 
 ## 4. 宏展开产物
 
-对一个 `#[photon::service(id = 7, blocking)] trait Calc { … }`，展开必须产出**恰好**下列项（名字规则固定，避免用户猜）：
+对一个 `#[spile::service(id = 7, blocking)] trait Calc { … }`，展开必须产出**恰好**下列项（名字规则固定，避免用户猜）：
 
 | 产物 | 形状 | 说明 |
 |---|---|---|
@@ -91,12 +91,12 @@ pub trait Service: Send + Sync + 'static {
 | `CalcService<S>` | 包一层 `Arc<S>`，`impl Service`，内部 `match method` | 见下方「为什么是包装类型而不是 blanket impl」，v0.17 修 |
 | `<CalcService<S> as Service>::schedule` | 逐个 blocking 方法比 `method`，其余落 `Async` | 有 blocking 方法时才生成；没有就用 trait 默认实现（v0.19） |
 | `register_calc(registry, svc)` | 用 `Calc` 上的 `id` 占号，内部 `CalcService::new(svc)` | 与 stub 共用同一个 `id` 字面量，一处写两处用 |
-| `CalcClient::SERVICE_ID` / `mod __photon_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
-| `mod __photon_calc` 内的 `METHOD_NAMES` | `&[(u64, &'static str)]` | span / `UnknownMethod` 日志 / panic 报告 |
-| `mod __photon_calc` 内的 `HASH_<METHOD>` 常量 | `const u64` | 编译期哈希值，`match` 的键 |
-| `CalcBlockingClient<S, K>` | 持 `photon::blocking::BlockingSession<S, K>` + `deadline_ms`；方法与 `CalcClient` 一一对应但全是同步 `fn`（v0.27） | 仅服务级写了 `blocking` 时生成 |
+| `CalcClient::SERVICE_ID` / `mod __spile_calc::SERVICE_ID` | `const u16` | 排障与日志用；**trait 上不挂关联常量**，见 v0.17 说明 |
+| `mod __spile_calc` 内的 `METHOD_NAMES` | `&[(u64, &'static str)]` | span / `UnknownMethod` 日志 / panic 报告 |
+| `mod __spile_calc` 内的 `HASH_<METHOD>` 常量 | `const u64` | 编译期哈希值，`match` 的键 |
+| `CalcBlockingClient<S, K>` | 持 `spile::blocking::BlockingSession<S, K>` + `deadline_ms`；方法与 `CalcClient` 一一对应但全是同步 `fn`（v0.27） | 仅服务级写了 `blocking` 时生成 |
 
-**为什么是包装类型 `CalcService<S>` 而不是 blanket impl（v0.17 修）**。v0.9–v0.16 一直写的是 `impl<S: Calc + Send + Sync + 'static> Service for S`，看着最省事（`Arc::new(my_calc)` 直接进注册表）。实际写出来在**用户 crate 里必然编译失败**：`Service` 来自 photon、`S` 是裸类型参数，展开代码属于下游 crate，孤儿规则不允许「外部 trait + 裸参数」（`E0210`）。只有两种出路：把 `Service` 改成 phantom 参数（等于让 L3 认不出服务），或者包一层本地类型。后者多一层指针解引用与一次 `Arc::clone`，代价可以忽略，收益是**同一实现类型可以同时实现多个服务 trait**——v0.9 里「一个类型只能属于一个服务」的限制不再存在。`register_calc(registry, svc)` 的签名保持不变，包装发生在宏内部。
+**为什么是包装类型 `CalcService<S>` 而不是 blanket impl（v0.17 修）**。v0.9–v0.16 一直写的是 `impl<S: Calc + Send + Sync + 'static> Service for S`，看着最省事（`Arc::new(my_calc)` 直接进注册表）。实际写出来在**用户 crate 里必然编译失败**：`Service` 来自 spile、`S` 是裸类型参数，展开代码属于下游 crate，孤儿规则不允许「外部 trait + 裸参数」（`E0210`）。只有两种出路：把 `Service` 改成 phantom 参数（等于让 L3 认不出服务），或者包一层本地类型。后者多一层指针解引用与一次 `Arc::clone`，代价可以忽略，收益是**同一实现类型可以同时实现多个服务 trait**——v0.9 里「一个类型只能属于一个服务」的限制不再存在。`register_calc(registry, svc)` 的签名保持不变，包装发生在宏内部。
 
 **`async fn` 必须改写成带 `Send` 的 RPITIT（v0.17 修）**。trait 里的原生 `async fn` 只保证「返回一个 future」，**不保证它是 `Send`**；而 dispatch 要交出 `BoxFuture`（内含 `+ Send`），于是 `Box::pin(async move { … svc.add(a, b).await … })` 直接报「future cannot be sent between threads safely」。宏因此把 trait 方法的签名改写成：
 
@@ -107,10 +107,10 @@ fn add(&self, a: i64, b: i64) -> impl ::std::future::Future<Output = Result<i64,
 
 实现侧**照旧写 `async fn`**（编译器认这个形状），`Send` 由它逐 impl 验证：handler 里持有了一个 `!Send` 的东西（例如 `Rc`）会在用户自己的代码上编译失败，而不是等到运行期发现 task 起不来。这也是不用 `async-trait` 的唯一理由——`async-trait` 会把 future 装进 `Box`，与我们「不为每请求多买一次 alloc」的口径相反。
 
-**所有辅助项必须包进一个按服务命名的模块（v0.10 修）**。v0.9 的写法是在模块级直接生成 `METHOD_NAMES` / `HASH_ADD` / `SERVICE_ID` 这些固定名字——**同一个模块里写两个 `#[photon::service]` 就必然重名编译失败**，而「一个模块放几个服务」是完全正常的用法。规则：
+**所有辅助项必须包进一个按服务命名的模块（v0.10 修）**。v0.9 的写法是在模块级直接生成 `METHOD_NAMES` / `HASH_ADD` / `SERVICE_ID` 这些固定名字——**同一个模块里写两个 `#[spile::service]` 就必然重名编译失败**，而「一个模块放几个服务」是完全正常的用法。规则：
 
 ```rust
-mod __photon_calc {          // 模块名 = __photon_ + 服务名的小写 snake 形式
+mod __spile_calc {          // 模块名 = __spile_ + 服务名的小写 snake 形式
     pub(super) const METHOD_NAMES: &[(u64, &'static str)] = &[...];
     pub(super) const HASH_ADD: u64 = 0x...;
 }
@@ -120,7 +120,7 @@ mod __photon_calc {          // 模块名 = __photon_ + 服务名的小写 snake
 - `HASH_<METHOD>` 用方法名**大写**形式；若方法名本身含非法标识符字符（极少数），退回 `HASH_0`、`HASH_1` 并按声明顺序编号。
 - 不要用 `#[doc(hidden)]` 糊过去就完事——重名是编译错误，不是文档问题。
 
-**`blocking` 不能用 `#[cfg(feature = "blocking")]` 生成**：proc-macro 展开出的 `cfg` 检查的是**使用方 crate** 的 feature，不是 photon 的，按字面根本不成立（用户开 `photon/blocking` 不会让这段 `cfg` 变真）。所以生成与否只由属性参数决定；框架侧也不设这个 feature（v0.27）——`src/blocking.rs` 复用已有 tokio、零新依赖，加一个永远为真的开关只会在文档与代码之间制造落差。
+**`blocking` 不能用 `#[cfg(feature = "blocking")]` 生成**：proc-macro 展开出的 `cfg` 检查的是**使用方 crate** 的 feature，不是 spile 的，按字面根本不成立（用户开 `spile/blocking` 不会让这段 `cfg` 变真）。所以生成与否只由属性参数决定；框架侧也不设这个 feature（v0.27）——`src/blocking.rs` 复用已有 tokio、零新依赖，加一个永远为真的开关只会在文档与代码之间制造落差。
 
 ---
 
@@ -147,7 +147,7 @@ fn call(self: Arc<Self>, method: u64, payload: Bytes) -> BoxFuture<'static, Resu
                     },
                 }
             }
-            HASH_LOAD => {                                            // fn + #[photon(blocking)]
+            HASH_LOAD => {                                            // fn + #[spile(blocking)]
                 let me = Arc::clone(&me);
                 tokio::task::spawn_blocking(move || {                  // decode 必须在闭包里
                     let path: PathBuf = Default::decode(&payload)?;
@@ -183,7 +183,7 @@ fn schedule(&self, method: u64) -> Schedule {
 
 **`schedule` 为什么必须由生成代码给出（v0.19）**：配额检查发生在「reader 解析完头、准备 spawn」这一刻，此时手上只有 `service_id + method`；实现内部走哪个分支要等 `call` 被 poll 才知道，而那时额度已经扣过了。让 L3 猜不了，也不该让 handler 自己扣（那等于把会话层的资源契约下放到业务代码）。代价只是一次 `match` 比较链，且只有存在 blocking 方法时才生成。
 
-**`method_name` 同理，只是用途是观测（v0.28）**：`dispatch` 在进 handler 之前就要建 `photon.request` span，而那时只有 `service_id + method`；`method` 是 `xxh3` 哈希，**反推不出名字**，名字只存在于宏展开的 `mod __photon_xxx::METHOD_NAMES` 里。所以 `Service` 加了一个默认返回 `None` 的方法，宏用一次 `find` 覆盖它：
+**`method_name` 同理，只是用途是观测（v0.28）**：`dispatch` 在进 handler 之前就要建 `spile.request` span，而那时只有 `service_id + method`；`method` 是 `xxh3` 哈希，**反推不出名字**，名字只存在于宏展开的 `mod __spile_xxx::METHOD_NAMES` 里。所以 `Service` 加了一个默认返回 `None` 的方法，宏用一次 `find` 覆盖它：
 
 ```rust
 fn method_name(&self, method: u64) -> Option<&'static str> {
@@ -193,7 +193,7 @@ fn method_name(&self, method: u64) -> Option<&'static str> {
 
 不生成时（手写 `Service`）日志里写 `<unknown>`——比什么都不写诚实：看得出「没接名字表」，而不是以为这个方法没有名字。
 
-参数解码位置：**`async fn` / `fn` 分支在 `call` 开头** `let (a, b) = Default::decode::<(i64, i64)>(&payload)?;`；**`#[photon(blocking)]` 分支必须在 `spawn_blocking` 的闭包里 decode**（v0.10 修）——v0.9 把它写在闭包外，等于只在调用线程上解析、闭包里只剩执行，一次线程切换只干了一件事；更糟的是 decode 出错时闭包外的 `?` 会让 `payload` 在闭包捕获前就被借用，写出来的代码通常编译不过或被迫多一次 clone。解码失败一律 `code = 4`。`Vec<u8>` 等容器类型直接走 serde，不需要特殊处理。
+参数解码位置：**`async fn` / `fn` 分支在 `call` 开头** `let (a, b) = Default::decode::<(i64, i64)>(&payload)?;`；**`#[spile(blocking)]` 分支必须在 `spawn_blocking` 的闭包里 decode**（v0.10 修）——v0.9 把它写在闭包外，等于只在调用线程上解析、闭包里只剩执行，一次线程切换只干了一件事；更糟的是 decode 出错时闭包外的 `?` 会让 `payload` 在闭包捕获前就被借用，写出来的代码通常编译不过或被迫多一次 clone。解码失败一律 `code = 4`。`Vec<u8>` 等容器类型直接走 serde，不需要特殊处理。
 
 ---
 
@@ -202,7 +202,7 @@ fn method_name(&self, method: u64) -> Option<&'static str> {
 方法签名只有两种形状，`E` 由契约自定义、只要求 `Codec`：
 
 ```rust
-#[photon::service(id = 11)]
+#[spile::service(id = 11)]
 trait Ledger {
     async fn balance(&self) -> i64;                            // 不可失败
     async fn withdraw(&self, amount: i64) -> Result<i64, CalcError>;   // 可失败
@@ -246,15 +246,15 @@ match <S as Ledger>::withdraw(&*me, amount).await {
 ## 5.2 `PayloadMode`：两种取值在 v1 都是 no-op（v0.26）
 
 ```rust
-#[photon::service(id = 8)]
+#[spile::service(id = 8)]
 trait Mixed {
     async fn add(&self, ..) -> Result<i64, RpcError>;
-    #[photon(zero_copy)]
+    #[spile(zero_copy)]
     fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError>;   // 仅同步 fn
 }
 
 // 生成的 impl Service 里多一段
-fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
+fn payload_mode(&self, method: u64) -> ::spile::PayloadMode {
     match method { HASH_DIGEST => PayloadMode::ZeroCopy, _ => PayloadMode::Copy }
 }
 ```
@@ -263,14 +263,14 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 
 所以这一步落的是三件**不涉及代码生成结果**的事：类型（`PayloadMode`）、通路（`Service::payload_mode` 与 `schedule` 并列）、护栏（`zero_copy` 只对同步 `fn` 放行）。护栏是唯一有立即收益的部分：把「async handler 攥住槽位」这种错误提前到编译期，而不是等 M5 在线上表现为「环被填满、通道停摆」。
 
-**`SessionOptions` 不加 `payload_mode`**：v1 里没有任何路径会读它——加了就是一个收下不用的参数，和 `Memory::pair` 去掉 `opts` 是同一条理由。M5 加总闸时用户代码不用改，因为 `#[photon(zero_copy)]` 已经存在，语义（全局关时方法标了也不生效）也已经定死。
+**`SessionOptions` 不加 `payload_mode`**：v1 里没有任何路径会读它——加了就是一个收下不用的参数，和 `Memory::pair` 去掉 `opts` 是同一条理由。M5 加总闸时用户代码不用改，因为 `#[spile(zero_copy)]` 已经存在，语义（全局关时方法标了也不生效）也已经定死。
 
 ## 6. 配额与线程池
 
 | 配额 | 谁消费 | 默认 | 说明 |
 |---|---|---|---|
 | `max_async_in_flight` | 服务端 `async fn` / `fn` handler | 1024（与出站队列同量级） | task 资源 |
-| `max_blocking_in_flight` | 服务端 `#[photon(blocking)]` handler | = blocking pool 大小 | 线程资源 |
+| `max_blocking_in_flight` | 服务端 `#[spile(blocking)]` handler | = blocking pool 大小 | 线程资源 |
 | 客户端出站配额 | 客户端 | 一组，只用 `max_async_in_flight` | 客户端不跑 handler |
 
 **必须拆成两个**：共用一组额度会出现「一批慢的 blocking 请求把额度占满，此时异步请求明明跑得动却也收到 `Overloaded`」——两类资源混进一个计数器，过载信号就失去意义了。
@@ -307,7 +307,7 @@ fn payload_mode(&self, method: u64) -> ::photon::PayloadMode {
 
 ### 7.2.1 名字要跟着命令一起过线程（v0.28）
 
-`photon.call` 的 span 在**会话线程**上建（调用方线程上没有 runtime、也没有 `await`），而 `method_name` 只有宏知道。所以 `Command::Call` 多带一个 `Option<&'static str>`，公开入口是：
+`spile.call` 的 span 在**会话线程**上建（调用方线程上没有 runtime、也没有 `await`），而 `method_name` 只有宏知道。所以 `Command::Call` 多带一个 `Option<&'static str>`，公开入口是：
 
 ```rust
 pub fn call(&self, service_id, method, payload, deadline_ms) -> Result<Bytes, RpcError>;
@@ -338,7 +338,7 @@ v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：f
 | `deadline_alone_bounds_the_call` | 只设 `deadline` 也有界（外层默认 `None` 不是漏洞） |
 | `notify_is_fire_and_forget` | 通知不占回包通道 |
 | `close_then_call_is_closed` | `close()` 之后的调用回 `Closed` |
-| `blocking_call_also_carries_the_name`（在 `tests/tracing_spans.rs`） | 同步路径的 `photon.call` 也带 `method_name`，且与服务端 `photon.request` 的 `request_id` 对齐 |
+| `blocking_call_also_carries_the_name`（在 `tests/tracing_spans.rs`） | 同步路径的 `spile.call` 也带 `method_name`，且与服务端 `spile.request` 的 `request_id` 对齐 |
 | `business_error_survives_sync_stub` | 业务错误经 `from_error` 三处映射后仍是用户码 |
 | `usable_inside_current_thread_runtime` | `current_thread` runtime 里同步调用不 panic、不死锁 |
 
@@ -354,7 +354,7 @@ v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：f
 两条必须澄清的点：
 
 - 本地直连**不是 transport**，它是 5.6 的调用路径；把两者混成一个实现是 v0.2 的错误。
-- 三档声明在本地直连下仍按形态分派：`async fn` 直接 await、`fn` 直接调；标了 `#[photon(blocking)]` 时**由调用方自己负责线程池**，框架不替它调度（那时框架根本不在链路上）。
+- 三档声明在本地直连下仍按形态分派：`async fn` 直接 await、`fn` 直接调；标了 `#[spile(blocking)]` 时**由调用方自己负责线程池**，框架不替它调度（那时框架根本不在链路上）。
 
 ---
 
@@ -363,9 +363,9 @@ v0.7 的「`try_current()` 只告警、不硬拒绝」在 v0.27 整个取消：f
 | 检查 | 时机 | 报错要求 |
 |---|---|---|
 | `id` 缺失 / 不是 `u16` 字面量 | 展开 | 指出「必须写 `id = N`」，并给一行正确写法 |
-| `async fn` + `#[photon(blocking)]` | 展开 | 「`blocking` 只能标在同步 `fn` 上」；v0.19 起由 `tests/compile-fail/blocking_on_async.rs` 冻结文本 |
+| `async fn` + `#[spile(blocking)]` | 展开 | 「`blocking` 只能标在同步 `fn` 上」；v0.19 起由 `tests/compile-fail/blocking_on_async.rs` 冻结文本 |
 | 未知方法级属性（如 `cache`） | 展开 | 「只接受 `blocking` 与 `zero_copy`」；由 `unknown_method_attr.rs` 冻结 |
-| `async fn` / `#[photon(blocking)] fn` + `zero_copy` | 展开 | 分别说明「跨 await 会攥住槽位」「池线程时长不可预期」；由 `zero_copy_on_async.rs` / `zero_copy_on_blocking.rs` 冻结 |
+| `async fn` / `#[spile(blocking)] fn` + `zero_copy` | 展开 | 分别说明「跨 await 会攥住槽位」「池线程时长不可预期」；由 `zero_copy_on_async.rs` / `zero_copy_on_blocking.rs` 冻结 |
 | 接收者不是 `&self`、返回不是 `Result`、参数是模式解构 | 展开 | 定位到具体方法，说明展开需要「简单标识符参数 + `Result` 返回」 |
 | 方法名重复或哈希相撞 | 展开 | 常量断言式检查；报出两个方法名 |
 | `async fn` + `blocking` | 展开 | 「同步方法才需要 `blocking`」 |
@@ -496,7 +496,7 @@ impl<S, K> SessionHandle<S, K> {
 - 服务端侧的 `Notification` 与 `Request` 走同一个 `dispatch`（查服务 → 扣额度 → spawn），差别只有 `want_reply = false`：**未注册服务、额度不足都只记日志，绝不回 `Response`**。给通知回一个 `Response` 是协议噪声：对端没有对应 pending，收到只会丢掉。
 - `deadline_ms` 的客户端语义是「本端愿意等多久」，因此它同时决定头里的剩余预算。放弃（超时或 future 被 drop）时 `CallGuard` 摘表并触发 `Cancel`，见 `03` 6.3。
 
-**客户端 stub 顺手带一个 span（v0.28）**：生成的异步方法先建 `photon.call`（`service_id` / `method` / `method_name` / `deadline_ms`，`request_id` 留 `Empty`），再用 `photon::__private::instrument` 把整次调用包进去。两处细节值得写下来：
+**客户端 stub 顺手带一个 span（v0.28）**：生成的异步方法先建 `spile.call`（`service_id` / `method` / `method_name` / `deadline_ms`，`request_id` 留 `Empty`），再用 `spile::__private::instrument` 把整次调用包进去。两处细节值得写下来：
 
 1. **`method_name` 在客户端这一侧也是常量**——宏知道方法名，没必要等回包才知道；
 2. **`request_id` 由 L3 回填**：分配它的地方是 `Session::call`，那里做 `Span::current().record("request_id", id)`；span 上没有这个字段时（用户直接调 `handle.call`）`record` 是 no-op，不会报错。
@@ -524,7 +524,7 @@ impl<S, K> SessionHandle<S, K> {
 | `calc_local` | `local`，两进程 | M3（v0.23 已落地） | 换 transport 不改业务代码（架构验收）；同一二进制 `server` / `client` 两角色 |
 | `examples/calc-split`（`calc-api` / `calc-server` / `calc-client`） | `tcp`，两进程，**三个 crate** | M3（v0.29 新增） | 真实发布形态：契约 / 服务端 / 客户端各自独立编译；客户端依赖树里没有服务端（判据见 `design.md` 10.7） |
 
-**示例的接口与实现必须分文件（v0.28.1）**：`calc_service/api.rs` 只放 `Calc` trait 与打印/构造错误的小工具，`calc_service/imp.rs` 放 `Calculator` 与业务逻辑。v0.30 删掉 `calc_server` / `calc_client` 后，`photon/examples/` 里剩下的 `calc_local` 与 `local_calc` 都同时扮演两端，两半都得引——所以这条规则在**本 package 内**已经没有反例可打，真正守住它的判据移到 `examples/calc-split/`（契约是独立 crate，客户端 crate 的依赖树里没有服务端）。
+**示例的接口与实现必须分文件（v0.28.1）**：`calc_service/api.rs` 只放 `Calc` trait 与打印/构造错误的小工具，`calc_service/imp.rs` 放 `Calculator` 与业务逻辑。v0.30 删掉 `calc_server` / `calc_client` 后，`spile/examples/` 里剩下的 `calc_local` 与 `local_calc` 都同时扮演两端，两半都得引——所以这条规则在**本 package 内**已经没有反例可打，真正守住它的判据移到 `examples/calc-split/`（契约是独立 crate，客户端 crate 的依赖树里没有服务端）。
 
 判据不是「看着分开了」，而是客户端二进制里没有那个类型：在 `examples/calc-split` 下 `nm target/debug/calc-client | grep -c Calculator` = 0（服务端同一命令是 37）。v0.29 之前这条判据打在 `examples/calc_client` 上，v0.30 删掉它之后只剩跨 crate 这一处可验——恰好也是更强的形态（依赖树里连 `calc-server` 都没有，`cargo tree -p calc-client | grep calc-server` 为空）。这件事在 RPC 项目里不是洁癖——宏产物只有 `Service::call` 的 `match` 分支体依赖实现类型，把实现编进客户端等于**把业务逻辑分发出去**。
 
@@ -540,7 +540,7 @@ M2 的范围必须写清：**只支持 `async fn` 声明**，不含 `Notificatio
 ## 12. 明确不做
 
 - **不给 `fn` 声明自动生成 `fn` 客户端方法**：那会把「handler 形态」和「调用形态」重新绑死，正好绕回 5.2 想拆开的错误。要同步客户端必须是显式宏参数。
-- 不默认生成同步客户端：只由宏参数（`#[photon::service(id = N, blocking)]`）开启，代价是「每个会话多 3 条线程 + 一套 runtime 生命周期」；也不提供「多 client 复用一个 runtime」的入口（共享粒度是会话，见 §7.3）。
+- 不默认生成同步客户端：只由宏参数（`#[spile::service(id = N, blocking)]`）开启，代价是「每个会话多 3 条线程 + 一套 runtime 生命周期」；也不提供「多 client 复用一个 runtime」的入口（共享粒度是会话，见 §7.3）。
 - handler 内反向调用对端（需 `&ServiceContext` 首参）：会改动所有 handler 签名，M3 之后再说。
 - 协作式取消（handler 内轮询 `is_cancelled()`）：同上。
 - 用 `HashMap<u64, Box<dyn Fn>>` 代替 `match`：调度决策在运行期只剩一个函数指针，无法分流；且 method id 重复无法在编译期发现。

@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 calc-api = { path = "../api" }
-photon = { path = "../../../photon" }
+spile = { path = "../../../spile" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

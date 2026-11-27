@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 # 只依赖契约：没有 `calc-server`，也就没有任何业务实现。
 calc-api = { path = "../api" }
-photon = { path = "../../../photon" }
+spile = { path = "../../../spile" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

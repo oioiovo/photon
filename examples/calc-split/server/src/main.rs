@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use calc_api::{Calc, CalcError};
-use photon::transport::tcp::TcpTransport;
-use photon::{Endpoint, Server, SessionOptions, TransportOptions};
+use spile::transport::tcp::TcpTransport;
+use spile::{Endpoint, Server, SessionOptions, TransportOptions};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7001";
 

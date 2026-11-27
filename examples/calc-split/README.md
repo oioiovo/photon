@@ -1,6 +1,6 @@
 # calc-split —— 「三 crate」的真实形态
 
-photon 自己的 `examples/` 是**单个 package 的 example target**，只能演示 API 形状；真实项目里
+spile 自己的 `examples/` 是**单个 package 的 example target**，只能演示 API 形状；真实项目里
 接口、服务端、客户端是三件不同的事，编译边界也不一样。这份 demo 就是那种形态：
 
 ```

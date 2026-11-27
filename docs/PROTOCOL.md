@@ -1,8 +1,8 @@
-# photon 线格式（PROTOCOL.md）
+# spile 线格式（PROTOCOL.md）
 
-> **本文件是 photon 线格式的唯一权威。** `docs/design.md` 3.3.1 的逐 kind 表是设计视角速查表，与本文同源；两者不一致时以本文为准，且必须立刻修正速查表。
+> **本文件是 spile 线格式的唯一权威。** `docs/design.md` 3.3.1 的逐 kind 表是设计视角速查表，与本文同源；两者不一致时以本文为准，且必须立刻修正速查表。
 >
-> 当前对应 `design.md` **v0.31**，`protocol_version = 2`。v0.31 改了错误帧的语义（**结构没变，仍是「错误 `Response` 的 payload」，长度仍由 L1 前缀界定**）：① flags bit3 启用，区分「框架判定」与「业务拒绝」，`Response` 的合法组合变成 `0x00 / 0x01 / 0x09`；② 框架错误体前缀从 8 字节缩到 2 字节（`code u8 | reserved u8`），**删掉 `retryable` 字段**，`code` 只保留 `0..=7`、取消业务码段；③ 业务帧 payload 就是契约里 `E` 的 codec 字节，框架不解释、可以为 0 字节。旧实现（`protocol_version = 1`）会把 `0x09` 当协议错误、并按 8 字节前缀解框架帧，因此**版本号必须升到 2**，握手不匹配即拒绝建连（7.1）。其余字节布局、17 条校验、黄金样例的头与 payload 偏移一字未动。
+> 当前对应 `design.md` **v0.31.1**，`protocol_version = 2`。v0.31.1 只把项目与 crate 从 `photon` 改名为 `spile`，**字节布局与本文任何一条规则都未改**；v0.31 改了错误帧的语义（**结构没变，仍是「错误 `Response` 的 payload」，长度仍由 L1 前缀界定**）：① flags bit3 启用，区分「框架判定」与「业务拒绝」，`Response` 的合法组合变成 `0x00 / 0x01 / 0x09`；② 框架错误体前缀从 8 字节缩到 2 字节（`code u8 | reserved u8`），**删掉 `retryable` 字段**，`code` 只保留 `0..=7`、取消业务码段；③ 业务帧 payload 就是契约里 `E` 的 codec 字节，框架不解释、可以为 0 字节。旧实现（`protocol_version = 1`）会把 `0x09` 当协议错误、并按 8 字节前缀解框架帧，因此**版本号必须升到 2**，握手不匹配即拒绝建连（7.1）。其余字节布局、17 条校验、黄金样例的头与 payload 偏移一字未动。
 
 ---
 
@@ -206,7 +206,7 @@
 5. `reserved != 0` → 断连。
 6. 握手完成前的帧长上限恒为 **64 KiB**：声明值只在握手成功后生效，否则一个恶意 `Handshake` 就能让对方按 64 MiB 分配缓冲。
 
-`payload_mode` **不在握手里**：它回答的是「本端怎么处理入站 payload」，纯本端策略，`SessionOptions` + `#[photon(zero_copy)]` 两层就够；放进握手只会制造「两边不一致时怎么办」的未定义行为。
+`payload_mode` **不在握手里**：它回答的是「本端怎么处理入站 payload」，纯本端策略，`SessionOptions` + `#[spile(zero_copy)]` 两层就够；放进握手只会制造「两边不一致时怎么办」的未定义行为。
 
 ### 7.2 `GoAway`（payload 为空）
 
@@ -238,7 +238,7 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 
 ## 8. 黄金样例
 
-**样例中 `request_id` / `method` 均取占位常量，不代表线上真实值**——`method` 的真实值由宏在编译期对方法名做 xxh3-64 得到，它的 golden 向量放在 `photon-macros` 的单元测试里（**不放进本文件，也不与 §8 的线格式样例混在一起**）。本节的样例只锁「头 + 边界 + 逐 kind 语义」。
+**样例中 `request_id` / `method` 均取占位常量，不代表线上真实值**——`method` 的真实值由宏在编译期对方法名做 xxh3-64 得到，它的 golden 向量放在 `spile-macros` 的单元测试里（**不放进本文件，也不与 §8 的线格式样例混在一起**）。本节的样例只锁「头 + 边界 + 逐 kind 语义」。
 
 样例里的 payload 用少量占位字节（`AA BB` / `CC` / `DD`），因为它们的内容归 codec，不属于线格式。
 
@@ -369,7 +369,7 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 | 8.6 | `"GoAway"` / `"GoAway 急停"` | 24 | 全零头；急停变体只差 flags |
 | 8.7 | `"Handshake"` | 36 | 12 字节 payload；`reserved` = 0 |
 
-七个样例全部内联在 `photon/tests/protocol.rs` 的 `golden_samples_match_protocol_section_8` 里，
+七个样例全部内联在 `spile/tests/protocol.rs` 的 `golden_samples_match_protocol_section_8` 里，
 由 `assert_golden(name, header, payload, expected)` 断言「encode 出的字节与冻结字面量逐字节一致」。
 **没有 `.bin` 文件，也没有 `include_bytes!`**：理由见 §11 第 5 条。
 
@@ -431,10 +431,10 @@ v0.7 的 `GoAway{last_request_id}` 已删除：对称会话下它没有良定义
 
 1. **生成**：先用实现编码出这七种帧（不是手敲 hex），把结果打印成字节数组。
 2. **人工审**：对照本文件第 2–8 节逐字节核对一遍（偏移、宽度、小端、必须为 0 的字段）。
-3. **冻结**：把核对过的字节数组**内联**进 `photon/tests/protocol.rs`（作为 `assert_golden` 的 `expected` 参数），从此不再重新生成。
+3. **冻结**：把核对过的字节数组**内联**进 `spile/tests/protocol.rs`（作为 `assert_golden` 的 `expected` 参数），从此不再重新生成。
 4. **验证**：测试只做「decode 冻结样例 → 字段断言」与「encode → 与冻结字节逐字节比对」，**绝不在测试运行时重新生成**——那样样例只是把当前实现的 bug 固化下来。
 5. **为什么内联而不是 `.bin` + `include_bytes!`**：二进制产物在 code review 的 diff 里不可见，改坏一个字节没人看得出来；内联字面量逐行可见、可以逐段写注释（标明字段名与宽度），冻结效果完全等价——两者都是「运行时不再重新生成」。代价只是测试文件长一些，这个代价不值得用一层文件路径管理去交换。
-6. **反例**：另外维护一组「必须被拒」的用例（同样内联在 `photon/tests/protocol.rs`，形式是「合法头 + 单字段破坏」）：
+6. **反例**：另外维护一组「必须被拒」的用例（同样内联在 `spile/tests/protocol.rs`，形式是「合法头 + 单字段破坏」）：
    - `Cancel.service_id != 0`
    - `Notification.request_id == 0`
    - `Handshake.reserved != 0`

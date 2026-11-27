@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use calc_api::{CalcClient, describe};
-use photon::{
+use spile::{
     ConnectOptions, Endpoint, connect,
     transport::tcp::{TcpSink, TcpSource, TcpTransport},
 };

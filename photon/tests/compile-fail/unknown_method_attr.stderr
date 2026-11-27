@@ -1,5 +1,0 @@
-error: 方法级 `#[photon(...)]` 只接受 `blocking` 与 `zero_copy`
- --> tests/compile-fail/unknown_method_attr.rs:7:14
-  |
-7 |     #[photon(cache)]
-  |              ^^^^^
