@@ -247,6 +247,8 @@ loop {
 
 ### 6.1 时序与每步失败处理
 
+**v0.32 起，①之前多一段「链」**（`interceptor`，见 `04-l4-api.md` 5.3）：`SessionHandle::call_named` → `Session::call_named` 判 `chain.first()`——空则直连 `send_once`；非空则 `ClientNext::run(ClientCall)` 一路落到 `send_once`。下表描述的是 **`send_once` 内部**。链上的拦截器可以缩短 `deadline_ms`、换掉 `payload`、直接短路（短路时 ①–⑧ 一步都不发生，`request_id` 也不会被消耗）。
+
 | 步 | 动作 | 失败时 |
 |---|---|---|
 | ① | `next_id.fetch_add(1)` → `id`（非 0） | — |
@@ -263,6 +265,7 @@ loop {
 ### 6.2 dispatch 内部（服务端）
 
 1. `let svc = registry.get(service_id)` → 无 → `send_error(id, 2, "unknown service")`（回包侧直接陈述，见 `02` 7.3）；
+   **注册表里查到之后**，`ServerCall` 先过一遍服务端链：`call_through_chain(&server_chain, &svc, call)`——空链就是一次 `Service::call`，非空则从最外层 `ServerInterceptor` 往里走（v0.32）。链短路产生的 `HandlerError::Framework { code, .. }` 与 handler 自己产生的走同一套第 5 步三分布帧，所以「链把请求拒了」在线上与「handler 拒了」不可区分——这正是 `INV-32` 要的形状；
 2. 扣额度：`svc.schedule(method)` 给出 `Slot::Async | Slot::Blocking` → `inbound.try_acquire(slot, opts)`。**必须在 spawn 之前**：等 `call` 被 poll 才知道走哪个分支，那时额度已经扣过了。抢不到 → `send_error(id, 1, "overloaded" | "blocking pool overloaded")`，不登记 cancel token（v0.19）；
 3. 方法匹配在 handler 内做（宏生成 `match method { ... }`）→ 落空 → `Err(HandlerError::Framework { code: 3, message: "unknown method" })`（`Service::call` 的失败面就是 `HandlerError`，不必绕 `RpcError`）；
 4. `tokio::spawn(async move { svc.call(method, payload).await })`，**句柄必须 await**：实现上是「外层 task await 里层句柄」，每个请求多一次 spawn，换来「里层 panic 也有人回包」；
@@ -447,6 +450,8 @@ struct ClosingState {
 | `GoAway`（收活侧） | 对端 `GoAway` 之后到达、但属于「对端 `GoAway` 之前发出」的请求**必须被 dispatch 并回包**，不得回框架码 `7`（`INV-10a`） | M3 |
 | 关闭不丢包 | 双方宣告关闭之后到达的 `Request` 收到 `PeerRejected { code: 7 }`（明确拒绝，不挂死）（`INV-10c`） | M3 |
 | 关闭超时 | 对端完全不配合时，`close()` 在 `close_timeout` 内返回，不永久挂起 | M3 |
+| 拦截器位置 | 客户端链包住 `send_once`、服务端链包住 `Service::call`；空链时行为与没有拦截器时完全一致（`tests/interceptor.rs::empty_chain_is_not_observed_at_all`） | v0.32 |
+| 拦截器不改错 | 业务拒绝穿过任意层数的链后仍是 `CallFailure::Rejected(E)`（`business_rejection_passes_through_the_chain_untouched`） | v0.32 |
 
 ---
 
