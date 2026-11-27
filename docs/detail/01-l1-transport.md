@@ -249,7 +249,7 @@ src/transport/
 
 **实现形状**：`tokio::net::windows::named_pipe`，就在已开启的 `net` feature 里，**零新依赖**。需要的六项能力都在：`PipeMode::Byte`（默认）、`first_pipe_instance`、`max_instances`、`reject_remote_clients`（默认 true）、`AsyncRead + AsyncWrite`、`server.connect().await` / `ClientOptions::open`。
 
-- **名字**：`LocalAddr` 的路径只是**种子**。已经写成 `\\.\pipe\...` 的原样使用（直连口子）；否则映射成 `\\.\pipe\spile-<可读前缀>-<16 位十六进制 FNV-1a(路径字节)>`，总长上限 200 字符（内核 256）。**相对路径不解析**：两个进程必须给出相同字符串才落到同一条 pipe。
+- **名字**：`LocalAddr` 的路径只是**种子**。已经写成 `\\.\pipe\...` 的原样使用（直连口子）；否则映射成 `\\.\pipe\spile-<可读前缀>-<16 位十六进制 FNV-1a(路径字节)>`，总长上限 200 字符（内核 256）。可读前缀 = 种子文件名里**只保留 `[A-Za-z0-9_-]`、截 24 字符**（`.` 等一律滤掉，`alpha.sock` → `alphasock`），避免任意路径文本原样进入全局 pipe 命名空间；唯一性由哈希承担，前缀只负责「人能认出来」。**相对路径不解析**：两个进程必须给出相同字符串才落到同一条 pipe。
 - **`bind`**：`ServerOptions::new()` + `pipe_mode(Byte)` + `first_pipe_instance(true)` + `reject_remote_clients(true)` + `max_instances(254)`，`create` 一次。名字已被活的监听者独占时 `CreateNamedPipe` 报 `ERROR_ACCESS_DENIED`(5)，归一成 `AlreadyExists`（`INV-24` 的 Windows 版本）。首实例必须带 `create` 在 reactor 上，所以 `bind` 的 async 在这里是硬约束（`design.md` 2.1）。
 - **`accept`**：持一把 `tokio::sync::Mutex` → 取走待连接实例 → `server.connect().await` → **立刻再造一个实例放回槽位** → 交出这一对半身。造实例撞 `ERROR_PIPE_BUSY`(231) 就按 1 ms 退让重试（`accept` 按契约不设超时）。`accept` 因此不是取消安全的：在 `connect` 期间被 drop 会连同待连接实例一起消失，监听端失效——会话层只在整个公式关停时才 drop 它。
 - **`connect`**：`ClientOptions::open` 撞 `ERROR_PIPE_BUSY` 时退让 1 ms 重试，整轮包在 `opts.connect_timeout` 里到期 `TimedOut`；没有监听者是 `NotFound`，**直接返回**（要不要重试由调用方决定，`calc_local` 示例里就是这么做的）。已知毛刺：所有实例都用满时 `CreateFile` 会在内核里等，这段等待**不可被 `connect_timeout` 打断**——平台行为，不是本实现的取舍。
