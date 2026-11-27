@@ -5,19 +5,20 @@
 //!
 //! 用法：
 //! ```text
-//! cargo run --release --example bench                 # memory + tcp，64 B，5000 次
-//! cargo run --release --example bench -- tcp 1024 20000 128
-//! cargo run --release --example bench -- memory 0 50000 32
+//! cargo run --release --example bench
+//! cargo run --release --example bench -- tcp 1024 20000 128 0
 //! ```
 //!
-//! 三个位置参数分别是：传输（`memory` / `tcp` / `all`）、payload 字节数、单连接次数、
-//! 并发数。**数字只在同一台机器上横比有意义**，别和文档里的绝对数对线。
+//! 五个位置参数：传输（`memory` / `tcp` / `all`）、payload 字节数、次数、并发数、
+//! 请求期限（毫秒，`0` = 不设期限）。**数字只在同一台机器上横比有意义**，
+//! 别和文档里的绝对数对线。
 
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
 use spile::transport::memory::Memory;
 use spile::transport::tcp::TcpTransport;
@@ -29,10 +30,10 @@ use spile::{
 /// 示例服务：原样回显。只在 `service_id = 7`、`method = 1` 上注册。
 const SERVICE_ID: u16 = 7;
 const METHOD: u64 = 1;
-/// 期限给足：这里量的是往返，不是超时；250 ms 足够跑完任何一次单跳。
-const DEADLINE_MS: u32 = 250;
 /// 预热次数。第一次调用要等握手 `Ready`、第一次 `dispatch` 要建表，混进样本会污染 p99。
 const WARMUP: usize = 200;
+/// mpsc 队列深度，与 `memory` 传输的实现常量同量级，免得下限被容量差异影响。
+const QUEUE: usize = 1024;
 
 struct Echo;
 
@@ -82,14 +83,21 @@ fn us_f(nanos: f64) -> f64 {
     nanos / 1000.0
 }
 
-/// 顺序往返：量单次延迟。每次调用都 `await` 完再发下一次，所以这是**一跳的响应时间**，
-/// 不含排队；批次总时长除以次数就是单连接的吞吐上限。
+fn mean_of(samples: &[u128]) -> f64 {
+    samples.iter().sum::<u128>() as f64 / samples.len() as f64
+}
+
 /// 顺序往返的**采样本体**：每次 `await` 完再发下一次。
 ///
 /// 注意调用它所在的线程：在 `#[tokio::main]` 的阻塞主线程上跑，每次 `await`
-/// 之后线程会真的 park，被唤醒要走一次 futex（本机约 +10 µs）；在 worker 线程
+/// 之后线程会真的 park，被唤醒要走一次 futex（本机约 +6 µs）；在 worker 线程
 /// 里跑则只在本地队列里换任务。两者都要量，因为用户可能从任意上下文发起调用。
-async fn seq_body<S, K>(handle: &SessionHandle<S, K>, payload_len: usize, iters: usize) -> Vec<u128>
+async fn seq_body<S, K>(
+    handle: &SessionHandle<S, K>,
+    payload_len: usize,
+    iters: usize,
+    deadline_ms: u32,
+) -> Vec<u128>
 where
     S: MessageSource + 'static,
     K: MessageSink + 'static,
@@ -97,7 +105,7 @@ where
     let payload = payload_of(payload_len);
     for _ in 0..WARMUP {
         handle
-            .call(SERVICE_ID, METHOD, payload.clone(), DEADLINE_MS)
+            .call(SERVICE_ID, METHOD, payload.clone(), deadline_ms)
             .await
             .expect("预热调用失败");
     }
@@ -106,7 +114,7 @@ where
     for _ in 0..iters {
         let t0 = Instant::now();
         let reply = handle
-            .call(SERVICE_ID, METHOD, payload.clone(), DEADLINE_MS)
+            .call(SERVICE_ID, METHOD, payload.clone(), deadline_ms)
             .await
             .expect("调用失败");
         let dt = t0.elapsed().as_nanos();
@@ -117,6 +125,55 @@ where
     samples
 }
 
+/// 理论下限：两条 mpsc + 一个只做回显的 task，**完全不经过 Session / L1 / L2**。
+///
+/// 差值（`memory` 单跳 − 这一行）就是框架自己（头编解码、pending 表、配额、
+/// 每请求 spawn、span）的成本。没有这把尺子，5 µs 到底算好还是坏无从判断。
+async fn raw_baseline(payload_len: usize, iters: usize) -> Vec<u128> {
+    let (c2s_tx, mut c2s_rx) = mpsc::channel::<Bytes>(QUEUE);
+    let (s2c_tx, mut s2c_rx) = mpsc::channel::<Bytes>(QUEUE);
+    tokio::spawn(async move {
+        while let Some(msg) = c2s_rx.recv().await {
+            if s2c_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let payload = payload_of(payload_len);
+    for _ in 0..WARMUP {
+        c2s_tx.send(payload.clone()).await.expect("send");
+        s2c_rx.recv().await.expect("recv");
+    }
+
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        c2s_tx.send(payload.clone()).await.expect("send");
+        let reply = s2c_rx.recv().await.expect("recv");
+        samples.push(t0.elapsed().as_nanos());
+        assert_eq!(reply, payload);
+    }
+    samples
+}
+
+/// 拆账用的第二把尺子：**每次迭代都 `spawn` 一个空 task 并 `await` 它**。
+///
+/// 服务端每请求都要 spawn 一次（外层兜 panic、里层跑 handler），所以「spawn + join」
+/// 的单价必须单独知道，否则会话的 5 µs 里哪一块是它、哪一块是框架逻辑说不清。
+async fn spawn_baseline(iters: usize) -> Vec<u128> {
+    for _ in 0..WARMUP {
+        tokio::spawn(async {}).await.expect("join");
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        tokio::spawn(async {}).await.expect("join");
+        samples.push(t0.elapsed().as_nanos());
+    }
+    samples
+}
+
 /// 并发吞吐：`conc` 条独立请求流共用一条会话，量墙钟时间。
 /// 每次调用仍然按 id 配对，因此这里也顺带证明「高并发下 pending 表不错配」。
 async fn conc<S, K>(
@@ -124,6 +181,7 @@ async fn conc<S, K>(
     payload_len: usize,
     iters: usize,
     conc: usize,
+    deadline_ms: u32,
 ) -> (f64, usize)
 where
     S: MessageSource + 'static,
@@ -139,7 +197,7 @@ where
         tasks.push(tokio::spawn(async move {
             for _ in 0..per_task {
                 let reply = handle
-                    .call(SERVICE_ID, METHOD, payload.clone(), DEADLINE_MS)
+                    .call(SERVICE_ID, METHOD, payload.clone(), deadline_ms)
                     .await
                     .expect("并发调用失败");
                 assert_eq!(reply, payload);
@@ -153,6 +211,18 @@ where
     (wall, per_task * conc)
 }
 
+fn print_row(label: &str, samples: &[u128]) {
+    println!(
+        "{label} p50={:>7.2}µs p90={:>7.2}µs p99={:>7.2}µs mean={:>7.2}µs  ≈{:>9.0} 次/秒",
+        us(percentile(samples, 0.50)),
+        us(percentile(samples, 0.90)),
+        us(percentile(samples, 0.99)),
+        us_f(mean_of(samples)),
+        1.0e9 / mean_of(samples),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn measure<S, K>(
     label: &str,
     server: Arc<Session<S, K>>,
@@ -160,6 +230,8 @@ async fn measure<S, K>(
     payload_len: usize,
     iters: usize,
     conc_n: usize,
+    deadline_ms: u32,
+    with_raw: bool,
 ) where
     S: MessageSource + 'static,
     K: MessageSink + 'static,
@@ -167,41 +239,39 @@ async fn measure<S, K>(
     // ① worker 线程内：这是「框架自身的往返成本」。
     let mut worker = {
         let handle = handle.clone();
-        tokio::spawn(async move { seq_body(&handle, payload_len, iters).await })
+        tokio::spawn(async move { seq_body(&handle, payload_len, iters, deadline_ms).await })
             .await
             .expect("采样任务 panic")
     };
     worker.sort_unstable();
-    let mean_w = worker.iter().sum::<u128>() as f64 / worker.len() as f64;
 
     // ② 阻塞主线程上：多付的是一次线程 park/unpark，不是框架开销。
-    let mut on_main = seq_body(&handle, payload_len, iters).await;
+    let mut on_main = seq_body(&handle, payload_len, iters, deadline_ms).await;
     on_main.sort_unstable();
-    let mean_m = on_main.iter().sum::<u128>() as f64 / on_main.len() as f64;
 
-    println!("\n=== {label} · payload {payload_len} B · 1 条会话 ===");
-    println!(
-        "顺序(worker) p50={:>7.2}µs p90={:>7.2}µs p99={:>7.2}µs mean={:>7.2}µs  ≈{:>9.0} 次/秒",
-        us(percentile(&worker, 0.50)),
-        us(percentile(&worker, 0.90)),
-        us(percentile(&worker, 0.99)),
-        us_f(mean_w),
-        1.0e9 / mean_w,
-    );
-    println!(
-        "顺序(主线程) p50={:>7.2}µs p90={:>7.2}µs p99={:>7.2}µs mean={:>7.2}µs  ≈{:>9.0} 次/秒 ← 含 park/unpark",
-        us(percentile(&on_main, 0.50)),
-        us(percentile(&on_main, 0.90)),
-        us(percentile(&on_main, 0.99)),
-        us_f(mean_m),
-        1.0e9 / mean_m,
-    );
+    println!("\n=== {label} · payload {payload_len} B · deadline {deadline_ms} ms · 1 条会话 ===");
+    print_row("顺序(worker) ", &worker);
+    print_row("顺序(主线程) ", &on_main);
 
-    let (wall, done) = conc(&handle, payload_len, iters, conc_n).await;
+    let (wall, done) = conc(&handle, payload_len, iters, conc_n, deadline_ms).await;
     println!(
-        "并发  c={conc_n:<3} n={done:<6} wall={wall:>7.3}s  ≈{:>9.0} 次/秒",
+        "并发     c={conc_n:<3} n={done:<6} wall={wall:>7.3}s  ≈{:>9.0} 次/秒",
         done as f64 / wall,
     );
+
+    if with_raw {
+        let mut raw = tokio::spawn(async move { raw_baseline(payload_len, iters).await })
+            .await
+            .expect("下限采样任务 panic");
+        raw.sort_unstable();
+        print_row("裸 mpsc 下限", &raw);
+
+        let mut spawn_cost = tokio::spawn(async move { spawn_baseline(iters).await })
+            .await
+            .expect("spawn 采样任务 panic");
+        spawn_cost.sort_unstable();
+        print_row("空 spawn+join", &spawn_cost);
+    }
 
     // 会话要活到最后一行打印完：`Session::drop` 会宣告关闭并取消两个 task。
     drop(handle);
@@ -218,10 +288,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(64, |v| v.parse().expect("payload 字节数"));
     let iters: usize = args.next().map_or(5_000, |v| v.parse().expect("次数"));
     let conc_n: usize = args.next().map_or(64, |v| v.parse().expect("并发数"));
+    let deadline_ms: u32 = args.next().map_or(250, |v| v.parse().expect("期限毫秒"));
+    let with_raw = std::env::var("BENCH_RAW").is_ok_and(|v| v != "0");
 
     println!(
-        "spile 往返基准：transport={target} payload={payload_len}B iters={iters} conc={conc_n} \
-         （release 构建；数字只用于同机横比）"
+        "spile 往返基准：transport={target} payload={payload_len}B iters={iters} \
+         conc={conc_n} deadline={deadline_ms}ms raw_baseline={with_raw} \
+         （release；数字只用于同机横比）"
     );
 
     if target == "memory" || target == "all" {
@@ -241,6 +314,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload_len,
             iters,
             conc_n,
+            deadline_ms,
+            with_raw,
         )
         .await;
         client.close().await.ok();
@@ -275,6 +350,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload_len,
             iters,
             conc_n,
+            deadline_ms,
+            false,
         )
         .await;
         client.close().await.ok();
