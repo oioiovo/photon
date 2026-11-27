@@ -2,10 +2,11 @@
 
 > 一个用 Rust 实现的轻量 RPC / IPC 框架。目标：小巧、高效、可扩展。
 >
-> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落九块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。剩下 `Interceptor` 与 `tracing` span 仍在 M3。
+> 当前阶段：**M3 进行中 — 声明形态 + 超时/取消/通知 + 关停 + 握手协商 + 同步客户端 + span 贯穿 + 三传输示例**（trait 一次声明即得 client stub / dispatch / 注册函数；`local_calc`（memory，单进程）、`calc_local`（UDS，两进程）、`examples/calc-split`（TCP，三 crate）三条链路都跑通；并发用例在 `memory` 与 `tcp` 上各跑一遍）。M3 已落十块：① 同步 handler 与调度分流；② 超时 / 取消 / 通知；③ `GoAway` 双向收尾 + 急停；④ 握手协商的双向验收；⑤ `calc_local` 两进程 UDS；⑥ `local_calc` 十行输出覆盖 10.3 全部七种形态（含 stub 的 `with_deadline` 与同步客户端）；⑦ 错误通道解耦（v0.31 重做：契约零框架类型、业务错误原样往返、框架码只描述框架判定）；⑧ `PayloadMode` 的类型与方法级 opt-in；⑨ 同步客户端 `<Svc>BlockingClient`（自带线程 + runtime，协议期限 / 本地期限两层）。⑩ `Interceptor` 链（v0.32：自研、不接 `tower`、零新依赖、空链零成本，11 条用例）。M3 清单自此全空。
 >
-> 版本：**v0.31.1**（**更名，代码与线格式零改动**）：项目、仓库根目录与两个 crate 由 `photon` / `photon-macros` 更名为 `spile` / `spile-macros`；宏路径随之是 `#[spile::service]`、`#[spile(blocking)]`、`#[spile(zero_copy)]`，宏生成的工具模块从 `__photon_<snake>` 变成 `__spile_<snake>`，span 名从 `photon.call` / `photon.request` 变成 `spile.call` / `spile.request`；`protocol_version` 仍是 **2**，字节布局、校验清单与七条黄金样例一字未动。
-> 上一版（v0.31）（错误模型与契约解耦：契约里不再出现任何框架类型——`async fn add(..) -> i64`、`async fn div(..) -> Result<i64, CalcError>`，`CalcError` 由契约自己定义、自己编码。错误帧由 `flags` bit3 分两条：框架帧仍是 `code u8 | reserved u8 | message`（`code` 只保留 `0..=7`，**删掉业务码段与 `retryable` 字段**，重试性改由规范里的静态表给出），业务帧的 payload 就是 `E` 的 codec 字节、框架一个字节都不解释。删 `ErrorCode`/`ServiceError`/`RemoteError`/`RpcError::Remote`，新增 `PeerRejected { code, message }` 与 `HandlerError`/`CallFailure`/`CallError<E>`；客户端可失败方法交出 `CallError<E>`，不可失败方法交出 `RpcError`。线格式语义变更 → `protocol_version` 1 → 2。)
+> 版本：**v0.32**（**Interceptor 链落地：自研、零新依赖、线格式零改动**）：`spile::interceptor` 给出两条字节级链——`ClientInterceptor` / `ServerInterceptor`，配 `ClientCall` / `ServerCall`（只读上下文；路由字段不给 setter，只有 `with_deadline` / `with_payload` 两个派生口）与 `ClientNext` / `ServerNext`（洋葱顺序，`ClientNext: Clone` 支持重放）。注册走 `SessionOptions::client_interceptor` / `server_interceptor`；`Session::call` 拆成「进链」(`call_named`) + 「单次尝试」(`send_once`)，空链直接短路到 `send_once`，存量调用不多一次虚调用；`SessionHandle::call_named` 把方法名带进 ctx，宏 stub 与同步客户端改走它；服务端 `dispatch` 的 handler 臂改经 `call_through_chain`。不设 feature、不加依赖，`protocol_version` 仍是 **2**。
+> 上一版（v0.31.1）（**更名，代码与线格式零改动**）：项目、仓库根目录与两个 crate 由 `photon` / `photon-macros` 更名为 `spile` / `spile-macros`；宏路径随之是 `#[spile::service]`、`#[spile(blocking)]`、`#[spile(zero_copy)]`，宏生成的工具模块从 `__photon_<snake>` 变成 `__spile_<snake>`，span 名从 `photon.call` / `photon.request` 变成 `spile.call` / `spile.request`；`protocol_version` 仍是 **2**，字节布局、校验清单与七条黄金样例一字未动。
+> 更早（v0.31）（错误模型与契约解耦：契约里不再出现任何框架类型——`async fn add(..) -> i64`、`async fn div(..) -> Result<i64, CalcError>`，`CalcError` 由契约自己定义、自己编码。错误帧由 `flags` bit3 分两条：框架帧仍是 `code u8 | reserved u8 | message`（`code` 只保留 `0..=7`，**删掉业务码段与 `retryable` 字段**，重试性改由规范里的静态表给出），业务帧的 payload 就是 `E` 的 codec 字节、框架一个字节都不解释。删 `ErrorCode`/`ServiceError`/`RemoteError`/`RpcError::Remote`，新增 `PeerRejected { code, message }` 与 `HandlerError`/`CallFailure`/`CallError<E>`；客户端可失败方法交出 `CallError<E>`，不可失败方法交出 `RpcError`。线格式语义变更 → `protocol_version` 1 → 2。)
 > 更早（v0.30）（删掉 `spile/examples/` 里两个被 `examples/calc-split` 完全覆盖的示例：`calc_server.rs` 与 `calc_client.rs`。同一个 TCP 往返有两条命令、两处预期输出要同步，上一轮那个 `--addr` 的 bug 就出在这里；而它们相对 `calc-split` 没有任何独有信息。留下的三个各有不可替代的角色——`echo` 是唯一绕过 Session 的 L1/L2 证据，`local_calc` 是唯一的 API 面全量（一条命令七形态），`calc_local` 是唯一的 `local` feature 端到端。代码与线格式零改动。
 > 更早（v0.29.1）（修文档里三处跑不起来的命令：示例读的是**第一个位置参数**（`std::env::args().nth(1)`），不是 `--addr` 选项，照 `--addr 127.0.0.1:7001` 抄会得到 `AddrParseError(Socket)`。10.3 / 10.4 的命令与「`--addr` 可覆盖」的说明一并改成位置参数。代码零改动。
 > 更早（v0.29）（示例补上「真实发布形态」：`examples/calc-split/` 是一个独立的嵌套 workspace，三个成员分别是契约 `calc-api`（只有 trait 与码段常量）、服务端程序 `calc-server`（impl + main）、客户端程序 `calc-client`（只依赖契约、只调 stub）。判据是依赖树与符号：`cargo tree -p calc-client | grep calc-server` 为空、`nm target/debug/calc-client | grep -c Calculator` = 0，而服务端有 37 个符号。框架代码零改动，线格式零改动。
@@ -58,6 +59,7 @@
 
 | **v0.18** | **M2 收尾：服务端装配、客户端连接、示例与并发验收，线格式零改动**。① **`Server<T>`**：`bind(ep, transport_opts, session_opts)` → `register`（撞号 `Err` 不覆盖）→ `serve` / `serve_with`。注册表**按值**持有、`serve` 时才包 `Arc`：把「运行中改注册表」从类型上排除，比事后加锁便宜；`registry()` 交出 `&mut ServiceRegistry` 让宏生成的 `register_calc(server.registry(), svc)` 直接可用，`transport()` 交出 listener（端口写 `0` 的测试靠它拿真地址）。accept 循环里连接级错误（`ConnectionAborted` / `ConnectionReset` / `Interrupted` / `WouldBlock`）记一行继续，listener 级错误才返回 `Err`——`while let Ok(..)` 会把 listener 死亡静默吞掉。② **`Session::wait_closed()`**：`closed: Arc<Notify>` + 进 `Closed` 的唯一写点；`serve` 循环靠它知道「这条连接不用再持有」。**先建 waiter 再看状态**，反序会丢通知并留下永久等待。③ **客户端拆成两步**：`connect::<T>(ep, ConnectOptions)` 拿 `SessionHandle`，`CalcClient::new(handle)` 包一层。原因是 `CalcClient` 只泛型化到半身 `CalcClient<S, K>`——`Memory::pair` 不实现 `Transport`，若 stub 绑在 `Transport` 上，`local_calc` 根本用不了同一份 stub；`connect` 本身还要等握手到 `Ready`（`codec_id`/版本不符在 connect 上就报错，而不是第一次业务调用超时）。④ **示例**：`examples/calc_service/mod.rs`（共用 `Calc` 服务，两个 example `#[path]` 各引一次）、`local_calc`（memory pair，四条输出与 10.5 逐字一致）、`calc_server`/`calc_client`（TCP，客户端 50 ms 间隔重试、2 s 预算）。⑤ **`tests/concurrency.rs`**：32 并发 + 100 乱序，同一套断言在 `memory` 与 `tcp` 上各跑一遍，比对「每个请求拿到的是不是自己的值」，整体套 10 s 超时（卡住必须变失败）。变异验证：把 dispatch 的已注册分支改成不可达 → 两条用例同时红。⑥ 全量 39 + 1 + 2 + 9 + 8 + 16 + 21 + 3 全绿。**同步改动**：`detail/03`（`wait_closed` / `set_closed` 的写法与原因）、`detail/04`（§4 stub 改为半身泛型、§10 三小节按实现重写）、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
 | **v0.19** | **M3 第一步：三档声明形态与调度分流，线格式零改动**。① **宏**：`async fn` / `fn` / `#[spile(blocking)] fn` 三档都接受，形态判定在展开期写死（`MethodKind::{Async, Sync, Blocking}`），`rewrite_sigs` 只改 `async fn`（同步 `fn` 本来就没有 future 可改写）；方法级 `#[spile(...)]` 展开后从 trait 上摘掉——留着 rustc 会去解析一个不存在的属性并报错。② **dispatch 三分支**：`async` 分支 await；`fn` 分支包进 async 块首 poll 就地跑完（不换线程）；`blocking` 分支 `spawn_blocking`，**decode 搬进闭包**（它也是 CPU 工作），`JoinError` 映射 `Internal`（线上按 `0` 兜底）。③ **`Service::schedule(method) -> Schedule`**：额度必须在「进 handler」之前扣，那时只有 `service_id + method`，还看不到实现内部分支——所以调度类别由生成代码交出来（默认 `Async`，只有 `blocking` 方法生成 `Blocking`；没有 blocking 方法时干脆不生成，用 trait 默认实现）。④ **入站配额拆两张**：`InboundQuota{async_used, blocking_used}` + `try_acquire(Slot)` 一次持锁完成「检查 + 计数」，`InboundGuard` 按 slot 归还；阻塞池满时异步请求照跑。⑤ **debug 慢 handler 告警**：超过 100 µs 打 `tracing::warn` 提示加 `#[spile(blocking)]`；顺手把 handler panic 也改成 `tracing::error!`（原来只回包不记日志，服务端看起来「什么都没发生」）。⑥ **验收**：`tests/service_macro.rs` 12 条（同步就地执行、blocking 走线程池、blocking panic 不挂住、`schedule` 逐方法正确）、`tests/session.rs` 18 条（新增「阻塞额度只有 1 个 → 一次成功两次过载、异步不受影响」，`memory`/`local` 各一遍）、`tests/compile-fail/` 换成 `blocking_on_async` / `unknown_method_attr`（`sync_method` 已合法，删除）。变异验证：把 `Schedule::Blocking` 也映射到 `Slot::Async` → 两条配额用例同时红。全量 39 + 1 + 2 + 9 + 12 + 18 + 21 + 3 全绿。**同步改动**：`detail/04`（§3 属性表标未实现、§4 产物补 `schedule`、§5 三分支与 `schedule`、§9 检查表与 trybuild 清单）、`detail/03`（§6.2 补 slot 选择与阻塞分支的 `JoinError`、§6.3 补慢 handler 告警）、`design.md` 5.1 / 5.3 片段、`detail/00` 与 `PROTOCOL.md` 版本指向（字节布局与 17 条校验一字未动）。
+| **v0.32** | **Interceptor 链落地（自研，零新依赖，线格式零改动）**。① 新增 `spile/src/interceptor.rs`：`ClientInterceptor` / `ServerInterceptor` 两条字节级链；`ClientCall` / `ServerCall` 是只读上下文（`service_id` / `method` / `method_name` / `deadline_ms` / `payload`，服务端另有 `request_id`），路由字段无 setter，只有 `with_deadline` / `with_payload`；`ClientNext` / `ServerNext` 洋葱顺序，`ClientNext` 实现 `Clone` 以支持重放。② `SessionOptions.interceptors` + 两个 builder，`Session` 建会话时拷入链。③ `Session::call` 拆成 `call_named`（进链）+ `send_once`（单次尝试），空链快路径直连 `send_once`。④ `SessionHandle::call_named` 把方法名带进 ctx，宏 stub 与阻塞客户端改走它（与 `spile.call` span 同源）。⑤ 服务端 `dispatch` 的 handler 臂改经 `call_through_chain`。⑥ 不设 feature、不加依赖；`protocol_version` 仍是 2；`tests/interceptor.rs` 11 条。 |
 | **v0.31.1** | **更名：`photon` → `spile`，代码与线格式零改动**。① 仓库根与两个 crate 目录改名，`spile-macros` 的 `path` 依赖与 `Cargo.lock` 随之更新。② 宏路径 `#[spile::service]` / `#[spile(blocking)]` / `#[spile(zero_copy)]`，工具模块 `__photon_<snake>` → `__spile_<snake>`。③ span 名 `spile.call` / `spile.request`。④ 示例里的 UDS 默认路径与 demo 常量改名。⑤ `protocol_version`、字节布局、校验清单与黄金样例不变。 |
 | **v0.31** | **错误模型与契约解耦，`protocol_version` 1 → 2**。① **契约零框架类型**：方法只写 `-> T` 或 `-> Result<T, E>`（`E` 自定、只需 `Codec`），写 `Result<T, RpcError>` 展开期报错；删服务级 `error = E`、`ServiceError`、`ErrorCode`。② **两条错误通道**：`flags` 启用 bit3，`0x01` = 框架判定（2 字节前缀 `code u8 | reserved u8` + message，`code` 只留 `0..=7`）、`0x09` = 业务拒绝（payload 就是 `E` 的编码，0 字节合法）。③ **删业务码段与 `retryable` 字段**，框架码重试性改成规范静态表。④ **新增 `HandlerError` / `CallFailure` / `CallError<E>`，删 `RemoteError` 与 `RpcError::Remote`**，改用 `PeerRejected { code, message }`；回包侧不再「伪造远端错误」。 |
 | **v0.30** | **删掉被替代的两个示例，代码零改动**。① **删** `spile/examples/calc_server.rs`（39 行）与 `calc_client.rs`（62 行）：它们的 TCP 往返与 `examples/calc-split` 完全重复，且相对三 crate 形态没有任何独有信息；保留只会产生两份命令、两份预期输出，同步义务落空时就是文档骗人（v0.29.1 的 `--addr` 即此）。② **留存判据**：`echo.rs`（唯一绕过 Session 的裸字节往返，是「L1 单独可用」的证据）、`local_calc.rs`（唯一把七种 API 形态塞进一个文件、一条命令跑完）、`calc_local.rs`（唯一端到端跑 `local` feature）。③ **代价与补偿**：`spile/examples/` 里不再有「纯客户端」示例，所以「业务逻辑不进客户端二进制」这条判据改由 `examples/calc-split` 守（`nm target/debug/calc-client | grep -c Calculator` = 0、`cargo tree -p calc-client | grep calc-server` 为空），形态更强（跨依赖边界而不是跨文件）。④ 文档同步：1.3 目录树、10.1 表、10.3/10.4/10.5 命令与预期输出、M2 清单条目、10.6/10.7、`detail/04` §11、`calc_service/{api,imp}.rs` 与 `calc_local.rs` 的头部注释。 |
@@ -104,7 +106,7 @@
 
 | 阶段 | 可能新增的直接依赖 | 处理方式 |
 |---|---|---|
-| M3 | `tower`（Interceptor 插槽想复用 `tower::Service` / `Layer`） | 做成可选 feature `interceptor`，不进默认集 |
+| M3 | `tower`（Interceptor 插槽曾想复用 `tower::Service` / `Layer`） | **v0.32 定案：不接**，自研薄链（见插槽 3）。依赖线仍是 8 个，也没有新增 feature |
 | M5 | `crossbeam-utils`（`CachePadded`，仅 `shm` 需要） | 已锁在 `shm` feature 内，不破线 |
 
 **MSRV：1.85。** 这是 `edition = "2024"` 的下限，也是 `impl Trait` in trait、`Box`/`Arc` 接收者等本设计用到的特性都能满足的最低版本。文档里说「Rust 1.75 之后有 AFIT」只是说明不必用 `async-trait`，不代表 MSRV 是 1.75——**两件事不要混**。CI 固定跑 1.85 与当前 stable 两档。
@@ -263,12 +265,12 @@ spile/                          # workspace 根
 | `memory` | ✅ | `transport/memory.rs` | 常开：接口验收与单元测试的基础 |
 | `local` | ❌ | `transport/local.rs` | Unix 手搓 UDS（零新依赖）；Windows 未实现，开启即编译失败 |
 | `shm` | ❌ | `transport/shm.rs` | M5；依赖 `shared_memory` + `crossbeam-utils` |
-| `interceptor` | ❌ | 接 `tower::Service` / `Layer` | M3 评估后再引入；它会把直接依赖推到 9 个，所以不进默认集（见 0 节） |
+| `interceptor` | — | **v0.32 起不存在此 feature**：`spile::interceptor` 常开编译 | 原计划接 `tower` 并做成可选 feature；v0.32 改自研后零外部依赖、也没有可省的编译成本，做成 feature 只会让「默认拿不到拦截器」 |
 | `codec-postcard` | ✅ | `proto/codec.rs` | 默认 codec |
 | `codec-rkyv` | ❌ | 零拷贝 codec | M5，与 `shm` 配套引入 |
-| `full` | ❌ | **随里程碑长大**：M3 之前 = `local`；M3 起 = `local` + `interceptor` | 便于 CI 一次性覆盖。**不含 `shm` / `codec-rkyv`**——M5 之前 `--all-features` 必然编译失败，别把它当成 `--all-features` 的替身 |
+| `full` | ❌ | **随里程碑长大**：M3 之前 = `local`；v0.32 起 = `local`（`interceptor` 已不是 feature） | 便于 CI 一次性覆盖。**不含 `shm` / `codec-rkyv`**——M5 之前 `--all-features` 必然编译失败，别把它当成 `--all-features` 的替身 |
 
-> **`full` 不能写死成一个固定集合（v0.8 修）。** 它的成员里曾有 `blocking` / `interceptor`，而这两个的源码到 M3 才存在（`blocking` 后因不需要 feature 而删除，见 5.5）；而 CI 从 M0 就跑 `--features full`。写死成三项的结果是 M0–M2 的 CI 全红。两种解法：让 `full` 按里程碑演进（本文采用），或者让 CI 从 M3 才跑 `full`（M0–M2 只跑 `default` + `local`）。**不要在 M0 的 `Cargo.toml` 里提前声明一个空 feature 来糊弄**——空 feature 会让 `--features full` 假装成功，掩盖真实缺口。
+> **`full` 不能写死成一个固定集合（v0.8 修）。** 它的成员里曾有 `blocking` / `interceptor`，而这两个的源码到 M3 才存在（`blocking` 后因不需要 feature 而删除，见 5.5；`interceptor` 在 v0.32 同样取消——自研后它零依赖、无编译成本可省）；而 CI 从 M0 就跑 `--features full`。写死成三项的结果是 M0–M2 的 CI 全红。两种解法：让 `full` 按里程碑演进（本文采用），或者让 CI 从 M3 才跑 `full`（M0–M2 只跑 `default` + `local`）。**不要在 M0 的 `Cargo.toml` 里提前声明一个空 feature 来糊弄**——空 feature 会让 `--features full` 假装成功，掩盖真实缺口。
 
 **默认 feature 的选择原则**：默认集必须能在 Windows 与 Linux 上**零额外系统依赖**跑通，且**不引入需要用户主动防范的失败模式**。所以：
 
@@ -1281,9 +1283,35 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 
 ### 插槽 3：`Interceptor`
 
-中间件链：tracing、metrics、超时、重试、鉴权。
+中间件链：tracing、metrics、超时、重试、鉴权。**v0.32 落地，自研，不接 `tower`。**
 
-> 不想自己写就直接复用 `tower::Service` / `tower::Layer`，tokio 生态的超时、限流、重试、`tracing` 中间件全是现成的。建议 M3 接进来，不要自己撸一套。
+**为什么最后没用 `tower`**（本文 v0.6–v0.31 一直写着「建议接进来」，v0.32 改判）：
+
+1. **形状不匹配。** `tower::Service` 的核心是 `poll_ready` —— 先预留、再调用，为的是连接池 / 限流的背压。我们的调用是「一次 `call` 一次往返」，`poll_ready` 这一段没有语义，每个中间件都得写一个恒 `Ready` 的样板。
+2. **依赖预算。** 默认集只剩 1 个余量（8 → 9 就是 0 节那条警报线）。做成可选 feature 又等于「拦截器默认不可用」，与它「零成本钩子」的定位相反；不做 feature 就把线踩破。两条路都不好。
+3. **语义不认我们的协议。** `tower` 生态的中间件按 HTTP 写（状态码、header、`RetryPolicy`），而我们的失败面是 `CallFailure::Failed(RpcError)` / `CallFailure::Rejected(E)`，服务端是 `HandlerError`。翻译这层映射的代码量，已经超过写一条链的成本。
+
+**形状**（`spile/src/interceptor.rs`，一个文件，零外部依赖）：
+
+| 类型 | 角色 |
+|---|---|
+| `ClientCall` / `ServerCall` | 交给拦截器的只读上下文：`service_id`、`method`、`method_name`、`deadline_ms`、`payload`；服务端另有 `request_id` |
+| `ClientNext` / `ServerNext` | 「链的剩余部分 + 真实动作」，只有一个方法 `run(call)` |
+| `ClientInterceptor` / `ServerInterceptor` | 唯一方法 `intercept(&self, call, next) -> BoxFuture<...>` |
+
+`ClientCall` 只有两个派生口：`with_deadline` 与 `with_payload`。**路由字段（`service_id` / `method`）不给 setter** —— 拦截器能改时限、能改字节、能短路，但不能把请求改投到别的方法：那会让「日志里的方法名」与「实际执行的 handler」分家，而 span、限流、幂等全建立在这个等号上。
+
+**三条性质**：
+
+1. **顺序是洋葱。** 先注册的在最外层：进入按注册顺序、退出逆序（与 `tower::Layer` 一致）。`Interceptors::with_client` / `with_server` 是 append，所以「先加的先生效」。
+2. **不许翻译错误通道。** 客户端链返回 `Result<Bytes, CallFailure>`、服务端返回 `Result<Bytes, HandlerError>`：只能透传或短路，不能把 `Rejected(E)` 换成 `Failed(...)`。否则 3.8 那条「业务错误原样到达调用方」在链里就断了（`tests/interceptor.rs::business_rejection_passes_through_the_chain_untouched` 钉住这条）。
+3. **空链零成本。** `Session::call_named` 先看 `chain.first()`，空则直连 `send_once`：不构造 `Next`、不多一次 `Box::pin`。没用拦截器的存量调用，连一次虚调用都不多。
+
+**重试在客户端是对的，在服务端不建议。** `ClientNext` 实现 `Clone`，重试的写法是 `next.clone().run(call.clone())` —— 每次重放都由 `send_once` 分配新的 `request_id`，不会命中上一轮残留的 pending 表项（`replay_gets_a_fresh_request_id` 用「服务端只在第一轮拒绝」验的就是这条）。`ServerNext` 故意**不实现 `Clone`**：handler 可能有副作用，而协议里没有幂等键，重放等于把「客户端的选择」变成「服务端的风险”。
+
+**方法名怎么进 ctx。** 宏生成的 stub 调 `SessionHandle::call_named(..., Some("add"), ...)`，同步客户端（`blocking` dispatcher）也一样 —— 那个字面量与 `spile.call` span 用的是**同一个**编译期常量（`INV-30` 的要求）。手写 `Service` 的实现不给 `method_name` 时，ctx 里是 `None`，链上看到的是 `<unknown>`，不影响功能。
+
+**不进协议。** 拦截器纯本端：不进握手、不改字节布局、`protocol_version` 不动。对端没有拦截器也能正常通信 —— 它只影响本端怎么看待一次调用。同理，通知（`Notification`）**不过链**：它没有回包，也就没有「拦截」这个词可言。
 
 ### 插槽 4（预留，未实现）：调度策略
 
@@ -1481,7 +1509,7 @@ v0.7 规定：检测到 runtime 上下文只告警、不硬拒绝（`spawn_block
 - [x] `GoAway` 优雅关闭 + 急停（`flags` bit2）+ 按 4.6 的状态表实现两个方向——v0.21 落地（`Session::abort()`、`ingress_draining` 只在双方宣告后置位、收到宣告后排空即收尾）
 - [x] `PayloadMode` 策略落地（默认 Copy；`ZeroCopy` 只对 `fn` + `#[spile(zero_copy)]` 开放，见 4.5）——v0.26 落地（`Service::payload_mode` + 展开期护栏；全局开关随 shm）
 - [x] 错误通道解耦——v0.31 落地（契约零框架类型：`-> T` / `-> Result<T, E>`；错误帧按 `flags` bit3 分框架/业务两条，业务帧 payload 就是 `E` 的编码；`CallError<E>` 在 stub 边界分开 `Rejected` 与 `Failed`；框架码 `0..=7` + 静态重试表）
-- [ ] `Interceptor` 链（或接 `tower`，走 `interceptor` feature）
+- [x] `Interceptor` 链（自研，**不接 `tower`**，无 feature）——v0.32 落地（`spile::interceptor`：`ClientInterceptor` / `ServerInterceptor` 两条字节级链、`ClientNext: Clone` 支持重放、空链快路径、`SessionHandle::call_named` 把方法名带进 ctx、服务端 `dispatch` 经 `call_through_chain`；`tests/interceptor.rs` 11 条，含顺序 / 短路 / 重试 / 请求号 / 业务错误透传）
 - [x] `tracing` span 贯穿（span 带 `method_name`，见 3.5）——v0.28 落地（客户端 `spile.call` + 服务端 `spile.request`，`method_name` 走 `Service::method_name`，`request_id` 由 `Session::call` 回填；`tests/tracing_spans.rs` 2 条 + 4 条变异）
 - [x] `examples/calc_local.rs`：两进程本地 IPC，验证「换 transport 不改业务代码」——v0.23 落地（同一二进制 `server` / `client` 两角色，默认 `/tmp/spile-calc.sock`）
 - [x] **`fn` 声明 + `#[spile(blocking)]` 两种展开**（见 5.2 / 5.3）——v0.19 落地（三分支 + `schedule`）

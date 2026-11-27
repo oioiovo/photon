@@ -10,6 +10,7 @@
 pub mod blocking;
 pub mod codec;
 pub mod error;
+pub mod interceptor;
 pub mod proto;
 pub mod session;
 pub mod transport;
@@ -20,6 +21,10 @@ pub use bytes::Bytes;
 pub use codec::Codec;
 pub use error::{
     BUSINESS_CODE_MARK, CallError, CallFailure, FRAMEWORK_CODE_MAX, HandlerError, RpcError,
+};
+pub use interceptor::{
+    ClientCall, ClientInterceptor, ClientNext, Interceptors, ServerCall, ServerInterceptor,
+    ServerNext,
 };
 pub use session::{
     ConnectOptions, Server, ServiceRegistry, Session, SessionHandle, SessionOptions,

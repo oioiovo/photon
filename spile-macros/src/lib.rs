@@ -272,7 +272,13 @@ fn expand(
             quote! {
                 ::spile::__private::instrument(span, self
                     .handle
-                    .call(Self::SERVICE_ID, #helper::#hash, payload, self.deadline_ms))
+                    .call_named(
+                        Self::SERVICE_ID,
+                        #helper::#hash,
+                        ::std::option::Option::Some(#name_str),
+                        payload,
+                        self.deadline_ms,
+                    ))
                     .await
             },
         );

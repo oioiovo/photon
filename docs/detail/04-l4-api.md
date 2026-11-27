@@ -248,9 +248,9 @@ match <S as Ledger>::withdraw(&*me, amount).await {
 ```rust
 #[spile::service(id = 8)]
 trait Mixed {
-    async fn add(&self, ..) -> Result<i64, RpcError>;
+    async fn add(&self, ..) -> Result<i64, CalcError>;
     #[spile(zero_copy)]
-    fn digest(&self, data: Vec<u8>) -> Result<u64, RpcError>;   // 仅同步 fn
+    fn digest(&self, data: Vec<u8>) -> Result<u64, CalcError>;   // 仅同步 fn
 }
 
 // 生成的 impl Service 里多一段
@@ -264,6 +264,63 @@ fn payload_mode(&self, method: u64) -> ::spile::PayloadMode {
 所以这一步落的是三件**不涉及代码生成结果**的事：类型（`PayloadMode`）、通路（`Service::payload_mode` 与 `schedule` 并列）、护栏（`zero_copy` 只对同步 `fn` 放行）。护栏是唯一有立即收益的部分：把「async handler 攥住槽位」这种错误提前到编译期，而不是等 M5 在线上表现为「环被填满、通道停摆」。
 
 **`SessionOptions` 不加 `payload_mode`**：v1 里没有任何路径会读它——加了就是一个收下不用的参数，和 `Memory::pair` 去掉 `opts` 是同一条理由。M5 加总闸时用户代码不用改，因为 `#[spile(zero_copy)]` 已经存在，语义（全局关时方法标了也不生效）也已经定死。
+
+## 5.3 拦截器：字节级、两条链（v0.32）
+
+**位置。** 链不在宏里，在 `Session` 上：客户端拦截器包住「一次 `send_once`」，服务端拦截器包住「一次 `Service::call`」。所以它天然覆盖所有方法、所有声明形态（`async fn` / `#[spile(blocking)]` / 同步 `fn` 的 blocking 客户端），宏一个字节都不用改。
+
+**注册**（`SessionOptions`）：
+
+```rust
+let server_opts = SessionOptions::default()
+    .server_interceptor(Metrics::new())      // 先加的在最外层
+    .server_interceptor(Authz::new());
+
+let client_opts = SessionOptions::default()
+    .client_interceptor(Retry::new(2));      // 最外层：先看到失败，才谈得上重试
+```
+
+链在建会话时**拷进** `Session`（`Interceptors` 内部是 `Arc<[…]>`，拷的只是引用计数），之后再改 `SessionOptions` 不影响已有会话。
+
+**形状**（`spile::interceptor`，全部 re-export 到 crate 根）：
+
+```rust
+pub trait ClientInterceptor: Send + Sync + 'static {
+    fn intercept<'a>(&'a self, call: ClientCall, next: ClientNext<'a>)
+        -> BoxFuture<'a, Result<Bytes, CallFailure>>;
+}
+
+pub trait ServerInterceptor: Send + Sync + 'static {
+    fn intercept<'a>(&'a self, call: ServerCall, next: ServerNext<'a>)
+        -> BoxFuture<'a, Result<Bytes, HandlerError>>;
+}
+```
+
+`ClientCall` / `ServerCall` 是只读上下文：
+
+| 字段 | 客户端 | 服务端 | 说明 |
+|---|---|---|---|
+| `service_id` / `method` | ✅ | ✅ | **无 setter**：不许改路由 |
+| `method_name` | `Option<&'static str>` | `&'static str`（缺省 `<unknown>`） | 与 `spile.call` span 同一个常量 |
+| `deadline_ms` | ✅ | ✅ | 客户端可用 `with_deadline` 缩短；0 = 不设期限 |
+| `payload` | ✅ | ✅ | 可用 `with_payload` 换掉（注入 / 脱敏 / 压缩） |
+| `request_id` | — | ✅ | 服务端用它关联日志；**链不能改它** |
+
+**四个必须遵守的约定**：
+
+1. **顺序是洋葱**：`a` 先注册 → `a:in, b:in, b:out, a:out`（`client_chain_runs_in_registration_order_outermost_first` 与同名的 server 版钉住）。
+2. **只许透传或短路，不许翻译错误通道**：`Rejected(E)` 不许变 `Failed(...)`；服务端 `HandlerError::Business` 不许改成 `Framework`。否则 5.1 的「业务错误原样到达调用方」就断在链里（`business_rejection_passes_through_the_chain_untouched`）。
+3. **空链不留税**：`Session::call_named` 与 `call_through_chain` 都有 `chain.split_first()` 的直连分支——没有拦截器时不构造 `Next`、不额外 `Box::pin`。
+4. **重放只在客户端做**：`ClientNext: Clone`，写法 `next.clone().run(call.clone())`；服务端 `ServerNext` **故意不可 Clone**（handler 有副作用、协议没有幂等键）。
+
+**和别的层的关系**：
+
+- **不进协议**：不进握手、不改字节布局、`protocol_version` 仍是 2。对端有没有拦截器与本端能否通信无关。
+- **通知不过链**：`Notification` 没有回包，不进 `call_named` 那条路径。
+- **同步客户端继承客户端链**：`<Svc>BlockingClient` 的 dispatcher 走的是 `SessionHandle::call_named`，链照常生效，只是跑在专属线程的 runtime 上。
+- **`method_name` 的来源**：宏 stub 与 blocking dispatcher 都把编译期常量传给 `call_named`；手写 `Service` 靠 `Service::method_name` 给服务端那一侧。
+
+**验收（`tests/interceptor.rs`，11 条）**：客户端 / 服务端各自的洋葱顺序、空链、客户端短路（服务端计数为 0）、服务端短路（变 `PeerRejected{7}`）、业务拒绝透传、`ctx` 字段（含 `deadline_ms` 与 `request_id`）、重试成功一次、重放换新 `request_id`、`with_deadline` 缩短后仍能返回。
 
 ## 6. 配额与线程池
 

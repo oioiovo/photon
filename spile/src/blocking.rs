@@ -364,7 +364,13 @@ async fn dispatcher<S, K>(
                 );
                 tokio::spawn(
                     async move {
-                        let call = handle.call(service_id, method, payload, deadline_ms);
+                        let call = handle.call_named(
+                            service_id,
+                            method,
+                            method_name,
+                            payload,
+                            deadline_ms,
+                        );
                         let result = match timeout {
                             Some(limit) => match tokio::time::timeout(limit, call).await {
                                 Ok(result) => result,

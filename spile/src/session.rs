@@ -30,6 +30,10 @@ use tracing::Instrument as _;
 use crate::{
     Schedule, Service,
     error::{BUSINESS_CODE_MARK, CallFailure, HandlerError, RpcError},
+    interceptor::{
+        ClientCall, ClientInterceptor, ClientLeaf, ClientNext, Interceptors, ServerCall,
+        ServerInterceptor, ServerNext,
+    },
     proto::{
         Decoded, FLAG_BUSINESS, FLAG_ERR, FLAG_GOAWAY_FORCE, HEADER_LEN, Header, Kind,
         MAX_MESSAGE_LEN, error_body,
@@ -63,6 +67,8 @@ pub struct SessionOptions {
     pub max_async_in_flight: usize,
     /// 入站阻塞 handler 并发上限（M1 尚无 blocking 分支，先占位）。
     pub max_blocking_in_flight: usize,
+    /// 两条拦截器链。默认空——空链走的是没有额外分配的快路径。
+    pub interceptors: Interceptors,
 }
 
 impl Default for SessionOptions {
@@ -73,7 +79,25 @@ impl Default for SessionOptions {
             handshake_timeout: Duration::from_secs(1),
             max_async_in_flight: 1024,
             max_blocking_in_flight: 256,
+            interceptors: Interceptors::new(),
         }
+    }
+}
+
+impl SessionOptions {
+    /// 追加一个客户端拦截器（最先追加的在最外层）。
+    ///
+    /// 建会话时拷进 `Session`，之后改 options 不再影响已有会话——拦截器链属于
+    /// 「这条连接怎么建」，不是「运行中可以热插拔的东西」。
+    pub fn client_interceptor(mut self, interceptor: impl ClientInterceptor) -> Self {
+        self.interceptors.push_client(Arc::new(interceptor));
+        self
+    }
+
+    /// 追加一个服务端拦截器（最先追加的在最外层）。
+    pub fn server_interceptor(mut self, interceptor: impl ServerInterceptor) -> Self {
+        self.interceptors.push_server(Arc::new(interceptor));
+        self
     }
 }
 
@@ -265,6 +289,9 @@ where
     reader: Mutex<Option<JoinHandle<()>>>,
     writer: Mutex<Option<JoinHandle<()>>>,
     opts: SessionOptions,
+    /// 从 `opts.interceptors` 拷出来单独放：热路径每次调用都要读它，
+    /// 隔着 `Options` 多一层字段访问没有意义。
+    interceptors: Interceptors,
     _marker: PhantomData<fn() -> (S, K)>,
 }
 
@@ -296,6 +323,8 @@ where
 
         // 握手帧先入队，writer 按 FIFO 写出，所以它必然是首帧。
         let local = Handshake::new(opts.max_message_len, CODEC_POSTCARD);
+        // 先取链再 move `opts`：`Interceptors` 是两条 `Arc<[…]>`，clone 只是两次计数。
+        let interceptors = opts.interceptors.clone();
         let _ = tx.try_send(local.encode_frame());
 
         let session = Arc::new(Self {
@@ -326,6 +355,7 @@ where
             reader: Mutex::new(None),
             writer: Mutex::new(None),
             opts,
+            interceptors,
             _marker: PhantomData,
         });
 
@@ -408,6 +438,39 @@ where
         payload: Bytes,
         deadline_ms: u32,
     ) -> Result<Bytes, CallFailure> {
+        self.call_named(service_id, method, None, payload, deadline_ms)
+            .await
+    }
+
+    /// 同 [`Self::call`]，但把方法名带进拦截器与 span。
+    ///
+    /// 宏生成的 stub 走这一条：`method` 是哈希，一条只有哈希的日志在排障时
+    /// 基本没用，而名字只有宏产物知道。
+    pub async fn call_named(
+        &self,
+        service_id: u16,
+        method: u64,
+        method_name: Option<&'static str>,
+        payload: Bytes,
+        deadline_ms: u32,
+    ) -> Result<Bytes, CallFailure> {
+        let call = ClientCall::new(service_id, method, method_name, payload, deadline_ms);
+        let chain = self.interceptors.client();
+
+        // 空链是快路径：没有拦截器时直通单次尝试，不为「可能要拦截」付一次分配。
+        let Some(()) = chain.first().map(|_| ()) else {
+            return self.send_once(call).await;
+        };
+
+        ClientNext::new(chain.iter(), self).run(call).await
+    }
+
+    /// 一次尝试：分配 `request_id`、占出站额度、发帧、等回包。
+    ///
+    /// 拦截器可以重放它（重试）；每次重放都是新 `request_id`，不会撞上上一轮
+    /// 还挂在 pending 表里的条目。
+    pub(crate) async fn send_once(&self, call: ClientCall) -> Result<Bytes, CallFailure> {
+        let (service_id, method, payload, deadline_ms) = call.into_request();
         self.wait_ready().await.map_err(CallFailure::Failed)?;
         if !self.egress_open.load(Ordering::Acquire) {
             return Err(CallFailure::Failed(RpcError::Closed));
@@ -852,6 +915,8 @@ where
 
         let tx = self.tx.clone();
         let cancels = Arc::clone(&self.cancels);
+        // 链要搬进 task：`Arc<[…]>` 计数 +1，不复制链本身。
+        let server_chain = self.interceptors.server_arc();
         let shutdown = self.shutdown.clone();
         let request_id = header.request_id;
         let service_id = header.service_id;
@@ -888,7 +953,11 @@ where
                     }),
                     _ = shutdown.cancelled() => Err(RpcError::Closed.into()),
                     _ = deadline => Err(RpcError::Timeout.into()),
-                    res = svc.call(method, payload) => res,
+                    res = call_through_chain(
+                        &server_chain,
+                        &svc,
+                        ServerCall::new(service_id, method, method_name, request_id, deadline_ms, payload),
+                    ) => res,
                 };
 
                 #[cfg(debug_assertions)]
@@ -968,6 +1037,18 @@ where
     }
 }
 
+impl<S, K> ClientLeaf for Session<S, K>
+where
+    S: MessageSource + 'static,
+    K: MessageSink + 'static,
+{
+    fn run_once(&self, call: ClientCall) -> crate::BoxFuture<'_, Result<Bytes, CallFailure>> {
+        // 不直接 `Box::pin(Self::send_once...)`：同名方法会让人误以为这里绕了一圈，
+        // 其实只是把 inherent 的 async fn 装箱成 trait 需要的 `dyn Future`。
+        Box::pin(Session::send_once(self, call))
+    }
+}
+
 impl<S, K> Drop for Session<S, K>
 where
     S: MessageSource,
@@ -1016,8 +1097,21 @@ where
         payload: Bytes,
         deadline_ms: u32,
     ) -> Result<Bytes, CallFailure> {
+        self.call_named(service_id, method, None, payload, deadline_ms)
+            .await
+    }
+
+    /// 同 [`Self::call`]，附带方法名（进拦截器上下文与 span）。
+    pub async fn call_named(
+        &self,
+        service_id: u16,
+        method: u64,
+        method_name: Option<&'static str>,
+        payload: Bytes,
+        deadline_ms: u32,
+    ) -> Result<Bytes, CallFailure> {
         self.inner
-            .call(service_id, method, payload, deadline_ms)
+            .call_named(service_id, method, method_name, payload, deadline_ms)
             .await
     }
 
@@ -1033,6 +1127,28 @@ where
 
     pub async fn close(&self) -> Result<(), RpcError> {
         self.inner.close().await
+    }
+}
+
+/// 服务端一次请求穿过拦截器链。
+///
+/// 空链是快路径：直接 `Service::call`，不为「可能有拦截器」付一次 `Box::pin`。
+/// 叶子是 `&Arc<dyn Service>`——`ServiceLeaf` 为它实现，`&svc` 就地半夜类型擦除。
+async fn call_through_chain(
+    chain: &[Arc<dyn ServerInterceptor>],
+    svc: &Arc<dyn Service>,
+    call: ServerCall,
+) -> Result<Bytes, HandlerError> {
+    match chain.split_first() {
+        None => {
+            let (method, payload) = call.into_handler_args();
+            Service::call(Arc::clone(svc), method, payload).await
+        }
+        Some((first, rest)) => {
+            first
+                .intercept(call, ServerNext::new(rest.iter(), svc))
+                .await
+        }
     }
 }
 
