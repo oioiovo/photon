@@ -1,9 +1,13 @@
 //! 两进程本地 IPC：同一个二进制，`server` / `client` 两个角色。
 //!
 //! ```text
-//! cargo run --features local --example calc_local -- server /tmp/spile-calc.sock
-//! cargo run --features local --example calc_local -- client /tmp/spile-calc.sock
+//! cargo run --example calc_local -- server
+//! cargo run --example calc_local -- client
 //! ```
+//!
+//! 第二个位置参数可以覆盖地址。Unix 上是 socket 文件路径（默认 `/tmp/spile-calc.sock`，
+//! 因为 `sun_path` 只有约 104 字节，路径必须浅）；Windows 上它只是 pipe 名的**种子**
+//! （默认 `spile-calc`），两端给同一个字符串就落到同一条 pipe。
 //!
 //! 与 `examples/calc-split` 的 `calc-server` 业务代码逐行相同，只换了 `Endpoint` 与
 //! `Transport` 类型——这就是「换 transport 不改业务代码」的可执行证据。
@@ -28,8 +32,12 @@ use spile::{
     transport::{LocalAddr, TransportOptions},
 };
 
-/// macOS 的 `sun_path` 上限是 104 字节，所以默认路径必须浅。
+/// 默认地址。Unix 的 `sun_path` 上限是 104 字节，所以路径必须浅；Windows 上这只是
+/// pipe 名的种子，短一点更省事（最终名字由后端哈希出来，见下）。
+#[cfg(unix)]
 const DEFAULT_PATH: &str = "/tmp/spile-calc.sock";
+#[cfg(windows)]
+const DEFAULT_PATH: &str = "spile-calc";
 
 const CONNECT_BUDGET: Duration = Duration::from_secs(2);
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -53,8 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let ep = Endpoint::Local(LocalAddr::new(&path));
 
-    // `bind` 会先处理「上一次进程留下的 socket 文件」：是残留就删，还活着就拒绝。
-    // 这条规则在示例里也要看得见——否则用户只会遇到「地址被占用」这句没头没尾的话。
+    // 两个后端的共同规则（见 `transport/local/mod.rs`）：「同一个地址只能有一个活的
+    // 监听者」。Unix 上这还包括「清掉上次崩溃留下的 socket 文件，且绝不碰用户文件」；
+    // Windows 上名字随句柄消失，所以没有残留问题，只有「已有人在听」这一种拒绝。
     let mut server =
         Server::<LocalTransport>::bind(&ep, TransportOptions::default(), SessionOptions::default())
             .await?;

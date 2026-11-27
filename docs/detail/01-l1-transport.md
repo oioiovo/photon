@@ -69,7 +69,7 @@ pub trait Transport: Sized {
 |---|---|---|---|
 | `tcp` | 不再写 | 是（`OwnedWriteHalf::drop` → `SHUT_WR`） | `PEER_SEES_EOF = true` |
 | `local`（Unix，手搓 UDS） | 不再写 | 是（同上） | `PEER_SEES_EOF = true` |
-| `local`（Windows named pipe，未实现） | 不再写 | 否（关写句柄 = 结束整个 pipe 实例） | 若实现则 `false` |
+| `local`（Windows，手搓 named pipe） | 不再写 | 否（没有半关闭；两半都 drop 才关连接） | `PEER_SEES_EOF = false` |
 | `memory` | 不再写 | 是（drop `Sender` → 对端 `recv` 得 `None`） | `PEER_SEES_EOF = true` |
 | `shm` | 停写 `head`、置段头 `state` | 是（靠状态位，不是 EOF） | `PEER_SEES_EOF = true` |
 
@@ -121,7 +121,7 @@ src/transport/
 | 变体 | 载荷 | 语义 | 解析方 |
 |---|---|---|---|
 | `Tcp` | `SocketAddr` | 已解析好的地址，不做 DNS | `tcp` |
-| `Local` | `LocalAddr`（包 `PathBuf`） | Unix socket 文件路径；Windows pipe 名待扩载荷 | `local` |
+| `Local` | `LocalAddr`（包 `PathBuf`） | Unix：socket 文件路径；Windows：pipe 名的种子（`\\.\pipe\...` 原样用，其余经哈希映射，见 6.2） | `local` |
 | `Memory` | `MemoryAddr` | **不参与查找**，只用于日志与 `Debug` | `memory` |
 | `Shm` | `{ name: String }` | **段基名**；实际两段 `{name}-a2b`、`{name}-b2a` | `shm` |
 
@@ -218,7 +218,11 @@ src/transport/
 - 分半：`into_split()` 得 `OwnedReadHalf` / `OwnedWriteHalf`，两半各自包 `FramedSource` / `FramedSink`。
 - `accept`：`listener.accept()` 循环由 L3 调用，L1 每次只产出一对半身。
 
-### 6.2 `local`（Unix UDS；Windows 推迟）
+### 6.2 `local`（Unix 手搓 UDS / Windows 手搓 named pipe）
+
+两个后端在编译期分派（`transport/local/{mod,unix,windows}.rs`），上层只认识一个 `LocalTransport`。共同契约（7 条）写在 `transport/local/mod.rs` 的模块文档里，架构口径见 `design.md` 2.6；下面只写实现。
+
+#### Unix 后端
 
 **实现形状**：直接拿 `tokio::net::UnixListener` / `UnixStream`，比 `tcp` 少一层协议栈，零新依赖（`net` feature 本来就要开）。
 
@@ -227,7 +231,7 @@ src/transport/
 - `accept`：`listener.accept()` 每次产出一对半身；
 - 分半：`UnixStream::into_split()` → `OwnedReadHalf` / `OwnedWriteHalf`，与 `tcp` 完全相同地包 `FramedSource` / `FramedSink`。
 
-**为什么手搓而不是套 `interprocess`（v0.15 结论）**：`interprocess` 把两半包在同一个 `Arc<RawPipeStream>` 里，drop 一半只减引用计数、不产生任何关闭信号——它为了在 Windows named pipe 上也能工作，把 Unix 的能力削到了 Windows 的水平。代价是 `UnexpectedEof` 在 `local` 上变成死代码、正常收尾留僵尸连接、对端继续写到管道缓冲满而阻塞。而我们要的东西在 `tokio` 里本来就是现成的：`OwnedWriteHalf::drop` 就是 `SHUT_WR`。
+**为什么手搓而不是套 `interprocess`（v0.15 提出，v0.35 修正理由）**：`interprocess` 的 **Unix 后端复用 tokio 的 `OwnedReadHalf` / `OwnedWriteHalf`**，半关闭其实是保住的——v0.15 那句「drop 一半只减引用计数」只对它的 **Windows** 后端成立。仍然不在 Unix 上用它，真实理由有两条：① 默认 `reclaim_name = true`，drop 时会 unlink 名字，存在删掉别人 socket 的 TOCTOU；② 崩溃残留它不处理，而本模块的 `prepare_path` 三道闸更严。再叠加依赖预算，收益为零。
 
 **`prepare_path`：绑定前必须处理残留 socket**（三条规则，写死）：
 
@@ -239,9 +243,20 @@ src/transport/
 
 **路径长度**：`sockaddr_un.sun_path` 上限 Linux 108 / macOS 104，取 104。超长时内核只报 `ENAMETOOLONG`，不说哪个路径，所以 `bind` 前自己查一遍并给出明确错误（超过 103 字节即拒）。
 
-**关闭**：`OwnedWriteHalf::drop` 给出 `SHUT_WR`，对端读到 `UnexpectedEof`；drop 读半关读方向。因此 `local` 的能力声明与 `tcp` 一致（`PEER_SEES_EOF = true`），测试矩阵不需要为它写例外分支。
+**关闭**：`OwnedWriteHalf::drop` 给出 `SHUT_WR`，对端读到 `UnexpectedEof`；drop 读半关读方向。因此能力声明是 `PEER_SEES_EOF = true`，测试矩阵不需要为它写例外分支。
 
-**Windows 分支：不做（v0.15）**。四条理由见 `design.md` 2.6：无半关闭、server 需 per-connection 新建 pipe 且首个实例要 `first_pipe_instance(true)` 规避 `ERROR_PIPE_BUSY`、无 `into_split()`（`tokio::io::split` 是 `Arc<Mutex>`，读写抢锁且同样无半关闭）、**没有测试环境**。`local` feature 在非 Unix 目标上直接 `compile_error!`，把不支持写成编译期事实。
+#### Windows 后端（v0.35）
+
+**实现形状**：`tokio::net::windows::named_pipe`，就在已开启的 `net` feature 里，**零新依赖**。需要的六项能力都在：`PipeMode::Byte`（默认）、`first_pipe_instance`、`max_instances`、`reject_remote_clients`（默认 true）、`AsyncRead + AsyncWrite`、`server.connect().await` / `ClientOptions::open`。
+
+- **名字**：`LocalAddr` 的路径只是**种子**。已经写成 `\\.\pipe\...` 的原样使用（直连口子）；否则映射成 `\\.\pipe\spile-<可读前缀>-<16 位十六进制 FNV-1a(路径字节)>`，总长上限 200 字符（内核 256）。**相对路径不解析**：两个进程必须给出相同字符串才落到同一条 pipe。
+- **`bind`**：`ServerOptions::new()` + `pipe_mode(Byte)` + `first_pipe_instance(true)` + `reject_remote_clients(true)` + `max_instances(254)`，`create` 一次。名字已被活的监听者独占时 `CreateNamedPipe` 报 `ERROR_ACCESS_DENIED`(5)，归一成 `AlreadyExists`（`INV-24` 的 Windows 版本）。首实例必须带 `create` 在 reactor 上，所以 `bind` 的 async 在这里是硬约束（`design.md` 2.1）。
+- **`accept`**：持一把 `tokio::sync::Mutex` → 取走待连接实例 → `server.connect().await` → **立刻再造一个实例放回槽位** → 交出这一对半身。造实例撞 `ERROR_PIPE_BUSY`(231) 就按 1 ms 退让重试（`accept` 按契约不设超时）。`accept` 因此不是取消安全的：在 `connect` 期间被 drop 会连同待连接实例一起消失，监听端失效——会话层只在整个公式关停时才 drop 它。
+- **`connect`**：`ClientOptions::open` 撞 `ERROR_PIPE_BUSY` 时退让 1 ms 重试，整轮包在 `opts.connect_timeout` 里到期 `TimedOut`；没有监听者是 `NotFound`，**直接返回**（要不要重试由调用方决定，`calc_local` 示例里就是这么做的）。已知毛刺：所有实例都用满时 `CreateFile` 会在内核里等，这段等待**不可被 `connect_timeout` 打断**——平台行为，不是本实现的取舍。
+- **分半**：`NamedPipeServer` / `NamedPipeClient` 是两种类型，先合成 `PipeStream`（枚举 + 两个 `AsyncRead` / `AsyncWrite` 转发，公开是因为它出现在类型别名里），再 `tokio::io::split` 切两半。锁只在 poll 的一瞬间持有、不跨 await，读写不会被互锁成死结。
+- **关闭**：没有半关闭。只有两半都 drop、句柄引用计数归零，连接才真的关；能力声明 `PEER_SEES_EOF = false`。
+
+**为什么监听必须「一连接一实例」**：Windows 上没有能反复 accept 的 listener，只有一个待连接实例。`connect` 成功后必须立刻补一个，否则后续客户端会撞 `ERROR_FILE_NOT_FOUND`——`NotFound` 与 `BUSY` 的差别往往只在于「补得够不够快」，这也是为什么补实例的步骤在交出连接之前。
 
 ### 6.3 `memory`（一致性测试替身）
 
@@ -362,7 +377,7 @@ M0 的落地项：trait + `framing.rs` + `tcp` + `memory` + `local`（Unix）+ `
 
 - `close` / `flush`：删过两次，别再回来（所有权论证见 `design.md` 2.1）。
 - `unix` 原生 transport / `SOCK_SEQPACKET`：`local` 已覆盖 UDS，特化留到真需要 fd 传递时。
-- 消息模式 named pipe：读侧不替我们切消息（超缓冲返 `ERROR_MORE_DATA`），且没有半关闭；Windows `local` 整体推迟（`design.md` 2.6）。
+- 消息模式的 named pipe：读侧不替我们切消息（超缓冲返 `ERROR_MORE_DATA`），且没有半关闭。Windows 后端只用 `PipeMode::Byte`（`design.md` 2.6）。
 - 压缩：协议层不留位，L1 更不做。
 - 大消息分片协议（chunking）：`max_message_len` 是硬上限，超了就说清楚，不做隐式分片——隐式分片会把「一条完整消息」的契约打破（`L1-C1`）。
 - TLS / 认证：本地 IPC 场景无收益，属非目标。

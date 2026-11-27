@@ -2,12 +2,12 @@
 //!
 //! 手搓而不是套 `interprocess`，是为了保住半关闭：UDS 的写半在 drop 时就是
 //! `shutdown(SHUT_WR)`，对端读侧会拿到 EOF。`local` 因此与 `tcp` 的关闭语义一致，
-//! 上层不需要为它写例外。
+//! 上层不需要为它写例外。另一个理由是路径清理：本模块的 [`prepare_path`] 只删
+//! 「确认没人 listen 的残留 socket」，不碰用户文件、也不动活跃监听者；`interprocess`
+//! 默认 `reclaim_name = true`，drop 时会 unlink 名字，存在删掉别人 socket 的竞态。
 //!
-//! Windows 上暂无实现，开启 `local` feature 会直接编译失败（见 `transport.rs` 的
-//! `compile_error!`）：named pipe 没有半关闭，且服务端监听需要 per-connection 新建、
-//! 用 `first_pipe_instance` 规避 `ERROR_PIPE_BUSY` 竞态——没有测试环境时手搓，
-//! 交付的是一段没人验证过的代码。
+//! Windows 后端在 [`super::windows`]，不共享这里的任何代码：named pipe 没有半关闭，
+//! 名字也不落在文件系统上。
 
 use std::fmt;
 use std::io;

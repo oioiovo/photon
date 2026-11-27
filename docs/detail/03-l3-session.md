@@ -377,7 +377,7 @@ struct ClosingState {
 | 能力 | 收尾表现 | 测试怎么断言 |
 |---|---|---|
 | 有半关闭（`tcp` / `local`(Unix) / `memory` / `shm`） | writer drop `sink` 后对端读到 EOF，可能比 `GoAway` 更早收敛 | 可以断言「drop 后对端在 N ms 内读到 `UnexpectedEof`」 |
-| 无半关闭（Windows named pipe，尚未实现） | `Draining → Closed` 对端**完全不可见**，唯一信号是 `GoAway` | 不能断言 EOF；断言「对端收到 `GoAway` 后在本端 `close_timeout` 内退出」 |
+| 无半关闭（Windows `local`，v0.35 已落地） | `Draining → Closed` 对端**完全不可见**，唯一信号是 `GoAway` | 不能断言 EOF；断言「对端收到 `GoAway` 后在本端 `close_timeout` 内退出」 |
 
 与能力无关、任何实现都必须成立的三条：
 

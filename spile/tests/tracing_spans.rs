@@ -198,8 +198,16 @@ async fn one_call_is_one_span_with_a_name() {
     assert_eq!(sum, 42);
 
     let snapshot = cap.snapshot();
+    // 同一个测试二进制里的另一个用例也会往这个全局 capture 里写 span，
+    // 所以先按 `service_id` 把自己（41）的挑出来再断言——否则用例的通过
+    // 取决于两者谁先跑，`--test-threads=1` 下必然失败。
+    // 同步用例那边本来就是这么筛的（42），这里补齐。
+    let mine: Vec<_> = snapshot
+        .iter()
+        .filter(|(_, fields, _)| fields.get("service_id").map(String::as_str) == Some("41"))
+        .collect();
 
-    let call = snapshot
+    let call = mine
         .iter()
         .find(|(name, ..)| name == "spile.call")
         .expect("客户端应有 spile.call span");
@@ -210,7 +218,7 @@ async fn one_call_is_one_span_with_a_name() {
         .get("request_id")
         .expect("request_id 应由 Session::call 回填");
 
-    let request = snapshot
+    let request = mine
         .iter()
         .find(|(name, ..)| name == "spile.request")
         .expect("服务端应有 spile.request span");

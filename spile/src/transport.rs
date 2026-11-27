@@ -17,12 +17,7 @@ use bytes::Bytes;
 
 pub mod framing;
 
-#[cfg(all(feature = "local", not(unix)))]
-compile_error!(
-    "`local` 传输目前只在 Unix 上实现。Windows 需要 named pipe 适配，     见 docs/detail/01-l1-transport.md §6.2；手搓之前先确认有 Windows 测试环境。"
-);
-
-#[cfg(all(feature = "local", unix))]
+#[cfg(feature = "local")]
 pub mod local;
 
 #[cfg(feature = "memory")]
@@ -115,9 +110,9 @@ pub trait Transport: Sized {
 pub enum Endpoint {
     /// 已解析的 socket 地址。
     Tcp(SocketAddr),
-    /// 本地 IPC：Unix 上是 socket 文件路径。
+    /// 本地 IPC：Unix 上是 socket 文件路径，Windows 上是 pipe 名的种子。
     ///
-    /// 路径本身不裁剪 feature——它是纯数据；能不能 bind 取决于 `local` 实现是否存在。
+    /// 载荷本身不裁剪 feature——它是纯数据；能不能 bind 取决于 `local` 实现是否存在。
     Local(LocalAddr),
     /// 进程内传输。地址不参与查找，只用于日志与 `Debug`。
     Memory(MemoryAddr),
@@ -125,8 +120,8 @@ pub enum Endpoint {
 
 /// 本地 IPC 的地址。
 ///
-/// Unix 上是 socket 文件路径；Windows 将来是 pipe 名，届时再扩载荷类型，
-/// 现在只表达「一个文件系统路径」。
+/// Unix 上是 socket 文件路径；Windows 上只是一个**名字种子**——同一台机器上两个进程
+/// 给出同一个字符串才落到同一条 pipe，相对路径不会被解析（细节见 [`local`] 的模块文档）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalAddr(PathBuf);
 
@@ -136,6 +131,9 @@ impl LocalAddr {
     }
 
     /// 路径形态。日志、错误信息与「长度上限检查」都要用它。
+    ///
+    /// Windows 上也返回用户传进来的那个种子，不是最终 pipe 名：要 pipe 名问
+    /// [`local::LocalTransport::pipe_name`]。
     pub fn as_path(&self) -> &Path {
         &self.0
     }

@@ -62,10 +62,17 @@ impl Harness for LocalHarness {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU16, Ordering};
 
-        // 名字必须唯一：同进程多用例并发跑，撞名会 bind 到别人的 socket。
+        // 名字必须唯一：同进程多用例并发跑，撞名会 bind 到别人的地址。
         static SEQ: AtomicU16 = AtomicU16::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+        // Unix 是真实 socket 文件；Windows 只是 pipe 名的种子，不落盘也不用手动清。
+        #[cfg(unix)]
         let path = PathBuf::from(format!("/tmp/spile-s{}-{seq}.sock", std::process::id()));
+        #[cfg(windows)]
+        let path = PathBuf::from(format!("spile-s{seq}.sock"));
+
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&path);
 
         let ep = Endpoint::Local(LocalAddr::new(&path));
@@ -86,6 +93,7 @@ impl Harness for LocalHarness {
         let server = accept.await.expect("accept task");
 
         // 已经连上的 fd 不受 unlink 影响，路径现在就清掉，别留垃圾。
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&path);
         (server, client)
     }

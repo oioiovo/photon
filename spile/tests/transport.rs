@@ -91,7 +91,7 @@ impl Harness for Memory {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", unix))]
 impl Harness for LocalTransport {
     type Src = LocalSource;
     type Sink = LocalSink;
@@ -106,24 +106,48 @@ impl Harness for LocalTransport {
         let path =
             std::path::PathBuf::from(format!("/tmp/spile-t{}-{seq}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let ep = Endpoint::Local(spile::transport::LocalAddr::new(&path));
-        let opts = TransportOptions::default();
-
-        let server = LocalTransport::bind(&ep, &opts).await.expect("bind");
-        let ep2 = ep.clone();
-        let accept_opts = opts.clone();
-        let accepting = tokio::spawn(async move {
-            let pair = server.accept(&accept_opts).await.expect("accept");
-            (pair, server)
-        });
-
-        let client = LocalTransport::connect(&ep2, &opts).await.expect("connect");
-        let (server_pair, server) = accepting.await.expect("accept 任务");
-        // 连接已建立，监听端可以立刻退场；socket 文件得手动删，drop 不会清。
-        drop(server);
-        let _ = std::fs::remove_file(&path);
-        (client, server_pair)
+        connect_pair(path).await
     }
+}
+
+#[cfg(all(feature = "local", windows))]
+impl Harness for LocalTransport {
+    type Src = LocalSource;
+    type Sink = LocalSink;
+
+    // named pipe 没有半关闭：只 drop 写半不会让对端读到 EOF。
+    const PEER_SEES_EOF: bool = false;
+
+    async fn connected() -> Pair<LocalSource, LocalSink> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        // Windows 上路径只是 pipe 名种子，不落盘，所以不用清理。
+        let path = std::path::PathBuf::from(format!("spile-t{}.sock", seq));
+        connect_pair(path).await
+    }
+}
+
+/// 两个平台的 `connected()` 只差「地址怎么来」，其余完全一样，所以合成一份。
+#[cfg(feature = "local")]
+async fn connect_pair(path: std::path::PathBuf) -> Pair<LocalSource, LocalSink> {
+    let ep = Endpoint::Local(spile::transport::LocalAddr::new(&path));
+    let opts = TransportOptions::default();
+
+    let server = LocalTransport::bind(&ep, &opts).await.expect("bind");
+    let ep2 = ep.clone();
+    let accept_opts = opts.clone();
+    let accepting = tokio::spawn(async move {
+        let pair = server.accept(&accept_opts).await.expect("accept");
+        (pair, server)
+    });
+
+    let client = LocalTransport::connect(&ep2, &opts).await.expect("connect");
+    let (server_pair, server) = accepting.await.expect("accept 任务");
+    // 连接已建立，监听端可以立刻退场；Unix 的 socket 文件得手动删，drop 不会清。
+    drop(server);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+    (client, server_pair)
 }
 
 /// 一问一答，双向都要通。
